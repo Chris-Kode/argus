@@ -29,8 +29,9 @@
 //!   squared; above it, exact and same-file-name renames are still found,
 //!   like git.
 //! - **+/- counts**: with [`Algorithm::Myers`] (the default) lines go
-//!   through git's preprocessing (`xdl_cleanup_records`) before imara-diff's
-//!   Myers, so counts equal `git diff --numstat`. [`Algorithm::Histogram`]
+//!   through git's preprocessing (`xdl_cleanup_records`) and then a port of
+//!   git's Myers with its cost heuristics (`xdl_split`), so counts equal
+//!   `git diff --numstat`. [`Algorithm::Histogram`]
 //!   is imara-diff's own and may differ from `git diff --histogram` by a few
 //!   lines.
 //! - **Hunks**: git's grouping rule (changes at most `2 × context` lines
@@ -53,6 +54,7 @@ mod options;
 mod renames;
 mod session;
 mod text;
+mod xdiff;
 
 pub use argus_git::CancelToken;
 pub use argus_git::objects::{EntryKind, TreeEntry};

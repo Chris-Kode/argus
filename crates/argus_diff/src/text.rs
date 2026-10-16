@@ -11,6 +11,7 @@ use imara_diff::{Diff, InternedInput, Token};
 
 use crate::model::Side;
 use crate::options::Algorithm;
+use crate::xdiff;
 
 /// Lines longer than this are not word-diffed; the whole line is marked.
 const WORD_DIFF_MAX_LINE_BYTES: usize = 4096;
@@ -236,10 +237,11 @@ fn line_diff(algorithm: Algorithm, input: &InternedInput<&[u8]>) -> Diff {
 
 /// Git's Myers pipeline (`xdl_prepare_env` + `xdl_do_diff`): lines that do
 /// not occur in the other file, and very frequent lines (blank lines,
-/// braces) sitting among them, are marked changed before Myers runs on the
-/// rest. imara-diff does the same pruning, but counts occurrences after
-/// stripping the common prefix and suffix, which makes its edit script
-/// differ from git's on some inputs; doing it here on whole files keeps the
+/// braces) sitting among them, are marked changed before git's Myers
+/// ([`xdiff::diff`]) runs on the rest. imara-diff does a similar pruning,
+/// but counts occurrences after stripping the common prefix and suffix and
+/// then runs a Myers with different heuristics, which makes its edit script
+/// differ from git's on some inputs; doing both steps the git way keeps the
 /// +/- counts identical to `git diff --numstat`.
 ///
 /// Returns `(removed, added)` flags, one per line.
@@ -313,18 +315,21 @@ fn git_myers(input: &InternedInput<&[u8]>) -> (Vec<bool>, Vec<bool>) {
     let (reduced_before, index_before) = reduce(middle_before, &class_before, &mut removed);
     let (reduced_after, index_after) = reduce(middle_after, &class_after, &mut added);
 
-    let mut diff = Diff::default();
-    diff.compute_with(
-        imara_diff::Algorithm::Myers,
+    // git's own Myers on the reduced lines: imara-diff's would prune them a
+    // second time and uses different cost heuristics (see `xdiff`).
+    let mut reduced_removed = vec![false; reduced_before.len()];
+    let mut reduced_added = vec![false; reduced_after.len()];
+    xdiff::diff(
         &reduced_before,
         &reduced_after,
-        input.interner.num_tokens(),
+        &mut reduced_removed,
+        &mut reduced_added,
     );
-    for (at, &line) in index_before.iter().enumerate() {
-        removed[line] |= diff.is_removed(at as u32);
+    for (&line, &changed) in index_before.iter().zip(&reduced_removed) {
+        removed[line] |= changed;
     }
-    for (at, &line) in index_after.iter().enumerate() {
-        added[line] |= diff.is_added(at as u32);
+    for (&line, &changed) in index_after.iter().zip(&reduced_added) {
+        added[line] |= changed;
     }
     (removed, added)
 }
