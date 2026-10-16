@@ -11,6 +11,8 @@
 //!    streamed through [`DiffSession::stats_updates`].
 //! 3. [`DiffSession::file_diff`] computes one file's hunks lazily, the first
 //!    time it is shown, and keeps it in a memory-bounded LRU cache.
+//! 4. [`layout`] flattens a loaded file into the uniform-height rows the
+//!    viewer virtualizes, and maps gutter selections back to line ranges.
 //!
 //! Nothing here runs on the caller's thread: list and hunks are computed on
 //! tokio's blocking pool, counts on dedicated worker threads. Every job
@@ -49,6 +51,7 @@
 mod cache;
 mod error;
 mod file_diff;
+pub mod layout;
 mod model;
 mod options;
 mod renames;

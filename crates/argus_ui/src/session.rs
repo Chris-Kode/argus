@@ -181,6 +181,11 @@ impl RepoSession {
         &self.record
     }
 
+    /// The opened git repository.
+    pub fn repo(&self) -> &argus_git::Repo {
+        &self.repo
+    }
+
     /// The branch list.
     pub fn branches(&self) -> &BranchList {
         &self.branches

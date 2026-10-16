@@ -17,6 +17,8 @@ actions!(
         NextHunk,
         /// Jump to the previous hunk.
         PreviousHunk,
+        /// Soft-wrap long diff lines, or scroll them horizontally.
+        ToggleSoftWrap,
         /// Start a comment on the selected line(s).
         Comment,
         /// Run the selected comment with Claude.
@@ -109,6 +111,13 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("k", PreviousFile, NAVIGATION, "Navigation", "Previous file"),
     shortcut!("n", NextHunk, NAVIGATION, "Navigation", "Next hunk"),
     shortcut!("p", PreviousHunk, NAVIGATION, "Navigation", "Previous hunk"),
+    shortcut!(
+        "alt-z",
+        ToggleSoftWrap,
+        NAVIGATION,
+        "Layout",
+        "Toggle soft wrap in the diff"
+    ),
     shortcut!(
         "c",
         Comment,

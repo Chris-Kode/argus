@@ -2,8 +2,9 @@
 //! dock, status bar, and the settings and keyboard-shortcuts sheets.
 //!
 //! The open repository and its base/head selection live in a [`RepoSession`];
-//! the title bar hosts its branch pickers, swap and Fetch buttons. The viewer
-//! (#7/#8), comments and runs (#21) plug their views into the slots rendered
+//! the title bar hosts its branch pickers, swap and Fetch buttons. Each
+//! resolved comparison gets a [`DiffView`] in the center; the file tree (#8),
+//! comments (#14) and runs (#21) plug their views into the slots rendered
 //! here. Settings, the repository list and git are read and written on the
 //! tokio runtime; this view only receives the results.
 
@@ -22,13 +23,14 @@ use crate::branch_picker::{BranchPicker, PickerEvent};
 use crate::components::{
     button, disabled_button, kbd, panel_header, placeholder, primary_button, toggle_button,
 };
+use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
 use crate::fonts::InstalledFonts;
 use crate::jobs::BackgroundJobs;
 use crate::keymap::{
     Accept, Comment, CycleTheme, DecreaseFontSize, Dismiss, IncreaseFontSize, NextFile, NextHunk,
     OpenRepository, OpenSettings, PreviousFile, PreviousHunk, ResetFontSize, Run, SHORTCUT_GROUPS,
     SHORTCUTS, ToggleFileTree, ToggleKeyboardShortcuts, ToggleRunPanel, ToggleRunPanelPosition,
-    WORKSPACE_CONTEXT,
+    ToggleSoftWrap, WORKSPACE_CONTEXT,
 };
 use crate::runtime::spawn_job;
 use crate::session::{
@@ -37,7 +39,7 @@ use crate::session::{
 use crate::settings::{
     DEFAULT_CODE_FONT_SIZE, DEFAULT_FILE_TREE_WIDTH, DEFAULT_RUN_PANEL_HEIGHT,
     DEFAULT_RUN_PANEL_WIDTH, DEFAULT_UI_FONT_SIZE, MIN_DOCK_SIZE, RunPanelPosition, UiSettings,
-    clamp_font_size,
+    clamp_font_size, clamp_tab_width,
 };
 use crate::theme::{ActiveTheme, Theme, ThemeFonts, ThemeMode};
 
@@ -57,6 +59,9 @@ const RECENT_REPOS_SHOWN: usize = 10;
 /// A picker closed this recently by a click outside it is not reopened by
 /// the same click landing on its own title-bar button.
 const PICKER_REOPEN_GUARD: Duration = Duration::from_millis(250);
+/// Memory budget of a diff session's own `FileDiff` cache; the diff view
+/// holds its loaded files on top of it (spec §12: < 500 MB in total).
+const DIFF_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Room for the macOS traffic lights over the transparent title bar.
 #[cfg(target_os = "macos")]
@@ -105,6 +110,8 @@ pub struct Workspace {
     fonts: InstalledFonts,
     session: Option<Entity<RepoSession>>,
     session_subscriptions: Vec<Subscription>,
+    diff_view: Option<Entity<DiffView>>,
+    diff_subscription: Option<Subscription>,
     picker: Option<OpenPicker>,
     picker_closed: Option<(Side, Instant)>,
     /// Reopen the most recent repository once the list first loads.
@@ -149,6 +156,8 @@ impl Workspace {
             fonts: InstalledFonts::load(cx),
             session: None,
             session_subscriptions: Vec::new(),
+            diff_view: None,
+            diff_subscription: None,
             picker: None,
             picker_closed: None,
             restore_last_repo: true,
@@ -205,6 +214,7 @@ impl Workspace {
         if theme_changed {
             self.apply_theme(window, cx);
         }
+        self.sync_diff_options(cx);
         self.schedule_save(cx);
         cx.notify();
     }
@@ -238,6 +248,20 @@ impl Workspace {
                 Err(error) => tracing::warn!(%error, "UI settings save task failed"),
             }
         }))
+    }
+
+    fn diff_options(&self) -> DisplayOptions {
+        DisplayOptions {
+            tab_width: self.settings.diff_tab_width,
+            soft_wrap: self.settings.diff_soft_wrap,
+        }
+    }
+
+    fn sync_diff_options(&mut self, cx: &mut Context<Self>) {
+        let options = self.diff_options();
+        if let Some(view) = self.diff_view.clone() {
+            view.update(cx, |view, cx| view.set_options(options, cx));
+        }
     }
 
     fn change_font_size(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
@@ -319,6 +343,7 @@ impl Workspace {
         if let Some(old) = self.session.take() {
             old.update(cx, |session, cx| session.shutdown(cx));
         }
+        self.close_diff(cx);
         let session = cx.new(|cx| RepoSession::new(record, repo, cx));
         self.session_subscriptions = vec![
             cx.observe(&session, |_, _, cx| cx.notify()),
@@ -331,13 +356,105 @@ impl Workspace {
                     cx.notify();
                 }
                 SessionEvent::TargetChanged(target) => {
-                    // The diff viewer (#7) loads `target` here.
                     tracing::debug!(?target, "diff target changed");
+                    match target {
+                        Some(target) => this.open_diff(target.clone(), cx),
+                        None => this.close_diff(cx),
+                    }
                 }
             }),
         ];
         self.session = Some(session);
         cx.notify();
+    }
+
+    // ---- diff view ----------------------------------------------------------
+
+    /// Shows the diff of `target`, replacing (and cancelling) the previous
+    /// one. "Viewed" marks carry over when the branches are the same.
+    fn open_diff(&mut self, target: DiffTarget, cx: &mut Context<Self>) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let repo = session.read(cx).repo().clone();
+        let viewed = self
+            .diff_view
+            .as_ref()
+            .map(|view| view.read(cx))
+            .filter(|view| view.target().base == target.base && view.target().head == target.head)
+            .map(DiffView::viewed_paths)
+            .unwrap_or_default();
+        self.close_diff(cx);
+        let options = argus_diff::DiffOptions {
+            cache_bytes: DIFF_CACHE_BYTES,
+            ..argus_diff::DiffOptions::default()
+        };
+        // `merge_base..head` is the three-dot diff `base...head` (spec §5.1).
+        let diff =
+            argus_diff::DiffSession::between(&repo, target.merge_base, target.head_tip, options);
+        let display = self.diff_options();
+        let view = cx.new(|cx| DiffView::new(diff, target, display, viewed, cx));
+        self.diff_subscription = Some(cx.subscribe(&view, |_, _, event: &DiffViewEvent, _| {
+            // Comments (#14) start from these; until then they are logged.
+            match event {
+                DiffViewEvent::LinesSelected(selection) => {
+                    tracing::debug!(?selection, "lines selected");
+                }
+                DiffViewEvent::CommentRequested(selection) => {
+                    tracing::debug!(?selection, "comment requested");
+                }
+                DiffViewEvent::SelectionRejected(hint) => {
+                    tracing::debug!(%hint, "selection rejected");
+                }
+            }
+        }));
+        self.diff_view = Some(view);
+        cx.notify();
+    }
+
+    /// Drops the diff view; its session and every job of it are cancelled.
+    fn close_diff(&mut self, cx: &mut Context<Self>) {
+        self.diff_subscription = None;
+        if self.diff_view.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn update_diff(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut DiffView, &mut Context<DiffView>),
+    ) {
+        if let Some(view) = self.diff_view.clone() {
+            view.update(cx, f);
+        }
+    }
+
+    fn next_file(&mut self, _: &NextFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.update_diff(cx, |view, cx| view.next_file(cx));
+    }
+
+    fn previous_file(&mut self, _: &PreviousFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.update_diff(cx, |view, cx| view.previous_file(cx));
+    }
+
+    fn next_hunk(&mut self, _: &NextHunk, _: &mut Window, cx: &mut Context<Self>) {
+        self.update_diff(cx, |view, cx| view.next_hunk(cx));
+    }
+
+    fn previous_hunk(&mut self, _: &PreviousHunk, _: &mut Window, cx: &mut Context<Self>) {
+        self.update_diff(cx, |view, cx| view.previous_hunk(cx));
+    }
+
+    fn toggle_soft_wrap(
+        &mut self,
+        _: &ToggleSoftWrap,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_settings(window, cx, |settings| {
+            settings.diff_soft_wrap = !settings.diff_soft_wrap;
+        });
     }
 
     // ---- branch pickers -----------------------------------------------------
@@ -543,7 +660,7 @@ impl Workspace {
     }
 
     /// Placeholder handler for review actions whose views land in later
-    /// issues (file tree #8, diff view #7, comments, runs #21, accept).
+    /// issues (comments #14, runs #21, accept).
     fn not_wired_yet<A: Action>(&mut self, action: &A, _: &mut Window, _: &mut Context<Self>) {
         tracing::debug!(action = action.name(), "action not wired yet");
     }
@@ -814,7 +931,7 @@ impl Workspace {
             None => placeholder("No repository open.", cx),
             Some(Comparison::Ready(target)) => placeholder(
                 format!(
-                    "{}...{}: the file list arrives with the diff viewer.",
+                    "{}...{}: the file tree arrives with #8.",
                     target.base, target.head
                 ),
                 cx,
@@ -932,9 +1049,10 @@ impl Workspace {
         let colors = cx.theme().colors.clone();
         let path = display_path(&session.record().path);
         match session.comparison() {
-            Comparison::Ready(target) => {
-                self.render_diff_placeholder(target, cx).into_any_element()
-            }
+            Comparison::Ready(_) => match &self.diff_view {
+                Some(view) => view.clone().into_any_element(),
+                None => placeholder("Opening the diff…", cx).into_any_element(),
+            },
             Comparison::Invalid(message) => div()
                 .flex()
                 .flex_col()
@@ -962,84 +1080,6 @@ impl Workspace {
             }
             Comparison::Incomplete(message) => placeholder(message.clone(), cx).into_any_element(),
         }
-    }
-
-    fn render_diff_placeholder(&self, target: &DiffTarget, cx: &Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let colors = &theme.colors;
-        // (sign, text before the changed word, changed word, text after).
-        let line = |sign: &'static str, parts: [&'static str; 3], bg, word_bg, fg| {
-            div()
-                .flex()
-                .px_3()
-                .bg(bg)
-                .child(div().w(px(16.0)).text_color(fg).child(sign))
-                .child(parts[0])
-                .child(div().bg(word_bg).child(parts[1]))
-                .child(parts[2])
-        };
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_sm()
-                    .text_color(colors.text_muted)
-                    .child(format!(
-                        "{}...{} · merge-base {} · head {} · the diff viewer arrives with #7.",
-                        target.base,
-                        target.head,
-                        target.merge_base.short(8),
-                        target.head_tip.short(8),
-                    )),
-            )
-            .child(
-                // A preview of the diff colors in the code font, so the theme
-                // can be checked before the viewer lands.
-                div()
-                    .flex()
-                    .flex_col()
-                    .mx_3()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .font_family(theme.fonts.code_family.clone())
-                    .text_size(theme.fonts.code_size)
-                    .text_color(colors.text)
-                    .child(line(
-                        " ",
-                        ["fn review(diff: &Diff) -> Verdict {", "", ""],
-                        colors.background,
-                        colors.background,
-                        colors.text_muted,
-                    ))
-                    .child(line(
-                        "-",
-                        ["    Verdict::", "approve()", ""],
-                        colors.diff_removed_background,
-                        colors.diff_removed_word,
-                        colors.diff_removed_text,
-                    ))
-                    .child(line(
-                        "+",
-                        ["    Verdict::", "comment(diff.hunks())", ""],
-                        colors.diff_added_background,
-                        colors.diff_added_word,
-                        colors.diff_added_text,
-                    ))
-                    .child(line(
-                        " ",
-                        ["}", "", ""],
-                        colors.background,
-                        colors.background,
-                        colors.text_muted,
-                    )),
-            )
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1520,30 +1560,31 @@ impl Workspace {
                 .children(children)
                 .into_any_element()
         };
-        let stepper = |id: &'static str, value: f32, apply: fn(&mut UiSettings, f32)| {
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(button((id, 0usize), "−", cx).on_click(cx.listener(
-                    move |this, _, window, cx| {
-                        this.update_settings(window, cx, |settings| apply(settings, -1.0))
-                    },
-                )))
-                .child(
-                    div()
-                        .w(px(48.0))
-                        .text_center()
-                        .text_color(colors.text)
-                        .child(format!("{value:.0} px")),
-                )
-                .child(button((id, 1usize), "+", cx).on_click(cx.listener(
-                    move |this, _, window, cx| {
-                        this.update_settings(window, cx, |settings| apply(settings, 1.0))
-                    },
-                )))
-                .into_any_element()
-        };
+        let stepper =
+            |id: &'static str, value: f32, unit: &'static str, apply: fn(&mut UiSettings, f32)| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(button((id, 0usize), "−", cx).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.update_settings(window, cx, |settings| apply(settings, -1.0))
+                        },
+                    )))
+                    .child(
+                        div()
+                            .w(px(48.0))
+                            .text_center()
+                            .text_color(colors.text)
+                            .child(format!("{value:.0} {unit}")),
+                    )
+                    .child(button((id, 1usize), "+", cx).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.update_settings(window, cx, |settings| apply(settings, 1.0))
+                        },
+                    )))
+                    .into_any_element()
+            };
         let muted = |text: SharedString| {
             div()
                 .text_color(colors.text_muted)
@@ -1598,20 +1639,49 @@ impl Workspace {
             .child(row("Active theme", muted(theme.name.clone())))
             .child(row(
                 "UI font size",
-                stepper("ui-font-size", settings.ui_font_size, |settings, delta| {
-                    settings.ui_font_size = clamp_font_size(settings.ui_font_size + delta, 0.0);
-                }),
+                stepper(
+                    "ui-font-size",
+                    settings.ui_font_size,
+                    "px",
+                    |settings, delta| {
+                        settings.ui_font_size = clamp_font_size(settings.ui_font_size + delta, 0.0);
+                    },
+                ),
             ))
             .child(row(
                 "Code font size",
                 stepper(
                     "code-font-size",
                     settings.code_font_size,
+                    "px",
                     |settings, delta| {
                         settings.code_font_size =
                             clamp_font_size(settings.code_font_size + delta, 0.0);
                     },
                 ),
+            ))
+            .child(row(
+                "Diff tab width",
+                stepper(
+                    "diff-tab-width",
+                    settings.diff_tab_width as f32,
+                    "cols",
+                    |settings, delta| {
+                        let width = settings.diff_tab_width as f32 + delta;
+                        settings.diff_tab_width = clamp_tab_width(width.max(0.0) as u32);
+                    },
+                ),
+            ))
+            .child(row(
+                "Diff soft wrap",
+                toggle_button(
+                    "diff-soft-wrap-setting",
+                    if settings.diff_soft_wrap { "On" } else { "Off" },
+                    settings.diff_soft_wrap,
+                    cx,
+                )
+                .on_click(|_, window, cx| window.dispatch_action(ToggleSoftWrap.boxed_clone(), cx))
+                .into_any_element(),
             ))
             .child(row("UI font", muted(theme.fonts.ui_family.clone())))
             .child(row("Code font", muted(theme.fonts.code_family.clone())))
@@ -1728,10 +1798,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
-            .on_action(cx.listener(Self::not_wired_yet::<NextFile>))
-            .on_action(cx.listener(Self::not_wired_yet::<PreviousFile>))
-            .on_action(cx.listener(Self::not_wired_yet::<NextHunk>))
-            .on_action(cx.listener(Self::not_wired_yet::<PreviousHunk>))
+            .on_action(cx.listener(Self::next_file))
+            .on_action(cx.listener(Self::previous_file))
+            .on_action(cx.listener(Self::next_hunk))
+            .on_action(cx.listener(Self::previous_hunk))
+            .on_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::not_wired_yet::<Comment>))
             .on_action(cx.listener(Self::not_wired_yet::<Run>))
             .on_action(cx.listener(Self::not_wired_yet::<Accept>))
