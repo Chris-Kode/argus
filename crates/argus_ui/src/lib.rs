@@ -14,8 +14,8 @@ use gpui::{
 
 /// Application-wide handles to the services, stored as a GPUI global.
 ///
-/// Views read it with `cx.global::<AppContext>()`. The services are filled in
-/// by later issues (#3 storage, #4/#17 git, #20 runs); for now they are
+/// Views read it with `cx.global::<AppContext>()`. The git and run services are
+/// filled in by later issues (#4/#17 git, #20 runs); for now they are
 /// placeholder handles so the wiring exists from the start.
 pub struct AppContext {
     /// Git reads (gix) and writes (git CLI).
@@ -32,11 +32,11 @@ pub struct AppContext {
 impl Global for AppContext {}
 
 impl AppContext {
-    /// Builds the global from a live runtime handle.
-    pub fn new(runtime: tokio::runtime::Handle) -> Self {
+    /// Builds the global from a live runtime handle and an opened store.
+    pub fn new(runtime: tokio::runtime::Handle, store: StorageService) -> Self {
         Self {
             git: GitService::new(),
-            store: StorageService::new(),
+            store,
             runs: RunManager::new(),
             runtime,
         }
@@ -46,10 +46,12 @@ impl AppContext {
 /// Opens the Argus window and runs the GPUI event loop until the app quits.
 ///
 /// Blocks the calling thread, which must be the main thread (macOS requires the
-/// platform run loop there).
-pub fn run_gpui_app(runtime: tokio::runtime::Handle) {
+/// platform run loop there). The thread is marked as the UI thread, so debug
+/// builds panic on any storage call made from it.
+pub fn run_gpui_app(runtime: tokio::runtime::Handle, store: StorageService) {
+    argus_store::mark_ui_thread();
     gpui_platform::application().run(move |cx: &mut App| {
-        cx.set_global(AppContext::new(runtime.clone()));
+        cx.set_global(AppContext::new(runtime.clone(), store.clone()));
 
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
         cx.open_window(
