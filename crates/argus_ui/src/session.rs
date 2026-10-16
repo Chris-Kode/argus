@@ -181,7 +181,7 @@ impl RepoSession {
         &self.record
     }
 
-    /// The opened git repository.
+    /// The git repository handle.
     pub fn repo(&self) -> &argus_git::Repo {
         &self.repo
     }

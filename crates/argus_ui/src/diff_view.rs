@@ -59,7 +59,6 @@ use gpui::{
 };
 
 use crate::components::{button, placeholder, toggle_button};
-use crate::jobs::BackgroundJobs;
 use crate::keymap::ToggleSoftWrap;
 use crate::runtime::spawn_job;
 use crate::session::DiffTarget;
@@ -69,7 +68,7 @@ use crate::theme::ActiveTheme;
 const PREFETCH_SCREENS: usize = 2;
 /// Memory the view may hold in loaded diffs and their rows before it evicts
 /// the least recently shown files.
-const VIEW_MEMORY_BUDGET: usize = 160 * 1024 * 1024;
+const VIEW_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
 /// Width of the vertical scrollbar track.
 const SCROLLBAR_WIDTH: Pixels = px(12.0);
 /// Smallest scrollbar thumb, so it stays grabbable on huge diffs.
@@ -111,6 +110,9 @@ pub enum DiffViewEvent {
     SelectionRejected(SharedString),
     /// The user clicked the gutter "+" to comment on a line or range.
     CommentRequested(LineSelection),
+    /// The file under the top of the viewport changed (file-list index);
+    /// the file tree highlights it.
+    ActiveFileChanged(usize),
 }
 
 /// How lines are displayed; persisted in the UI settings.
@@ -286,6 +288,12 @@ pub struct DiffView {
     drag: Option<Drag>,
     hint: Option<SharedString>,
     remembered_viewed: HashSet<String>,
+    active_file: Option<usize>,
+    /// Scroll position a file-tree reveal ended at. Until the user scrolls
+    /// away, the top file is not reported back: near the end of the list
+    /// the revealed file cannot reach the top, and echoing the file above
+    /// it would move the tree's selection back.
+    revealed_at: Option<f64>,
     list_task: Option<Task<()>>,
     stats_task: Option<Task<()>>,
 }
@@ -327,6 +335,8 @@ impl DiffView {
             drag: None,
             hint: None,
             remembered_viewed: viewed,
+            active_file: None,
+            revealed_at: None,
             list_task: None,
             stats_task: None,
         };
@@ -371,12 +381,11 @@ impl DiffView {
 
     fn load_list(&mut self, cx: &mut Context<Self>) {
         let session = self.session.clone();
+        // Shared with the file tree: the list is computed once per session.
         let job = spawn_job(cx, async move { session.file_list().await });
-        BackgroundJobs::update(cx, |jobs| jobs.diffing = true);
         self.list_task = Some(cx.spawn(async move |this, cx| {
             let result = job.await;
             this.update(cx, |this, cx| {
-                BackgroundJobs::update(cx, |jobs| jobs.diffing = false);
                 match result {
                     Ok(Ok(list)) => this.list_loaded(list, cx),
                     Ok(Err(error)) => {
@@ -846,6 +855,20 @@ impl DiffView {
             FileState::Pending | FileState::Evicted if slot.full_len > 1 => vec![1],
             _ => Vec::new(),
         }
+    }
+
+    /// Scrolls file `index`'s header to the top (a file opened from the
+    /// file tree), unfolding it if it was collapsed.
+    pub fn reveal_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.files.len() {
+            return;
+        }
+        if self.files[index].collapsed {
+            self.relayout(|this| this.files[index].collapsed = false);
+        }
+        self.active_file = Some(index);
+        self.scroll_to_row(self.starts[index], cx);
+        self.revealed_at = Some(self.scroll_top());
     }
 
     /// Scrolls the next file's header to the top (`j`).
@@ -1818,6 +1841,17 @@ impl Render for DiffView {
         rows.interactivity().base_style.restrict_scroll_to_axis = Some(true);
 
         let top_file = self.file_at(self.top_row());
+        let scroll_top = self.scroll_top();
+        if self
+            .revealed_at
+            .is_some_and(|revealed| (revealed - scroll_top).abs() >= 0.5)
+        {
+            self.revealed_at = None;
+        }
+        if self.revealed_at.is_none() && self.active_file != Some(top_file) {
+            self.active_file = Some(top_file);
+            cx.emit(DiffViewEvent::ActiveFileChanged(top_file));
+        }
         let sticky = self.render_file_header(top_file, &list.entries()[top_file], true, cx);
         // The next file's header pushes the sticky one up as it arrives.
         let next_header = self.starts[top_file + 1] as f64 * self.row_height() - self.scroll_top();

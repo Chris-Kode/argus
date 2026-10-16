@@ -49,6 +49,20 @@ actions!(
         Dismiss,
         /// Quit Argus.
         Quit,
+        /// Move the file-tree selection down one row.
+        SelectNextEntry,
+        /// Move the file-tree selection up one row.
+        SelectPreviousEntry,
+        /// Collapse the selected directory, or select the parent directory.
+        CollapseEntry,
+        /// Expand the selected directory, or select its first child.
+        ExpandEntry,
+        /// Open the selected file in the diff view (or toggle a directory).
+        OpenEntry,
+        /// Focus the file-tree filter box.
+        FocusFileFilter,
+        /// Switch the file tree between tree and flat list.
+        ToggleFileListMode,
     ]
 );
 
@@ -59,8 +73,15 @@ pub const WORKSPACE_CONTEXT: &str = "Workspace";
 /// that typing letters there does not trigger the single-key shortcuts.
 pub const TEXT_INPUT_CONTEXT: &str = "TextInput";
 
+/// Key context set on the file tree dock.
+pub const FILE_TREE_CONTEXT: &str = "FileTree";
+
 /// Predicate for single-key navigation shortcuts.
 const NAVIGATION: Option<&str> = Some("Workspace && !TextInput");
+
+/// Predicate for the file tree's own keys (the filter box handles the arrows
+/// itself).
+const FILE_TREE: Option<&str> = Some("FileTree && !TextInput");
 
 /// One entry of the keymap.
 pub struct Shortcut {
@@ -110,6 +131,55 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("j", NextFile, NAVIGATION, "Navigation", "Next file"),
     shortcut!("k", PreviousFile, NAVIGATION, "Navigation", "Previous file"),
     shortcut!("n", NextHunk, NAVIGATION, "Navigation", "Next hunk"),
+    shortcut!(
+        "/",
+        FocusFileFilter,
+        NAVIGATION,
+        "File tree",
+        "Filter the files"
+    ),
+    shortcut!(
+        "down",
+        SelectNextEntry,
+        FILE_TREE,
+        "File tree",
+        "Select the next row"
+    ),
+    shortcut!(
+        "up",
+        SelectPreviousEntry,
+        FILE_TREE,
+        "File tree",
+        "Select the previous row"
+    ),
+    shortcut!(
+        "left",
+        CollapseEntry,
+        FILE_TREE,
+        "File tree",
+        "Collapse the directory"
+    ),
+    shortcut!(
+        "right",
+        ExpandEntry,
+        FILE_TREE,
+        "File tree",
+        "Expand the directory"
+    ),
+    shortcut!(
+        "enter",
+        OpenEntry,
+        FILE_TREE,
+        "File tree",
+        "Open the file in the diff"
+    ),
+    shortcut!(
+        "secondary-shift-l",
+        ToggleFileListMode,
+        None,
+        "File tree",
+        "Toggle tree / flat list"
+    ),
     shortcut!("p", PreviousHunk, NAVIGATION, "Navigation", "Previous hunk"),
     shortcut!(
         "alt-z",
@@ -204,6 +274,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
 /// Help-sheet sections, in display order.
 pub const SHORTCUT_GROUPS: &[&str] = &[
     "Navigation",
+    "File tree",
     "Review",
     "Layout",
     "Appearance",
