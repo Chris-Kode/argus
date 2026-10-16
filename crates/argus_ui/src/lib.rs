@@ -4,10 +4,14 @@
 //! hands control to [`run_gpui_app`]. Service handles reach every view through
 //! the [`AppContext`] global; colors and fonts through the [`Theme`] global.
 
+pub mod branch_picker;
 pub mod components;
 mod fonts;
+pub mod fuzzy;
 pub mod jobs;
 pub mod keymap;
+pub mod runtime;
+pub mod session;
 pub mod settings;
 pub mod theme;
 mod workspace;
@@ -21,6 +25,7 @@ use gpui::{
 };
 
 pub use jobs::BackgroundJobs;
+pub use session::{Comparison, DiffTarget, RepoSession, SessionEvent, Side};
 pub use settings::UiSettings;
 pub use theme::{ActiveTheme, Appearance, Theme, ThemeColors, ThemeFonts, ThemeMode};
 pub use workspace::Workspace;

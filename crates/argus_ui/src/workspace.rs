@@ -1,21 +1,24 @@
 //! The Zed-style app shell: title bar, file-tree dock, center tabs, run-panel
 //! dock, status bar, and the settings and keyboard-shortcuts sheets.
 //!
-//! The viewer (#7/#8), comments and runs (#21) plug their views into the slots
-//! rendered here. Settings and the repository list are read and written on the
+//! The open repository and its base/head selection live in a [`RepoSession`];
+//! the title bar hosts its branch pickers, swap and Fetch buttons. The viewer
+//! (#7/#8), comments and runs (#21) plug their views into the slots rendered
+//! here. Settings, the repository list and git are read and written on the
 //! tokio runtime; this view only receives the results.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use argus_store::{Repo, StorageService};
 use gpui::{
-    Action, AnyElement, Context, DragMoveEvent, EmptyView, FocusHandle, Focusable, MouseButton,
-    PathPromptOptions, Pixels, Point, SharedString, Subscription, Task, Window, WindowControlArea,
-    div, prelude::*, px,
+    Action, AnyElement, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable,
+    MouseButton, PathPromptOptions, Pixels, Point, SharedString, Subscription, Task, Window,
+    WindowControlArea, deferred, div, prelude::*, px,
 };
 
 use crate::AppContext;
+use crate::branch_picker::{BranchPicker, PickerEvent};
 use crate::components::{
     button, disabled_button, kbd, panel_header, placeholder, primary_button, toggle_button,
 };
@@ -26,6 +29,10 @@ use crate::keymap::{
     OpenRepository, OpenSettings, PreviousFile, PreviousHunk, ResetFontSize, Run, SHORTCUT_GROUPS,
     SHORTCUTS, ToggleFileTree, ToggleKeyboardShortcuts, ToggleRunPanel, ToggleRunPanelPosition,
     WORKSPACE_CONTEXT,
+};
+use crate::runtime::spawn_job;
+use crate::session::{
+    BranchList, Comparison, DiffTarget, RepoSession, SessionEvent, Side, open_repository,
 };
 use crate::settings::{
     DEFAULT_CODE_FONT_SIZE, DEFAULT_FILE_TREE_WIDTH, DEFAULT_RUN_PANEL_HEIGHT,
@@ -47,6 +54,9 @@ const RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 /// How many recent repositories the empty state lists.
 const RECENT_REPOS_SHOWN: usize = 10;
+/// A picker closed this recently by a click outside it is not reopened by
+/// the same click landing on its own title-bar button.
+const PICKER_REOPEN_GUARD: Duration = Duration::from_millis(250);
 
 /// Room for the macOS traffic lights over the transparent title bar.
 #[cfg(target_os = "macos")]
@@ -81,18 +91,10 @@ struct Notice {
     is_error: bool,
 }
 
-/// Why a repository could not be opened.
-#[derive(Debug, thiserror::Error)]
-enum OpenRepoError {
-    #[error("{0} is not a git repository")]
-    NotARepository(String),
-    #[error("cannot read {path}: {source}")]
-    Io {
-        path: String,
-        source: std::io::Error,
-    },
-    #[error(transparent)]
-    Store(#[from] argus_store::StoreError),
+/// The open branch picker and its subscription.
+struct OpenPicker {
+    picker: Entity<BranchPicker>,
+    _subscription: Subscription,
 }
 
 /// The root view of the Argus window.
@@ -101,7 +103,12 @@ pub struct Workspace {
     settings: UiSettings,
     settings_dirty: bool,
     fonts: InstalledFonts,
-    repo: Option<Repo>,
+    session: Option<Entity<RepoSession>>,
+    session_subscriptions: Vec<Subscription>,
+    picker: Option<OpenPicker>,
+    picker_closed: Option<(Side, Instant)>,
+    /// Reopen the most recent repository once the list first loads.
+    restore_last_repo: bool,
     recent: RecentRepos,
     sheet: Option<Sheet>,
     notice: Option<Notice>,
@@ -140,7 +147,11 @@ impl Workspace {
             settings,
             settings_dirty: false,
             fonts: InstalledFonts::load(cx),
-            repo: None,
+            session: None,
+            session_subscriptions: Vec::new(),
+            picker: None,
+            picker_closed: None,
+            restore_last_repo: true,
             recent: RecentRepos::Loading,
             sheet: None,
             notice: None,
@@ -252,6 +263,18 @@ impl Workspace {
                 Err(error) => RecentRepos::Failed(error.to_string().into()),
             };
             this.update(cx, |this, cx| {
+                // After a restart, come back to where the user left off: the
+                // last repository, with its last base/head (#6).
+                let restore = std::mem::take(&mut this.restore_last_repo);
+                if let RecentRepos::Loaded(repos) = &recent
+                    && restore
+                    && this.session.is_none()
+                    && this.open_task.is_none()
+                    && let Some(last) = repos.first().filter(|repo| repo.last_opened_at.is_some())
+                {
+                    let path = last.path.clone();
+                    this.open_path(path, cx);
+                }
                 this.recent = recent;
                 cx.notify();
             })
@@ -259,21 +282,21 @@ impl Workspace {
         }));
     }
 
-    /// Records the repository at `path` and shows it in the shell.
+    /// Opens the repository containing `path`, records it in `repos` and
+    /// starts a session for it.
     fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let (store, runtime) = services(cx);
-        let job = runtime.spawn(async move { register_repository(&store, path).await });
+        let app = cx.global::<AppContext>();
+        let (git, store) = (app.git.clone(), app.store.clone());
+        let job = spawn_job(cx, open_repository(git, store, path));
         self.open_task = Some(cx.spawn(async move |this, cx| {
-            let result = match job.await {
-                Ok(result) => result.map_err(|error| error.to_string()),
-                Err(error) => Err(error.to_string()),
-            };
+            let result = job.await.unwrap_or_else(|error| Err(error.to_string()));
             this.update(cx, |this, cx| {
+                this.open_task = None;
                 match result {
-                    Ok(repo) => {
-                        tracing::info!(path = %repo.path.display(), "opened repository");
+                    Ok((record, repo)) => {
+                        tracing::info!(path = %record.path.display(), "opened repository");
                         this.notice = None;
-                        this.repo = Some(repo);
+                        this.start_session(record, repo, cx);
                     }
                     Err(message) => {
                         tracing::warn!(%message, "failed to open repository");
@@ -290,10 +313,111 @@ impl Workspace {
         }));
     }
 
+    /// Replaces the open repository, cancelling every job of the old one.
+    fn start_session(&mut self, record: Repo, repo: argus_git::Repo, cx: &mut Context<Self>) {
+        self.close_picker(cx);
+        if let Some(old) = self.session.take() {
+            old.update(cx, |session, cx| session.shutdown(cx));
+        }
+        let session = cx.new(|cx| RepoSession::new(record, repo, cx));
+        self.session_subscriptions = vec![
+            cx.observe(&session, |_, _, cx| cx.notify()),
+            cx.subscribe(&session, |this, _, event: &SessionEvent, cx| match event {
+                SessionEvent::Notice { message, is_error } => {
+                    this.notice = Some(Notice {
+                        message: message.clone(),
+                        is_error: *is_error,
+                    });
+                    cx.notify();
+                }
+                SessionEvent::TargetChanged(target) => {
+                    // The diff viewer (#7) loads `target` here.
+                    tracing::debug!(?target, "diff target changed");
+                }
+            }),
+        ];
+        self.session = Some(session);
+        cx.notify();
+    }
+
+    // ---- branch pickers -----------------------------------------------------
+
+    fn toggle_picker(&mut self, side: Side, window: &mut Window, cx: &mut Context<Self>) {
+        let open_side = self.picker.as_ref().map(|open| open.picker.read(cx).side());
+        if open_side.is_some() {
+            self.close_picker(cx);
+            if open_side == Some(side) {
+                window.focus(&self.focus_handle, cx);
+                return;
+            }
+        }
+        if let Some((closed_side, at)) = self.picker_closed.take()
+            && closed_side == side
+            && at.elapsed() < PICKER_REOPEN_GUARD
+        {
+            return;
+        }
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let session = session.read(cx);
+        let BranchList::Loaded(branches) = session.branches() else {
+            return;
+        };
+        let (branches, selected) = (branches.clone(), session.selected(side).map(str::to_owned));
+        let picker = cx.new(|cx| BranchPicker::new(side, branches, selected, cx));
+        let subscription = cx.subscribe_in(
+            &picker,
+            window,
+            |this, _, event: &PickerEvent, window, cx| {
+                match event {
+                    PickerEvent::Picked(side, name) => {
+                        if let Some(session) = this.session.clone() {
+                            let (side, name) = (*side, name.clone());
+                            session.update(cx, |session, cx| session.pick(side, name, cx));
+                        }
+                        this.close_picker(cx);
+                    }
+                    PickerEvent::Dismissed => {
+                        let side = this.picker.as_ref().map(|open| open.picker.read(cx).side());
+                        this.close_picker(cx);
+                        if let Some(side) = side {
+                            this.picker_closed = Some((side, Instant::now()));
+                        }
+                    }
+                }
+                window.focus(&this.focus_handle, cx);
+            },
+        );
+        window.focus(&picker.focus_handle(cx), cx);
+        self.picker = Some(OpenPicker {
+            picker,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn close_picker(&mut self, cx: &mut Context<Self>) {
+        if self.picker.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn update_session(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut RepoSession, &mut Context<RepoSession>),
+    ) {
+        if let Some(session) = self.session.clone() {
+            session.update(cx, f);
+        }
+    }
+
     // ---- actions ------------------------------------------------------------
 
     fn open_repository(&mut self, _: &OpenRepository, _: &mut Window, cx: &mut Context<Self>) {
         self.sheet = None;
+        self.close_picker(cx);
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -346,8 +470,17 @@ impl Workspace {
         self.toggle_sheet(Sheet::KeyboardShortcuts, cx);
     }
 
-    fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
-        if self.sheet.take().is_some() {
+    fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
+        let tracking = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.read(cx).tracking_prompt().is_some());
+        if self.picker.is_some() {
+            self.close_picker(cx);
+            window.focus(&self.focus_handle, cx);
+        } else if tracking {
+            self.update_session(cx, |session, cx| session.cancel_tracking(cx));
+        } else if self.sheet.take().is_some() {
             cx.notify();
         } else {
             cx.propagate();
@@ -522,11 +655,48 @@ impl Workspace {
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
-        let repo_label: SharedString = self
-            .repo
-            .as_ref()
-            .map(|repo| SharedString::from(repo.name.clone()))
+        let session = self.session.as_ref().map(|session| session.read(cx));
+        let repo_label: SharedString = session
+            .map(|session| SharedString::from(session.record().name.clone()))
             .unwrap_or_else(|| "Open Repository…".into());
+
+        let branch_controls = session.map(|session| {
+            let loaded = matches!(session.branches(), BranchList::Loaded(_));
+            div()
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .min_w_0()
+                .child(self.render_branch_button(Side::Base, session, loaded, cx))
+                .child(if loaded {
+                    button("title-swap", "⇄", cx)
+                        .text_color(colors.text_muted)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_picker(cx);
+                            this.update_session(cx, |session, cx| session.swap(cx));
+                        }))
+                } else {
+                    disabled_button("title-swap", "⇄", cx)
+                })
+                .child(self.render_branch_button(Side::Head, session, loaded, cx))
+        });
+
+        let fetch = match session {
+            Some(session) if session.is_fetching() => {
+                disabled_button("title-fetch", "Fetching…", cx)
+            }
+            Some(session) if session.has_remotes() => {
+                button("title-fetch", "Fetch", cx).on_click(cx.listener(|this, _, _, cx| {
+                    this.update_session(cx, |session, cx| session.fetch(cx));
+                }))
+            }
+            _ => disabled_button("title-fetch", "Fetch", cx),
+        };
+        // Push itself arrives with #25; the counts are live already.
+        let push_label = match session.and_then(|session| session.upstream()) {
+            Some(status) => format!("Push ↑{} ↓{}", status.ahead, status.behind),
+            None => "Push".to_owned(),
+        };
 
         div()
             .id("title-bar")
@@ -560,35 +730,98 @@ impl Workspace {
                                 window.dispatch_action(OpenRepository.boxed_clone(), cx)
                             }),
                     )
-                    // Branch picker slots, wired by #6.
-                    .when(self.repo.is_some(), |row| {
-                        row.child(disabled_button("title-base", "base ▾", cx))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(colors.text_placeholder)
-                                    .child("…"),
-                            )
-                            .child(disabled_button("title-head", "head ▾", cx))
-                    }),
+                    .children(branch_controls),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .child(fetch)
+                    .child(disabled_button("title-push", push_label, cx)),
+            )
+    }
+
+    /// A `base ▾` / `head ▾` button, with its picker popover when open.
+    fn render_branch_button(
+        &self,
+        side: Side,
+        session: &RepoSession,
+        enabled: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let colors = &cx.theme().colors;
+        let id = match side {
+            Side::Base => "title-base",
+            Side::Head => "title-head",
+        };
+        let (label, placeholder): (SharedString, bool) = match session.selected(side) {
+            Some(name) => (format!("{name} ▾").into(), false),
+            None => ("pick ▾".into(), true),
+        };
+        let picker = self
+            .picker
+            .as_ref()
+            .filter(|open| open.picker.read(cx).side() == side)
+            .map(|open| open.picker.clone());
+        let trigger = if enabled {
+            button(id, label, cx)
+                .max_w(px(260.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .when(placeholder, |button| button.text_color(colors.text_muted))
+                .when(picker.is_some(), |button| {
+                    button.bg(colors.element_selected)
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.toggle_picker(side, window, cx);
+                }))
+        } else {
+            disabled_button(id, label, cx)
+        };
+        div()
+            .relative()
+            .min_w_0()
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_1()
-                    // Fetch (#6) and Push (#25) slots.
-                    .child(disabled_button("title-fetch", "Fetch", cx))
-                    .child(disabled_button("title-push", "Push ↑0 ↓0", cx)),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors.text_placeholder)
+                            .child(side.label()),
+                    )
+                    .child(trigger),
             )
+            .when_some(picker, |slot, picker| {
+                slot.child(
+                    deferred(div().absolute().top(px(30.0)).left_0().child(picker))
+                        .with_priority(1),
+                )
+            })
     }
 
     fn render_file_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
-        let body = if self.repo.is_some() {
-            placeholder("Pick a base and head branch to list the changed files.", cx)
-        } else {
-            placeholder("No repository open.", cx)
+        let body = match self
+            .session
+            .as_ref()
+            .map(|session| session.read(cx).comparison())
+        {
+            None => placeholder("No repository open.", cx),
+            Some(Comparison::Ready(target)) => placeholder(
+                format!(
+                    "{}...{}: the file list arrives with the diff viewer.",
+                    target.base, target.head
+                ),
+                cx,
+            ),
+            Some(Comparison::Resolving) => placeholder("Resolving the comparison…", cx),
+            Some(Comparison::Incomplete(message)) => placeholder(message.clone(), cx),
+            Some(Comparison::Invalid(_)) => placeholder("No diff to list.", cx),
         };
         div()
             .relative()
@@ -636,14 +869,18 @@ impl Workspace {
 
     fn render_center(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
-        let content = match &self.repo {
-            Some(repo) => self.render_diff_placeholder(repo, cx).into_any_element(),
-            None => self.render_empty_state(cx).into_any_element(),
+        let tab_title: SharedString = match self
+            .session
+            .as_ref()
+            .map(|session| session.read(cx).comparison())
+        {
+            Some(Comparison::Ready(target)) => format!("{}...{}", target.base, target.head).into(),
+            Some(_) => "Diff".into(),
+            None => "Welcome".into(),
         };
-        let tab_title: SharedString = if self.repo.is_some() {
-            "Diff".into()
-        } else {
-            "Welcome".into()
+        let content = match self.session.clone() {
+            Some(session) => self.render_comparison(session.read(cx), cx),
+            None => self.render_empty_state(cx).into_any_element(),
         };
         div()
             .flex()
@@ -689,7 +926,45 @@ impl Workspace {
             .child(content)
     }
 
-    fn render_diff_placeholder(&self, repo: &Repo, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The center of an open repository: the resolved comparison, an inline
+    /// error when the pair cannot be diffed, or what to pick next.
+    fn render_comparison(&self, session: &RepoSession, cx: &Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let path = display_path(&session.record().path);
+        match session.comparison() {
+            Comparison::Ready(target) => {
+                self.render_diff_placeholder(target, cx).into_any_element()
+            }
+            Comparison::Invalid(message) => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .p_3()
+                .gap_2()
+                .child(div().text_sm().text_color(colors.text_muted).child(path))
+                .child(
+                    div()
+                        .id("comparison-error")
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.error.opacity(0.6))
+                        .bg(colors.error.opacity(0.08))
+                        .text_sm()
+                        .text_color(colors.error)
+                        .child(message.clone()),
+                )
+                .into_any_element(),
+            Comparison::Resolving => {
+                placeholder("Computing the merge-base…", cx).into_any_element()
+            }
+            Comparison::Incomplete(message) => placeholder(message.clone(), cx).into_any_element(),
+        }
+    }
+
+    fn render_diff_placeholder(&self, target: &DiffTarget, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let colors = &theme.colors;
         // (sign, text before the changed word, changed word, text after).
@@ -715,8 +990,11 @@ impl Workspace {
                     .text_sm()
                     .text_color(colors.text_muted)
                     .child(format!(
-                        "{} — pick a base and head branch in the title bar to load the diff.",
-                        repo.path.display()
+                        "{}...{} · merge-base {} · head {} · the diff viewer arrives with #7.",
+                        target.base,
+                        target.head,
+                        target.merge_base.short(8),
+                        target.head_tip.short(8),
                     )),
             )
             .child(
@@ -1042,6 +1320,130 @@ impl Workspace {
             )
     }
 
+    /// Confirmation for a remote-only head: create a local tracking branch,
+    /// or cancel and keep the current selection.
+    fn render_tracking_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let session = self.session.as_ref()?.read(cx);
+        let prompt = session.tracking_prompt()?;
+        let colors = cx.theme().colors.clone();
+        let code = |text: &str| {
+            div()
+                .px_1()
+                .rounded_sm()
+                .bg(colors.element_hover)
+                .font_family(cx.theme().fonts.code_family.clone())
+                .child(text.to_owned())
+        };
+        let (title, explanation, confirm_label) = if prompt.local_exists {
+            (
+                "Use the local branch?",
+                "already exists locally. Argus reviews the local branch, since Accept and Push \
+                 need one.",
+                "Use local branch",
+            )
+        } else {
+            (
+                "Create a local tracking branch?",
+                "is a remote-tracking branch. Accept and Push need a local branch, so Argus can \
+                 create one that tracks it. Your checkout is not touched.",
+                "Create branch",
+            )
+        };
+        let command = format!(
+            "git branch --track {} {}",
+            prompt.local_name, prompt.remote_branch
+        );
+        let confirm = if prompt.creating {
+            disabled_button("tracking-confirm", "Creating…", cx).into_any_element()
+        } else {
+            primary_button("tracking-confirm", confirm_label, cx)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.update_session(cx, |session, cx| session.confirm_tracking(cx));
+                }))
+                .into_any_element()
+        };
+        Some(
+            div()
+                .id("tracking-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_start()
+                .justify_center()
+                .pt(px(96.0))
+                .bg(colors.overlay)
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.update_session(cx, |session, cx| session.cancel_tracking(cx));
+                    }),
+                )
+                .child(
+                    div()
+                        .id("tracking-dialog")
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .w(px(460.0))
+                        .p_4()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.elevated_surface)
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(colors.text)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_1()
+                                .text_sm()
+                                .text_color(colors.text_muted)
+                                .child(code(if prompt.local_exists {
+                                    &prompt.local_name
+                                } else {
+                                    &prompt.remote_branch
+                                }))
+                                .child(explanation),
+                        )
+                        .when(!prompt.local_exists, |dialog| {
+                            dialog.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors.text_muted)
+                                    .child(code(&command)),
+                            )
+                        })
+                        .when_some(prompt.error.clone(), |dialog, error| {
+                            dialog.child(div().text_sm().text_color(colors.error).child(error))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(button("tracking-cancel", "Cancel", cx).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.update_session(cx, |session, cx| {
+                                            session.cancel_tracking(cx)
+                                        });
+                                    }),
+                                ))
+                                .child(confirm),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_shortcuts(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
         let group = |name: &'static str| {
@@ -1339,6 +1741,7 @@ impl Render for Workspace {
             .when_some(self.sheet, |root, sheet| {
                 root.child(self.render_sheet(sheet, cx))
             })
+            .children(self.render_tracking_dialog(cx))
     }
 }
 
@@ -1371,36 +1774,4 @@ fn display_path(path: &Path) -> String {
         return format!("~/{}", rest.display());
     }
     path.display().to_string()
-}
-
-/// Validates that `path` is a git repository and records it in `repos`.
-/// Runs on the tokio runtime.
-async fn register_repository(store: &StorageService, path: PathBuf) -> Result<Repo, OpenRepoError> {
-    let io_error = |source| OpenRepoError::Io {
-        path: path.display().to_string(),
-        source,
-    };
-    let path = tokio::fs::canonicalize(&path).await.map_err(io_error)?;
-    let has_git_dir = tokio::fs::try_exists(path.join(".git"))
-        .await
-        .map_err(io_error)?;
-    let is_bare = tokio::fs::try_exists(path.join("HEAD"))
-        .await
-        .map_err(io_error)?
-        && tokio::fs::try_exists(path.join("objects"))
-            .await
-            .map_err(io_error)?;
-    if !has_git_dir && !is_bare {
-        return Err(OpenRepoError::NotARepository(path.display().to_string()));
-    }
-
-    let repos = store.repos();
-    let id = repos.upsert(&path).await?;
-    repos.touch_last_opened(id).await?;
-    repos.get(id).await?.ok_or_else(|| {
-        OpenRepoError::Store(argus_store::StoreError::NotFound {
-            entity: "repo",
-            id: id.to_string(),
-        })
-    })
 }
