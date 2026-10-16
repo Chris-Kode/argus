@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/argus",
+    "crates/argus_ui",
+    "crates/argus_git",
+    "crates/argus_diff",
+    "crates/argus_highlight",
+    "crates/argus_runs",
+    "crates/argus_store",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.98"
+repository = "https://github.com/Chris-Kode/argus"
+authors = ["Christian Andrés Bacho"]
+
+[workspace.dependencies]
+# Internal crates.
+argus_diff = { path = "crates/argus_diff" }
+argus_git = { path = "crates/argus_git" }
+argus_highlight = { path = "crates/argus_highlight" }
+argus_runs = { path = "crates/argus_runs" }
+argus_store = { path = "crates/argus_store" }
+argus_ui = { path = "crates/argus_ui" }
+
+# GPUI is not reliably published on crates.io, so it is pinned to one exact Zed
+# commit. Both crates must always point at the same rev. See CONTRIBUTING.md for
+# the pinned rev, the Zed tag it belongs to, and how to bump it.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "fb69067729cb16a7f6135e2c1600c26a28c59659" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fb69067729cb16a7f6135e2c1600c26a28c59659", features = ["font-kit"] }
+
+# Third-party dependencies shared by the workspace. Services get filled in by
+# later issues; keep versions here so every crate uses the same ones.
+anyhow = "1.0.104"
+gix = "0.89.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.28.0", features = ["serde", "v7"] }

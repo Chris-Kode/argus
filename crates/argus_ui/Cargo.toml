@@ -1,0 +1,16 @@
+[package]
+name = "argus_ui"
+description = "GPUI views, theme and app wiring for Argus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+argus_git.workspace = true
+argus_runs.workspace = true
+argus_store.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+tokio.workspace = true

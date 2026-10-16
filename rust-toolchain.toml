@@ -1,0 +1,7 @@
+# Pinned to the toolchain the pinned GPUI rev is built with in the Zed repo
+# (see CONTRIBUTING.md). Do not replace this with "stable": the GPUI pin and the
+# toolchain are bumped together.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

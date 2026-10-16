@@ -1,0 +1,10 @@
+[package]
+name = "argus_runs"
+description = "Claude run manager, prompt builder and stream-json parser for Argus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]

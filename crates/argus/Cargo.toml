@@ -1,0 +1,15 @@
+[package]
+name = "argus"
+description = "Argus — native desktop code-review tool (binary)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+argus_ui.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
