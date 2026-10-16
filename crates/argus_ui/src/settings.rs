@@ -66,6 +66,35 @@ impl RunPanelPosition {
     }
 }
 
+/// The diff layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffViewMode {
+    /// One column with old and new line numbers.
+    Unified,
+    /// Old and new columns side by side (spec §3.1 default).
+    #[default]
+    SideBySide,
+}
+
+impl DiffViewMode {
+    /// Human-readable label.
+    pub fn label(self) -> &'static str {
+        match self {
+            DiffViewMode::Unified => "Unified",
+            DiffViewMode::SideBySide => "Side by side",
+        }
+    }
+
+    /// The other mode.
+    pub fn toggled(self) -> Self {
+        match self {
+            DiffViewMode::Unified => DiffViewMode::SideBySide,
+            DiffViewMode::SideBySide => DiffViewMode::Unified,
+        }
+    }
+}
+
 /// The left dock (file tree).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -137,6 +166,11 @@ pub struct UiSettings {
     pub diff_tab_width: u32,
     /// Diff view: soft-wrap long lines instead of scrolling horizontally.
     pub diff_soft_wrap: bool,
+    /// Diff view: unified or side-by-side; the mode new diffs open in.
+    pub diff_view_mode: DiffViewMode,
+    /// Diff view, side by side: one horizontal scroll for both columns
+    /// instead of one per column.
+    pub diff_link_horizontal_scroll: bool,
 }
 
 impl Default for UiSettings {
@@ -151,6 +185,8 @@ impl Default for UiSettings {
             run_panel: RunPanelDock::default(),
             diff_tab_width: DEFAULT_TAB_WIDTH,
             diff_soft_wrap: false,
+            diff_view_mode: DiffViewMode::default(),
+            diff_link_horizontal_scroll: true,
         }
     }
 }

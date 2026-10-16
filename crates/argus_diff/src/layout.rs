@@ -1,4 +1,5 @@
-//! Row model of the unified diff viewer (spec §4, §12).
+//! Row model of the diff viewer, unified and side-by-side (spec §3.1, §4,
+//! §12).
 //!
 //! The viewer shows every file of a diff in one scrollable list. To lay out
 //! only what is visible, each file is flattened into a list of uniform-height
@@ -6,16 +7,23 @@
 //! that were not diffed yet reserve [`estimate_rows`] placeholder rows, so the
 //! total height is known without diffing anything.
 //!
+//! In [`ViewMode::Split`] the lines of a hunk become [`Row::Split`] rows: the
+//! old column on the left, the new one on the right, aligned by
+//! [`align_split`]. Added and deleted files keep unified rows, so their one
+//! meaningful side can use the full width.
+//!
 //! Everything here is pure and GPUI-free: the UI crate builds rows for a
 //! loaded [`FileDiff`] with [`build_rows`] (on a worker thread), maps a row
-//! back to its line with [`row_line`], and turns a gutter selection into a
-//! comment range with [`select_range`].
+//! back to its line with [`row_line`] / [`split_cell`], turns a gutter
+//! selection into a comment range with [`select_range`] /
+//! [`select_split_range`], and keeps the reading position across a mode
+//! toggle with [`row_key`] and [`find_row`].
 
 use std::ops::Range;
 
 use crate::file_diff::{DiffContent, FileDiff};
-use crate::model::{FileStats, Side};
-use crate::text::{LineKind, TextDiff};
+use crate::model::{ChangeKind, FileStats, Side};
+use crate::text::{DiffLine, LineKind, TextDiff};
 
 /// Lines revealed by one click on "Expand up" / "Expand down".
 pub const EXPAND_STEP: u32 = 20;
@@ -64,6 +72,75 @@ pub enum Row {
         /// Index into [`FileRows::gaps`].
         gap: u32,
     },
+    /// Side-by-side: one row of the old (left) and new (right) columns of a
+    /// hunk. A context line fills both cells with the same line; inside a
+    /// change block removed and added lines are paired by position, and the
+    /// shorter side gets [`SplitCell::FILLER`] cells.
+    Split {
+        /// The removed or context line of the left column.
+        old: SplitCell,
+        /// The added or context line of the right column.
+        new: SplitCell,
+        /// Soft-wrap segment, `0` for the first (or only) one. The row has as
+        /// many segments as the longer of its two lines.
+        segment: u32,
+    },
+}
+
+/// One cell of a [`Row::Split`]: an index into [`TextDiff::lines`], or a
+/// blank filler. Packed into a `u32` so a [`Row`] stays 16 bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SplitCell(u32);
+
+impl SplitCell {
+    /// The blank cell on the shorter side of a change block.
+    pub const FILLER: SplitCell = SplitCell(u32::MAX);
+
+    /// A cell showing diff line `index`.
+    pub fn line(index: usize) -> Self {
+        debug_assert!(index < u32::MAX as usize);
+        SplitCell(index as u32)
+    }
+
+    /// The diff line index, `None` for a filler.
+    pub fn index(self) -> Option<usize> {
+        (self != Self::FILLER).then_some(self.0 as usize)
+    }
+}
+
+impl From<Option<usize>> for SplitCell {
+    fn from(index: Option<usize>) -> Self {
+        index.map_or(Self::FILLER, Self::line)
+    }
+}
+
+impl std::fmt::Debug for SplitCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.index() {
+            Some(index) => write!(f, "{index}"),
+            None => f.write_str("-"),
+        }
+    }
+}
+
+/// The two diff layouts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ViewMode {
+    /// One column with old and new line numbers.
+    Unified,
+    /// Old and new columns side by side.
+    #[default]
+    Split,
+}
+
+impl ViewMode {
+    /// The other mode.
+    pub fn toggled(self) -> Self {
+        match self {
+            ViewMode::Unified => ViewMode::Split,
+            ViewMode::Split => ViewMode::Unified,
+        }
+    }
 }
 
 /// How lines are turned into rows.
@@ -72,8 +149,14 @@ pub struct LayoutOptions {
     /// Display width of a tab stop, in columns (at least 1).
     pub tab_width: u32,
     /// Soft wrap at this many columns; `None` keeps one row per line (long
-    /// lines scroll horizontally).
+    /// lines scroll horizontally). The width of a full-width code column:
+    /// unified files, and added/deleted files in split mode.
     pub wrap_columns: Option<u32>,
+    /// Unified or side-by-side rows.
+    pub mode: ViewMode,
+    /// Soft-wrap width of one column of a side-by-side file; `None` falls
+    /// back to `wrap_columns`.
+    pub split_wrap_columns: Option<u32>,
 }
 
 impl Default for LayoutOptions {
@@ -81,6 +164,8 @@ impl Default for LayoutOptions {
         Self {
             tab_width: 4,
             wrap_columns: None,
+            mode: ViewMode::default(),
+            split_wrap_columns: None,
         }
     }
 }
@@ -205,6 +290,10 @@ pub struct FileRows {
     pub max_columns: u32,
     /// Decimal digits of the largest line number, for the gutter width.
     pub line_digits: u32,
+    /// The hunks were laid out as [`Row::Split`] rows (two columns).
+    pub split: bool,
+    /// The soft-wrap width the rows were cut at, `None` without soft wrap.
+    pub wrap_columns: Option<u32>,
 }
 
 impl FileRows {
@@ -244,8 +333,15 @@ pub fn build_rows(
         .max(text.source(Side::New).line_count());
     out.line_digits = digits(largest);
     out.gaps = gaps(text);
+    out.split = options.mode == ViewMode::Split && !is_one_sided(diff.entry.kind);
     let tab_width = options.tab_width.max(1);
-    let wrap = options.wrap_columns.map(|columns| columns.max(1));
+    let wrap = if out.split {
+        options.split_wrap_columns.or(options.wrap_columns)
+    } else {
+        options.wrap_columns
+    }
+    .map(|columns| columns.max(1));
+    out.wrap_columns = wrap;
 
     let mut segments = |line_text: &str, crlf: bool, max_columns: &mut u32| -> u32 {
         let width = display_width(line_text, tab_width) + u32::from(crlf);
@@ -296,6 +392,31 @@ pub fn build_rows(
         out.rows.push(Row::HunkHeader {
             hunk: hunk_index as u32,
         });
+        if out.split {
+            let base = hunk.lines.start;
+            for pair in align_split(&text.lines()[hunk.lines.clone()]) {
+                let (old, new) = (pair.old.map(|i| base + i), pair.new.map(|i| base + i));
+                let mut count = 1;
+                // A context line sits in both cells; measure it once.
+                let distinct = if old == new { None } else { new };
+                for index in [old, distinct].into_iter().flatten() {
+                    let line = &text.lines()[index];
+                    count = count.max(segments(
+                        text.line_text(line),
+                        line_has_crlf(text, line.kind, line.old_line, line.new_line),
+                        &mut out.max_columns,
+                    ));
+                }
+                for segment in 0..count {
+                    out.rows.push(Row::Split {
+                        old: old.into(),
+                        new: new.into(),
+                        segment,
+                    });
+                }
+            }
+            continue;
+        }
         for index in hunk.lines.clone() {
             let line = &text.lines()[index];
             let count = segments(
@@ -316,16 +437,93 @@ pub fn build_rows(
     out
 }
 
+/// True for files whose diff has only one side (added or deleted files):
+/// side-by-side mode shows them full-width in one column.
+pub fn is_one_sided(kind: ChangeKind) -> bool {
+    matches!(kind, ChangeKind::Added | ChangeKind::Deleted)
+}
+
 /// Rows reserved for a file that is not loaded yet: its header, one hunk
 /// header, the +/- lines and the usual context. A guess; the real layout
 /// replaces it once the file is diffed.
-pub fn estimate_rows(stats: Option<&FileStats>) -> usize {
+///
+/// Side-by-side rows pair removed with added lines, so a split file is
+/// guessed at the larger of the two counts (exact for pure additions,
+/// deletions and same-size replacements).
+pub fn estimate_rows(stats: Option<&FileStats>, mode: ViewMode) -> usize {
     match stats {
         Some(FileStats::Text { added, removed }) if added + removed > 0 => {
-            2 + (*added as usize + *removed as usize) + ESTIMATED_CONTEXT_ROWS
+            let (added, removed) = (*added as usize, *removed as usize);
+            let lines = match mode {
+                ViewMode::Unified => added + removed,
+                ViewMode::Split => added.max(removed),
+            };
+            2 + lines + ESTIMATED_CONTEXT_ROWS
         }
         _ => MIN_FILE_ROWS,
     }
+}
+
+/// One aligned row of a hunk in side-by-side mode: indices into the line
+/// slice given to [`align_split`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SplitPair {
+    /// Line shown in the old (left) column; `None` for a blank filler.
+    pub old: Option<usize>,
+    /// Line shown in the new (right) column; `None` for a blank filler.
+    pub new: Option<usize>,
+}
+
+/// Aligns the lines of a hunk into side-by-side rows.
+///
+/// A context line takes a row of its own, on both sides. Between two
+/// context lines, the change block's removed lines go on the left and its
+/// added lines on the right, paired by position (the first removed line with
+/// the first added line, and so on); the shorter side is padded with
+/// fillers. Line order is kept on both sides, so a removed line following
+/// added lines (which git never emits within one block) starts a new block.
+///
+/// Typical cases, with `-`/`+`/` ` lines as input and `(old, new)` rows as
+/// output:
+///
+/// - pure add `+a +b` → `(-, a) (-, b)`
+/// - pure delete `-a -b` → `(a, -) (b, -)`
+/// - replace 3→5 `-a -b -c +d +e +f +g +h` → `(a, d) (b, e) (c, f) (-, g) (-, h)`
+/// - mixed ` x -a +b  y +c` → `(x, x) (a, b) (y, y) (-, c)`
+pub fn align_split(lines: &[DiffLine]) -> Vec<SplitPair> {
+    fn flush(out: &mut Vec<SplitPair>, removed: &mut Vec<usize>, added: &mut Vec<usize>) {
+        for row in 0..removed.len().max(added.len()) {
+            out.push(SplitPair {
+                old: removed.get(row).copied(),
+                new: added.get(row).copied(),
+            });
+        }
+        removed.clear();
+        added.clear();
+    }
+
+    let mut out = Vec::with_capacity(lines.len());
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    for (index, line) in lines.iter().enumerate() {
+        match line.kind {
+            LineKind::Context => {
+                flush(&mut out, &mut removed, &mut added);
+                out.push(SplitPair {
+                    old: Some(index),
+                    new: Some(index),
+                });
+            }
+            LineKind::Removed => {
+                if !added.is_empty() {
+                    flush(&mut out, &mut removed, &mut added);
+                }
+                removed.push(index);
+            }
+            LineKind::Added => added.push(index),
+        }
+    }
+    flush(&mut out, &mut removed, &mut added);
+    out
 }
 
 /// What a line row shows: its op, numbers, text and soft-wrap segment.
@@ -374,6 +572,29 @@ pub fn row_line(text: &TextDiff, row: Row) -> Option<RowLine<'_>> {
                 diff_index: None,
             })
         }
+        _ => None,
+    }
+}
+
+/// What one column of a side-by-side row shows: the line on `side` of a
+/// [`Row::Split`] (`None` for a filler) or of an expanded [`Row::Context`].
+/// Other rows have no cells.
+pub fn split_cell(text: &TextDiff, row: Row, side: Side) -> Option<RowLine<'_>> {
+    match row {
+        Row::Split { old, new, segment } => {
+            let cell = match side {
+                Side::Old => old,
+                Side::New => new,
+            };
+            row_line(
+                text,
+                Row::Line {
+                    index: cell.index()? as u32,
+                    segment,
+                },
+            )
+        }
+        Row::Context { .. } => row_line(text, row),
         _ => None,
     }
 }
@@ -450,6 +671,110 @@ pub fn select_range(
         (Some(a), Some(b), _, _) => Ok(range(Side::New, a, b)),
         (_, _, Some(a), Some(b)) => Ok(range(Side::Old, a, b)),
         _ => Err(RangeError::MixedSides),
+    }
+}
+
+/// Turns a side-by-side gutter selection from row `anchor` to row `head`
+/// (either order) on column `side` into a line range on that side.
+///
+/// Every row between the ends must be a [`Row::Split`] or [`Row::Context`]
+/// row: crossing a hunk header or an expander is rejected. Filler cells
+/// carry no line number, so the range runs from the first to the last line
+/// of `side` within the rows; a selection of fillers only is rejected.
+pub fn select_split_range(
+    text: &TextDiff,
+    rows: &[Row],
+    side: Side,
+    anchor: usize,
+    head: usize,
+) -> Result<LineRange, RangeError> {
+    let (first, last) = (anchor.min(head), anchor.max(head));
+    let selected = rows.get(first..=last).ok_or(RangeError::NotALine)?;
+    let is_line = |row: &Row| matches!(row, Row::Split { .. } | Row::Context { .. });
+    if !is_line(&selected[0]) || !is_line(&selected[selected.len() - 1]) {
+        return Err(RangeError::NotALine);
+    }
+    if !selected.iter().all(is_line) {
+        return Err(RangeError::CrossesHunk);
+    }
+    let number = |row: &Row| {
+        let line = split_cell(text, *row, side)?;
+        match side {
+            Side::Old => line.old_line,
+            Side::New => line.new_line,
+        }
+    };
+    let start = selected
+        .iter()
+        .find_map(number)
+        .ok_or(RangeError::NotALine)?;
+    let end = selected
+        .iter()
+        .rev()
+        .find_map(number)
+        .ok_or(RangeError::NotALine)?;
+    Ok(LineRange {
+        side,
+        start: start.min(end),
+        end: start.max(end),
+    })
+}
+
+/// A row's logical position in its file, independent of the layout mode and
+/// soft wrap. Used to keep the same line at the top of the viewport when
+/// the layout changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RowKey {
+    /// The file header.
+    FileHeader,
+    /// A placeholder or notice row (`row` in file).
+    Other(u32),
+    /// Hunk header `hunk`.
+    Hunk(u32),
+    /// Diff line `index` (into [`TextDiff::lines`]).
+    Line(u32),
+    /// Expanded context line with this old line number.
+    Context(u32),
+    /// Expander of gap `gap`.
+    Expander(u32),
+}
+
+/// The logical position of row `index` of `rows`. A side-by-side row maps
+/// to the first of its lines (the removed one of a pair), which is where
+/// the unified layout shows that pair starting.
+pub fn row_key(rows: &[Row], index: usize) -> RowKey {
+    match rows.get(index) {
+        Some(Row::FileHeader) | None => RowKey::FileHeader,
+        Some(Row::Placeholder | Row::Notice) => RowKey::Other(index as u32),
+        Some(&Row::HunkHeader { hunk }) => RowKey::Hunk(hunk),
+        Some(&Row::Line { index, .. }) => RowKey::Line(index),
+        Some(&Row::Split { old, new, .. }) => match (old.index(), new.index()) {
+            (Some(a), Some(b)) => RowKey::Line(a.min(b) as u32),
+            (Some(line), None) | (None, Some(line)) => RowKey::Line(line as u32),
+            (None, None) => RowKey::Other(index as u32),
+        },
+        Some(&Row::Context { old, .. }) => RowKey::Context(old),
+        Some(&Row::Expander { gap }) => RowKey::Expander(gap),
+    }
+}
+
+/// The first row of `rows` at logical position `key`, in either layout.
+/// `None` when the row no longer exists (e.g. the file was re-diffed).
+pub fn find_row(rows: &[Row], key: RowKey) -> Option<usize> {
+    match key {
+        RowKey::FileHeader => Some(0),
+        RowKey::Other(row) => Some((row as usize).min(rows.len().saturating_sub(1))),
+        key => rows.iter().position(|row| match (*row, key) {
+            (Row::HunkHeader { hunk }, RowKey::Hunk(wanted)) => hunk == wanted,
+            (Row::Line { index, .. }, RowKey::Line(wanted)) => index == wanted,
+            (Row::Split { old, new, .. }, RowKey::Line(wanted)) => {
+                let wanted = Some(wanted as usize);
+                old.index() == wanted || new.index() == wanted
+            }
+            (Row::Context { old, .. }, RowKey::Context(wanted)) => old == wanted,
+            (Row::Expander { gap }, RowKey::Expander(wanted)) => gap == wanted,
+            _ => false,
+        }),
     }
 }
 

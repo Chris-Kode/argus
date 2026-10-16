@@ -1,5 +1,16 @@
-//! The unified diff viewer: every file of the diff in one virtualized,
-//! scrollable list (spec §4, §9, §12).
+//! The diff viewer: every file of the diff in one virtualized, scrollable
+//! list, unified or side by side (spec §3.1, §4, §9, §12).
+//!
+//! # Modes
+//!
+//! Unified rows show both line numbers in one gutter. Side-by-side rows
+//! ([`Row::Split`]) show the old column on the left and the new one on the
+//! right, each with its own gutter, sharing the vertical scroll; horizontal
+//! scroll is linked or per column ([`DisplayOptions::link_horizontal_scroll`]).
+//! Added and deleted files keep unified rows in side-by-side mode, so their
+//! one side gets the full width. Toggling the mode re-lays out loaded files
+//! and keeps the line at the top of the viewport there
+//! ([`layout::row_key`] / [`layout::find_row`]).
 //!
 //! # Rows
 //!
@@ -39,17 +50,22 @@
 //! selection within the file. On release the selection is resolved into a
 //! [`LineSelection`] (file, side, start, end) and emitted as
 //! [`DiffViewEvent::LinesSelected`], or rejected with a hint (e.g. when it
-//! crosses a hunk header). The gutter "+" emits
+//! crosses a hunk header). In side-by-side mode each column has its own
+//! gutter: the left one selects old lines, the right one new lines. The
+//! gutter "+" emits
 //! [`DiffViewEvent::CommentRequested`]; comments (#14) subscribe to both.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
-use argus_diff::layout::{self, DisplayLine, Expand, FileRows, GapExpansion, LayoutOptions, Row};
+use argus_diff::layout::{
+    self, DisplayLine, Expand, FileRows, GapExpansion, LayoutOptions, Row, RowKey, RowLine,
+    ViewMode,
+};
 use argus_diff::{
     ChangeKind, DiffContent, DiffSession, FileDiff, FileEntry, FileList, FileStats, LineKind,
-    LoadMode, Side as DiffSide, StatsEvent,
+    LoadMode, Side as DiffSide, StatsEvent, TextDiff,
 };
 use gpui::{
     AnyElement, Context, DispatchPhase, EventEmitter, FontWeight, HighlightStyle, Hsla,
@@ -85,6 +101,11 @@ const NUMBER_PADDING: Pixels = px(12.0);
 const CODE_PADDING: Pixels = px(4.0);
 /// Group name shared by the elements of one line row, for hover effects.
 const LINE_GROUP: &str = "diff-line";
+/// Hover groups of the two columns of a side-by-side row.
+const OLD_GROUP: &str = "diff-line-old";
+const NEW_GROUP: &str = "diff-line-new";
+/// Width of the rule between the two columns of a side-by-side row.
+const SPLIT_DIVIDER_WIDTH: Pixels = px(1.0);
 
 /// A resolved line selection: what a comment anchors to (spec §7.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +143,10 @@ pub struct DisplayOptions {
     pub tab_width: u32,
     /// Soft-wrap long lines instead of scrolling horizontally.
     pub soft_wrap: bool,
+    /// Unified or side-by-side.
+    pub mode: ViewMode,
+    /// Side by side: scroll both columns horizontally together.
+    pub link_horizontal_scroll: bool,
 }
 
 /// The file list of the diff.
@@ -180,9 +205,9 @@ struct FileSlot {
 }
 
 impl FileSlot {
-    fn new(stats: Option<FileStats>, viewed: bool) -> Self {
+    fn new(stats: Option<FileStats>, viewed: bool, mode: ViewMode) -> Self {
         Self {
-            full_len: layout::estimate_rows(stats.as_ref()),
+            full_len: layout::estimate_rows(stats.as_ref(), mode),
             stats,
             state: FileState::Pending,
             collapsed: viewed,
@@ -211,6 +236,9 @@ impl FileSlot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Selection {
     file: usize,
+    /// The column of a side-by-side selection; `None` in unified rows,
+    /// where the side follows from the selected lines.
+    side: Option<DiffSide>,
     anchor: usize,
     head: usize,
 }
@@ -264,6 +292,24 @@ struct Columns {
     code: Pixels,
 }
 
+/// Horizontal measures of one column of a side-by-side row.
+#[derive(Clone, Copy)]
+struct SplitColumns {
+    /// The whole column: gutter, "+", sign and code.
+    half: Pixels,
+    number: Pixels,
+    sign: Pixels,
+    code: Pixels,
+}
+
+/// Index of a side's horizontal offset in [`DiffView::h_offset`].
+fn side_index(side: DiffSide) -> usize {
+    match side {
+        DiffSide::Old => 0,
+        DiffSide::New => 1,
+    }
+}
+
 /// The unified diff of one [`DiffTarget`].
 pub struct DiffView {
     session: DiffSession,
@@ -274,9 +320,12 @@ pub struct DiffView {
     /// the total row count.
     starts: Vec<usize>,
     scroll: UniformListScrollHandle,
-    h_offset: Pixels,
+    /// Horizontal scroll of the code: `[0]` for unified rows and the old
+    /// column, `[1]` for the new column (equal when linked).
+    h_offset: [Pixels; 2],
     options: DisplayOptions,
     wrap_columns: Option<u32>,
+    split_wrap_columns: Option<u32>,
     metrics: Metrics,
     gutter_digits: u32,
     max_columns: u32,
@@ -294,6 +343,10 @@ pub struct DiffView {
     /// the revealed file cannot reach the top, and echoing the file above
     /// it would move the tree's selection back.
     revealed_at: Option<f64>,
+    /// The line the last re-layout kept at the top, as (file, key). A
+    /// side-by-side row holds two lines; remembering which one was read
+    /// lets a toggle back return to it rather than to its partner.
+    layout_anchor: Option<(usize, RowKey)>,
     list_task: Option<Task<()>>,
     stats_task: Option<Task<()>>,
 }
@@ -318,9 +371,10 @@ impl DiffView {
             files: Vec::new(),
             starts: vec![0],
             scroll: UniformListScrollHandle::new(),
-            h_offset: Pixels::ZERO,
+            h_offset: [Pixels::ZERO; 2],
             options,
             wrap_columns: None,
+            split_wrap_columns: None,
             metrics: Metrics {
                 row_height: px(20.0),
                 char_width: px(8.0),
@@ -337,6 +391,7 @@ impl DiffView {
             remembered_viewed: viewed,
             active_file: None,
             revealed_at: None,
+            layout_anchor: None,
             list_task: None,
             stats_task: None,
         };
@@ -362,18 +417,33 @@ impl DiffView {
             .collect()
     }
 
-    /// Applies new display options (tab width, soft wrap).
+    /// The current layout mode.
+    pub fn mode(&self) -> ViewMode {
+        self.options.mode
+    }
+
+    /// Applies new display options (tab width, soft wrap, mode, linked
+    /// horizontal scroll). A mode change keeps the line at the top of the
+    /// viewport in place.
     pub fn set_options(&mut self, options: DisplayOptions, cx: &mut Context<Self>) {
         if self.options == options {
             return;
         }
+        let mode_changed = self.options.mode != options.mode;
         self.options = options;
-        if options.soft_wrap {
-            self.h_offset = Pixels::ZERO;
+        if options.soft_wrap || mode_changed {
+            self.h_offset = [Pixels::ZERO; 2];
+        } else if options.link_horizontal_scroll {
+            self.h_offset[1] = self.h_offset[0];
+        }
+        if mode_changed {
+            // Rows of the other layout mean other lines.
+            self.selection = None;
         }
         // Soft wrap columns follow the width, measured at the next render.
         self.wrap_columns = None;
-        self.relayout_loaded();
+        self.split_wrap_columns = None;
+        self.relayout_loaded(mode_changed);
         cx.notify();
     }
 
@@ -410,6 +480,7 @@ impl DiffView {
                 FileSlot::new(
                     self.session.stats(entry.index),
                     viewed.contains(&entry.path),
+                    self.options.mode,
                 )
             })
             .collect();
@@ -432,13 +503,14 @@ impl DiffView {
     }
 
     fn apply_stats(&mut self, batch: Vec<(usize, FileStats)>, cx: &mut Context<Self>) {
+        let mode = self.options.mode;
         self.relayout(|this| {
             for (index, stats) in batch {
                 let Some(slot) = this.files.get_mut(index) else {
                     continue;
                 };
                 if matches!(slot.state, FileState::Pending) {
-                    slot.full_len = layout::estimate_rows(Some(&stats));
+                    slot.full_len = layout::estimate_rows(Some(&stats), mode);
                 }
                 slot.stats = Some(stats);
             }
@@ -464,6 +536,8 @@ impl DiffView {
         LayoutOptions {
             tab_width: self.options.tab_width,
             wrap_columns: self.wrap_columns.filter(|_| self.options.soft_wrap),
+            mode: self.options.mode,
+            split_wrap_columns: self.split_wrap_columns.filter(|_| self.options.soft_wrap),
         }
     }
 
@@ -639,10 +713,21 @@ impl DiffView {
         }
     }
 
-    /// Lays loaded files out again after the layout options changed.
-    fn relayout_loaded(&mut self) {
+    /// Lays loaded files out again after the layout options changed, keeping
+    /// the line at the top of the viewport there. `reestimate` recomputes
+    /// the placeholder rows of files that are not loaded (after a mode
+    /// change, which changes their estimate).
+    fn relayout_loaded(&mut self, reestimate: bool) {
         let layout = self.layout_options();
+        let logical = self.logical_anchor();
         self.relayout(|this| {
+            if reestimate {
+                for slot in &mut this.files {
+                    if matches!(slot.state, FileState::Pending | FileState::Evicted) {
+                        slot.full_len = layout::estimate_rows(slot.stats.as_ref(), layout.mode);
+                    }
+                }
+            }
             for slot in &mut this.files {
                 let FileState::Loaded(loaded) = &mut slot.state else {
                     continue;
@@ -656,6 +741,10 @@ impl DiffView {
             }
             this.selection = None;
         });
+        if let Some((anchor, key)) = logical {
+            self.restore_logical(anchor, key);
+            self.layout_anchor = key.map(|key| (anchor.file, key));
+        }
         self.held_bytes = self
             .files
             .iter()
@@ -742,6 +831,40 @@ impl DiffView {
         self.set_scroll_top(row as f64 * self.row_height() + anchor.offset);
     }
 
+    /// The top-of-viewport anchor plus the logical position of its row, which
+    /// survives a re-layout in another mode or wrap width.
+    fn logical_anchor(&self) -> Option<(Anchor, Option<RowKey>)> {
+        let anchor = self.anchor()?;
+        let slot = self.files.get(anchor.file)?;
+        let key = slot.loaded().filter(|_| !slot.collapsed).map(|loaded| {
+            let rows = &loaded.rows.rows;
+            // Still on the row the last re-layout restored: keep its line.
+            match self.layout_anchor {
+                Some((file, key))
+                    if file == anchor.file && layout::find_row(rows, key) == Some(anchor.row) =>
+                {
+                    key
+                }
+                _ => layout::row_key(rows, anchor.row),
+            }
+        });
+        Some((anchor, key))
+    }
+
+    /// Scrolls back to a [`Self::logical_anchor`]: to the row now showing
+    /// the same line, or to the same row index when the line is gone.
+    fn restore_logical(&self, anchor: Anchor, key: Option<RowKey>) {
+        let row = key.and_then(|key| {
+            let slot = self.files.get(anchor.file)?;
+            let loaded = slot.loaded().filter(|_| !slot.collapsed)?;
+            layout::find_row(&loaded.rows.rows, key)
+        });
+        match row {
+            Some(row) => self.restore(Anchor { row, ..anchor }),
+            None => self.restore(anchor),
+        }
+    }
+
     /// Runs `change` (which may change row counts) keeping the row at the
     /// top of the viewport in place.
     fn relayout(&mut self, change: impl FnOnce(&mut Self)) {
@@ -818,12 +941,30 @@ impl DiffView {
         if delta.x.abs() <= delta.y.abs() {
             return;
         }
-        let columns = self.columns();
+        let (code, sides) = match self.options.mode {
+            ViewMode::Unified => (self.columns().code, 0..1),
+            ViewMode::Split if self.options.link_horizontal_scroll => {
+                (self.split_columns().code, 0..2)
+            }
+            ViewMode::Split => {
+                // Unlinked: the column under the pointer scrolls.
+                let split = self.split_columns();
+                let middle = self.list_bounds().origin.x + split.half;
+                let side = usize::from(event.position.x >= middle);
+                (split.code, side..side + 1)
+            }
+        };
         let content = self.metrics.char_width * (self.max_columns + 2) as f32;
-        let max = (content - columns.code).max(Pixels::ZERO);
-        let next = (self.h_offset - delta.x).clamp(Pixels::ZERO, max);
-        if next != self.h_offset {
-            self.h_offset = next;
+        let max = (content - code).max(Pixels::ZERO);
+        let mut changed = false;
+        for side in sides {
+            let next = (self.h_offset[side] - delta.x).clamp(Pixels::ZERO, max);
+            if next != self.h_offset[side] {
+                self.h_offset[side] = next;
+                changed = true;
+            }
+        }
+        if changed {
             cx.notify();
         }
     }
@@ -1007,14 +1148,24 @@ impl DiffView {
 
     // ---- selection ----------------------------------------------------------
 
-    fn gutter_down(&mut self, file: usize, row: usize, shift: bool, cx: &mut Context<Self>) {
+    fn gutter_down(
+        &mut self,
+        file: usize,
+        row: usize,
+        side: Option<DiffSide>,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.selection = match self.selection {
-            Some(selection) if shift && selection.file == file => Some(Selection {
-                head: row,
-                ..selection
-            }),
+            Some(selection) if shift && selection.file == file && selection.side == side => {
+                Some(Selection {
+                    head: row,
+                    ..selection
+                })
+            }
             _ => Some(Selection {
                 file,
+                side,
                 anchor: row,
                 head: row,
             }),
@@ -1077,7 +1228,13 @@ impl DiffView {
         let entry = list.entries().get(selection.file)?;
         let loaded = self.files.get(selection.file)?.loaded()?;
         let text = loaded.diff.text()?;
-        let range = layout::select_range(text, &loaded.rows.rows, selection.anchor, selection.head);
+        let rows = &loaded.rows.rows;
+        let range = match selection.side {
+            Some(side) if loaded.rows.split => {
+                layout::select_split_range(text, rows, side, selection.anchor, selection.head)
+            }
+            _ => layout::select_range(text, rows, selection.anchor, selection.head),
+        };
         Some(range.map(|range| LineSelection {
             file: entry.path.clone(),
             old_file: entry.old_path.clone(),
@@ -1107,13 +1264,17 @@ impl DiffView {
 
     /// The gutter "+": comments on the current selection when the row is in
     /// it, otherwise on that line alone.
-    fn request_comment(&mut self, file: usize, row: usize, cx: &mut Context<Self>) {
-        let inside = self
-            .selection
-            .is_some_and(|selection| selection.file == file && selection.rows().contains(&row));
-        if !inside {
+    fn request_comment(
+        &mut self,
+        file: usize,
+        row: usize,
+        side: Option<DiffSide>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_selected(file, row, side) {
             self.selection = Some(Selection {
                 file,
+                side,
                 anchor: row,
                 head: row,
             });
@@ -1124,9 +1285,10 @@ impl DiffView {
         cx.notify();
     }
 
-    fn is_selected(&self, file: usize, row: usize) -> bool {
-        self.selection
-            .is_some_and(|selection| selection.file == file && selection.rows().contains(&row))
+    fn is_selected(&self, file: usize, row: usize, side: Option<DiffSide>) -> bool {
+        self.selection.is_some_and(|selection| {
+            selection.file == file && selection.side == side && selection.rows().contains(&row)
+        })
     }
 
     // ---- rendering ----------------------------------------------------------
@@ -1170,17 +1332,42 @@ impl DiffView {
         }
     }
 
+    /// Measures of one column of a side-by-side row.
+    fn split_columns(&self) -> SplitColumns {
+        let char_width = self.metrics.char_width;
+        let number = char_width * self.gutter_digits as f32 + NUMBER_PADDING;
+        let sign = char_width * 2.0;
+        let width = self.list_bounds().size.width;
+        let half = ((width - SCROLLBAR_WIDTH - SPLIT_DIVIDER_WIDTH) / 2.0).max(Pixels::ZERO);
+        let code = (half - number - COMMENT_COLUMN_WIDTH - sign - CODE_PADDING)
+            .max(char_width * MIN_WRAP_COLUMNS as f32);
+        SplitColumns {
+            half,
+            number,
+            sign,
+            code,
+        }
+    }
+
     /// Re-wraps loaded files when the soft-wrap width changed.
     fn update_wrap(&mut self) {
-        let wanted = if self.options.soft_wrap && self.list_bounds().size.width > Pixels::ZERO {
-            let columns = (self.columns().code / self.metrics.char_width).floor() as u32;
+        let wrap_at = |code: Pixels| {
+            let columns = (code / self.metrics.char_width).floor() as u32;
             Some(columns.max(MIN_WRAP_COLUMNS))
-        } else {
-            None
         };
-        if wanted != self.wrap_columns {
+        let (wanted, wanted_split) =
+            if self.options.soft_wrap && self.list_bounds().size.width > Pixels::ZERO {
+                (
+                    wrap_at(self.columns().code),
+                    wrap_at(self.split_columns().code),
+                )
+            } else {
+                (None, None)
+            };
+        if wanted != self.wrap_columns || wanted_split != self.split_wrap_columns {
             self.wrap_columns = wanted;
-            self.relayout_loaded();
+            self.split_wrap_columns = wanted_split;
+            self.relayout_loaded(false);
         }
     }
 
@@ -1259,6 +1446,12 @@ impl DiffView {
                     self.render_expander(file, loaded, gap as usize, row, columns, cx)
                 }
                 Some(&Row::Notice) => self.render_notice(file, entry, slot, columns, cx),
+                Some(&split_row @ Row::Split { .. }) => {
+                    self.render_split_row(file, loaded, split_row, local, row, cx)
+                }
+                Some(&context @ Row::Context { .. }) if loaded.rows.split => {
+                    self.render_split_row(file, loaded, context, local, row, cx)
+                }
                 Some(&line_row @ (Row::Line { .. } | Row::Context { .. })) => {
                     self.render_line(file, loaded, line_row, local, row, columns, cx)
                 }
@@ -1304,47 +1497,9 @@ impl DiffView {
         let Some(line) = layout::row_line(text, row_kind) else {
             return div().into_any_element();
         };
-        let (background, sign, sign_color, word_background) = match line.kind {
-            LineKind::Added => (
-                colors.diff_added_background,
-                "+",
-                colors.diff_added_text,
-                colors.diff_added_word,
-            ),
-            LineKind::Removed => (
-                colors.diff_removed_background,
-                "-",
-                colors.diff_removed_text,
-                colors.diff_removed_word,
-            ),
-            LineKind::Context => (colors.background, " ", colors.text_muted, colors.background),
-        };
+        let style = LineStyle::of(line.kind, &colors);
         let first_segment = line.segment == 0;
-        let selected = self.is_selected(file, local);
-        let char_width = self.metrics.char_width;
-
-        let window = match loaded.layout.wrap_columns {
-            Some(width) => line.segment * width..(line.segment + 1) * width,
-            None => {
-                let first = (self.h_offset / char_width).floor() as u32;
-                let visible = (columns.code / char_width).ceil() as u32 + 2;
-                first..first + visible
-            }
-        };
-        let shift = match loaded.layout.wrap_columns {
-            Some(_) => Pixels::ZERO,
-            None => self.h_offset - char_width * window.start as f32,
-        };
-        let display = layout::display_window(line.text, line.crlf, loaded.layout.tab_width, window);
-        let words = line
-            .diff_index
-            .and_then(|index| {
-                let hunk = text.hunk_of_line(index)?;
-                Some(text.intra_line_if_ready(hunk)?.ranges(index))
-            })
-            .unwrap_or(&[]);
-        let runs = highlight_runs(&display, words, word_background, colors.text_placeholder);
-        let code = StyledText::new(display.text).with_highlights(runs);
+        let selected = self.is_selected(file, local, None);
 
         let number = |value: Option<u32>| {
             div()
@@ -1355,34 +1510,240 @@ impl DiffView {
                 .whitespace_nowrap()
                 .children(value.filter(|_| first_segment).map(|n| n.to_string()))
         };
-        let gutter_background = if selected {
-            colors.accent.opacity(0.35)
-        } else {
-            colors.background.opacity(0.4)
+        let gutter = self
+            .gutter(("diff-gutter", row), selected, cx)
+            .w(columns.gutter)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.gutter_down(file, local, None, event.modifiers.shift, cx);
+                }),
+            )
+            .child(number(line.old_line))
+            .child(number(line.new_line));
+        let code = self.render_code(
+            text,
+            loaded,
+            &line,
+            self.h_offset[0],
+            columns.code,
+            style.word_background,
+            selected,
+            cx,
+        );
+        div()
+            .group(LINE_GROUP)
+            .flex()
+            .size_full()
+            .bg(style.background)
+            .child(gutter)
+            .child(self.comment_column(
+                ("diff-comment", row),
+                LINE_GROUP,
+                first_segment,
+                file,
+                local,
+                None,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex_none()
+                    .w(columns.sign)
+                    .text_color(style.sign_color)
+                    .children(first_segment.then_some(style.sign)),
+            )
+            .child(code)
+            .into_any_element()
+    }
+
+    /// A side-by-side row: the old column, a divider, the new column. Each
+    /// column has its own gutter, which selects lines of its side.
+    fn render_split_row(
+        &self,
+        file: usize,
+        loaded: &LoadedFile,
+        row_kind: Row,
+        local: usize,
+        row: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let Some(text) = loaded.diff.text() else {
+            return div().into_any_element();
         };
-        let gutter = div()
-            .id(("diff-gutter", row))
+        let columns = self.split_columns();
+        let old = self.render_split_half(
+            file,
+            loaded,
+            text,
+            row_kind,
+            DiffSide::Old,
+            local,
+            row,
+            columns,
+            cx,
+        );
+        let new = self.render_split_half(
+            file,
+            loaded,
+            text,
+            row_kind,
+            DiffSide::New,
+            local,
+            row,
+            columns,
+            cx,
+        );
+        div()
+            .flex()
+            .size_full()
+            .child(old)
+            .child(
+                div()
+                    .flex_none()
+                    .h_full()
+                    .w(SPLIT_DIVIDER_WIDTH)
+                    .bg(colors.border_variant),
+            )
+            .child(new)
+            .into_any_element()
+    }
+
+    /// One column of a side-by-side row: a line of `side`, or a blank filler
+    /// when the other side of the change block is longer.
+    #[allow(clippy::too_many_arguments)]
+    fn render_split_half(
+        &self,
+        file: usize,
+        loaded: &LoadedFile,
+        text: &TextDiff,
+        row_kind: Row,
+        side: DiffSide,
+        local: usize,
+        row: usize,
+        columns: SplitColumns,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let half = div().flex().flex_none().h_full().w(columns.half);
+        let Some(line) = layout::split_cell(text, row_kind, side) else {
+            // Filler: nothing on this side of the change block.
+            return half
+                .bg(colors.surface.opacity(0.5))
+                .child(
+                    div()
+                        .flex_none()
+                        .h_full()
+                        .w(columns.number + COMMENT_COLUMN_WIDTH)
+                        .bg(colors.background.opacity(0.4)),
+                )
+                .into_any_element();
+        };
+        let (group, gutter_id, comment_id) = match side {
+            DiffSide::Old => (OLD_GROUP, "diff-gutter-old", "diff-comment-old"),
+            DiffSide::New => (NEW_GROUP, "diff-gutter-new", "diff-comment-new"),
+        };
+        let style = LineStyle::of(line.kind, &colors);
+        let first_segment = line.segment == 0;
+        let selected = self.is_selected(file, local, Some(side));
+        let number = match side {
+            DiffSide::Old => line.old_line,
+            DiffSide::New => line.new_line,
+        };
+        let gutter = self
+            .gutter((gutter_id, row), selected, cx)
+            .w(columns.number)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.gutter_down(file, local, Some(side), event.modifiers.shift, cx);
+                }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(columns.number)
+                    .pr(NUMBER_PADDING / 2.0)
+                    .text_right()
+                    .whitespace_nowrap()
+                    .children(number.filter(|_| first_segment).map(|n| n.to_string())),
+            );
+        let code = self.render_code(
+            text,
+            loaded,
+            &line,
+            self.h_offset[side_index(side)],
+            columns.code,
+            style.word_background,
+            selected,
+            cx,
+        );
+        half.group(group)
+            .bg(style.background)
+            .child(gutter)
+            .child(self.comment_column(
+                (comment_id, row),
+                group,
+                first_segment,
+                file,
+                local,
+                Some(side),
+                cx,
+            ))
+            .child(
+                div()
+                    .flex_none()
+                    .w(columns.sign)
+                    .text_color(style.sign_color)
+                    .children(first_segment.then_some(style.sign)),
+            )
+            .child(code)
+            .into_any_element()
+    }
+
+    /// The clickable line-number gutter of a line row, without its numbers.
+    fn gutter(
+        &self,
+        id: (&'static str, usize),
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let colors = &cx.theme().colors;
+        div()
+            .id(id)
             .flex()
             .flex_none()
             .h_full()
-            .w(columns.gutter)
-            .bg(gutter_background)
+            .bg(if selected {
+                colors.accent.opacity(0.35)
+            } else {
+                colors.background.opacity(0.4)
+            })
             .text_color(if selected {
                 colors.text
             } else {
                 colors.text_placeholder
             })
             .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.gutter_down(file, local, event.modifiers.shift, cx);
-                }),
-            )
-            .child(number(line.old_line))
-            .child(number(line.new_line));
-        let comment_button = div()
+    }
+
+    /// The column holding the hover "+" comment button of a line row.
+    #[allow(clippy::too_many_arguments)]
+    fn comment_column(
+        &self,
+        id: (&'static str, usize),
+        group: &'static str,
+        first_segment: bool,
+        file: usize,
+        local: usize,
+        side: Option<DiffSide>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let colors = cx.theme().colors.clone();
+        div()
             .flex()
             .flex_none()
             .items_center()
@@ -1393,9 +1754,9 @@ impl DiffView {
                 let accent = colors.accent;
                 column.child(
                     div()
-                        .id(("diff-comment", row))
+                        .id(id)
                         .invisible()
-                        .group_hover(LINE_GROUP, |style| style.visible())
+                        .group_hover(group, |style| style.visible())
                         .flex()
                         .items_center()
                         .justify_center()
@@ -1410,38 +1771,61 @@ impl DiffView {
                             MouseButton::Left,
                             cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
-                                this.request_comment(file, local, cx);
+                                this.request_comment(file, local, side, cx);
                             }),
                         )
                         .child("+"),
                 )
-            });
+            })
+    }
+
+    /// The code of a line row: the soft-wrap segment, or the columns visible
+    /// at horizontal offset `h_offset` in a column `code_width` wide.
+    #[allow(clippy::too_many_arguments)]
+    fn render_code(
+        &self,
+        text: &TextDiff,
+        loaded: &LoadedFile,
+        line: &RowLine<'_>,
+        h_offset: Pixels,
+        code_width: Pixels,
+        word_background: Hsla,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let colors = &cx.theme().colors;
+        let char_width = self.metrics.char_width;
+        let window = match loaded.rows.wrap_columns {
+            Some(width) => line.segment * width..(line.segment + 1) * width,
+            None => {
+                let first = (h_offset / char_width).floor() as u32;
+                let visible = (code_width / char_width).ceil() as u32 + 2;
+                first..first + visible
+            }
+        };
+        let shift = match loaded.rows.wrap_columns {
+            Some(_) => Pixels::ZERO,
+            None => h_offset - char_width * window.start as f32,
+        };
+        let display = layout::display_window(line.text, line.crlf, loaded.layout.tab_width, window);
+        let words = line
+            .diff_index
+            .and_then(|index| {
+                let hunk = text.hunk_of_line(index)?;
+                Some(text.intra_line_if_ready(hunk)?.ranges(index))
+            })
+            .unwrap_or(&[]);
+        let runs = highlight_runs(&display, words, word_background, colors.text_placeholder);
+        let code = StyledText::new(display.text).with_highlights(runs);
         div()
-            .group(LINE_GROUP)
-            .flex()
-            .size_full()
-            .bg(background)
-            .child(gutter)
-            .child(comment_button)
-            .child(
-                div()
-                    .flex_none()
-                    .w(columns.sign)
-                    .text_color(sign_color)
-                    .children(first_segment.then_some(sign)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .overflow_hidden()
-                    .pl(CODE_PADDING)
-                    .whitespace_nowrap()
-                    .when(selected, |code| code.bg(colors.accent.opacity(0.1)))
-                    .child(div().relative().left(-shift).child(code)),
-            )
-            .into_any_element()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .pl(CODE_PADDING)
+            .whitespace_nowrap()
+            .when(selected, |code| code.bg(colors.accent.opacity(0.1)))
+            .child(div().relative().left(-shift).child(code))
     }
 
     fn render_expander(
@@ -1942,6 +2326,40 @@ impl Render for DiffView {
                 .children(scrollbar)
                 .children(drag_listener),
         )
+    }
+}
+
+/// Colors and sign of a line by its kind.
+struct LineStyle {
+    background: Hsla,
+    sign: &'static str,
+    sign_color: Hsla,
+    word_background: Hsla,
+}
+
+impl LineStyle {
+    fn of(kind: LineKind, colors: &crate::theme::ThemeColors) -> Self {
+        let (background, sign, sign_color, word_background) = match kind {
+            LineKind::Added => (
+                colors.diff_added_background,
+                "+",
+                colors.diff_added_text,
+                colors.diff_added_word,
+            ),
+            LineKind::Removed => (
+                colors.diff_removed_background,
+                "-",
+                colors.diff_removed_text,
+                colors.diff_removed_word,
+            ),
+            LineKind::Context => (colors.background, " ", colors.text_muted, colors.background),
+        };
+        Self {
+            background,
+            sign,
+            sign_color,
+            word_background,
+        }
     }
 }
 

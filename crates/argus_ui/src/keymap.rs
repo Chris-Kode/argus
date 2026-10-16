@@ -19,6 +19,8 @@ actions!(
         PreviousHunk,
         /// Soft-wrap long diff lines, or scroll them horizontally.
         ToggleSoftWrap,
+        /// Switch the diff between unified and side-by-side.
+        ToggleDiffMode,
         /// Start a comment on the selected line(s).
         Comment,
         /// Run the selected comment with Claude.
@@ -187,6 +189,13 @@ pub const SHORTCUTS: &[Shortcut] = &[
         NAVIGATION,
         "Layout",
         "Toggle soft wrap in the diff"
+    ),
+    shortcut!(
+        "secondary-shift-d",
+        ToggleDiffMode,
+        None,
+        "Layout",
+        "Toggle unified / side-by-side diff"
     ),
     shortcut!(
         "c",
