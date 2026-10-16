@@ -59,6 +59,8 @@ automations:
 
         {{ issue.body }}
 
+        We dont have any credentials to provide for run the claude cli, so do any proofs that you can without them,
+        a human will review the implementation after you finish
         Read the implementation asked in the issue and run the
         retained checks.
         Add automated tests only after an explicit user
