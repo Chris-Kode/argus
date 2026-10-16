@@ -1,5 +1,5 @@
 //! UI settings persisted in the `settings` table under the [`UI_SETTINGS_KEY`]
-//! key: theme, fonts, and dock sizes and visibility.
+//! key: theme, fonts, dock sizes and visibility, and diff display options.
 //!
 //! Loading and saving go through [`argus_store::SettingsStore`] on the tokio
 //! runtime, never on the UI thread.
@@ -29,6 +29,13 @@ pub const DEFAULT_FILE_TREE_WIDTH: f32 = 260.0;
 pub const DEFAULT_RUN_PANEL_WIDTH: f32 = 340.0;
 /// Default height of the run panel when docked at the bottom.
 pub const DEFAULT_RUN_PANEL_HEIGHT: f32 = 240.0;
+
+/// Default display width of a tab in the diff view, in columns.
+pub const DEFAULT_TAB_WIDTH: u32 = 4;
+/// Smallest allowed tab width.
+pub const MIN_TAB_WIDTH: u32 = 1;
+/// Largest allowed tab width.
+pub const MAX_TAB_WIDTH: u32 = 16;
 
 /// Where the run panel is docked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +133,10 @@ pub struct UiSettings {
     pub file_tree: FileTreeDock,
     /// Run panel dock.
     pub run_panel: RunPanelDock,
+    /// Diff view: tab width in columns.
+    pub diff_tab_width: u32,
+    /// Diff view: soft-wrap long lines instead of scrolling horizontally.
+    pub diff_soft_wrap: bool,
 }
 
 impl Default for UiSettings {
@@ -138,6 +149,8 @@ impl Default for UiSettings {
             code_font_size: DEFAULT_CODE_FONT_SIZE,
             file_tree: FileTreeDock::default(),
             run_panel: RunPanelDock::default(),
+            diff_tab_width: DEFAULT_TAB_WIDTH,
+            diff_soft_wrap: false,
         }
     }
 }
@@ -168,6 +181,7 @@ impl UiSettings {
         self.file_tree.width = clamp_dock_size(self.file_tree.width, DEFAULT_FILE_TREE_WIDTH);
         self.run_panel.width = clamp_dock_size(self.run_panel.width, DEFAULT_RUN_PANEL_WIDTH);
         self.run_panel.height = clamp_dock_size(self.run_panel.height, DEFAULT_RUN_PANEL_HEIGHT);
+        self.diff_tab_width = clamp_tab_width(self.diff_tab_width);
         self
     }
 }
@@ -179,6 +193,11 @@ pub fn clamp_font_size(size: f32, default: f32) -> f32 {
     } else {
         default
     }
+}
+
+/// Clamps a tab width to `[MIN_TAB_WIDTH, MAX_TAB_WIDTH]`.
+pub fn clamp_tab_width(width: u32) -> u32 {
+    width.clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH)
 }
 
 fn clamp_dock_size(size: f32, default: f32) -> f32 {

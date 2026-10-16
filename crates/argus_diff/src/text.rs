@@ -69,6 +69,22 @@ impl SourceText {
         Some(line.strip_suffix('\r').unwrap_or(line))
     }
 
+    /// True when 1-based line `line` ends with `\r\n` (the viewer marks
+    /// CRLF line endings subtly).
+    pub fn ends_with_crlf(&self, line: u32) -> bool {
+        let Some(index) = (line as usize).checked_sub(1) else {
+            return false;
+        };
+        let Some(&start) = self.line_starts.get(index) else {
+            return false;
+        };
+        let end = self
+            .line_starts
+            .get(index + 1)
+            .map_or(self.text.len(), |&end| end as usize);
+        self.text[start as usize..end].ends_with("\r\n")
+    }
+
     /// The whole text.
     pub fn as_str(&self) -> &str {
         &self.text
@@ -581,6 +597,24 @@ impl TextDiff {
     pub fn intra_line(&self, hunk: usize) -> Option<&HunkWords> {
         let slot = self.words.as_ref()?.get(hunk)?;
         Some(slot.get_or_init(|| self.compute_words(&self.hunks[hunk])))
+    }
+
+    /// Intra-line changes of hunk `hunk` if [`intra_line`](Self::intra_line)
+    /// already computed them; never computes. Lets the UI thread draw word
+    /// highlights without risking a slow first computation.
+    pub fn intra_line_if_ready(&self, hunk: usize) -> Option<&HunkWords> {
+        self.words.as_ref()?.get(hunk)?.get()
+    }
+
+    /// Index of the hunk owning entry `line_index` of [`lines`](Self::lines).
+    pub fn hunk_of_line(&self, line_index: usize) -> Option<usize> {
+        let at = self
+            .hunks
+            .partition_point(|hunk| hunk.lines.end <= line_index);
+        self.hunks
+            .get(at)
+            .filter(|hunk| hunk.lines.contains(&line_index))
+            .map(|_| at)
     }
 
     fn compute_words(&self, hunk: &Hunk) -> HunkWords {

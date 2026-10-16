@@ -6,6 +6,7 @@
 
 pub mod branch_picker;
 pub mod components;
+pub mod diff_view;
 pub mod file_tree;
 mod fonts;
 pub mod fuzzy;
@@ -27,6 +28,7 @@ use gpui::{
     px, size,
 };
 
+pub use diff_view::{DiffView, DiffViewEvent, DisplayOptions, LineSelection};
 pub use file_tree::{FileTree, FileTreeEvent};
 pub use jobs::BackgroundJobs;
 pub use session::{Comparison, DiffTarget, RepoSession, SessionEvent, Side};
