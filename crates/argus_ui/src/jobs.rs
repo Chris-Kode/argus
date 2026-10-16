@@ -10,6 +10,8 @@ use gpui::{App, BorrowAppContext, Global};
 pub struct BackgroundJobs {
     /// A diff is being computed.
     pub diffing: bool,
+    /// The changed-file list is being computed.
+    pub listing_files: bool,
     /// Syntax highlighting is in progress.
     pub highlighting: bool,
     /// A `git fetch` is running.
@@ -23,7 +25,11 @@ impl Global for BackgroundJobs {}
 impl BackgroundJobs {
     /// Whether anything is in progress.
     pub fn is_busy(&self) -> bool {
-        self.diffing || self.highlighting || self.fetching || self.active_runs > 0
+        self.diffing
+            || self.listing_files
+            || self.highlighting
+            || self.fetching
+            || self.active_runs > 0
     }
 
     /// Short labels for the work in progress, in display order.
@@ -31,6 +37,9 @@ impl BackgroundJobs {
         let mut labels = Vec::new();
         if self.diffing {
             labels.push("Diffing…".to_owned());
+        }
+        if self.listing_files {
+            labels.push("Listing files…".to_owned());
         }
         if self.highlighting {
             labels.push("Highlighting…".to_owned());

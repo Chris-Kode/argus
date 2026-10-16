@@ -22,13 +22,14 @@ use crate::branch_picker::{BranchPicker, PickerEvent};
 use crate::components::{
     button, disabled_button, kbd, panel_header, placeholder, primary_button, toggle_button,
 };
+use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::fonts::InstalledFonts;
 use crate::jobs::BackgroundJobs;
 use crate::keymap::{
-    Accept, Comment, CycleTheme, DecreaseFontSize, Dismiss, IncreaseFontSize, NextFile, NextHunk,
-    OpenRepository, OpenSettings, PreviousFile, PreviousHunk, ResetFontSize, Run, SHORTCUT_GROUPS,
-    SHORTCUTS, ToggleFileTree, ToggleKeyboardShortcuts, ToggleRunPanel, ToggleRunPanelPosition,
-    WORKSPACE_CONTEXT,
+    Accept, Comment, CycleTheme, DecreaseFontSize, Dismiss, FocusFileFilter, IncreaseFontSize,
+    NextFile, NextHunk, OpenRepository, OpenSettings, PreviousFile, PreviousHunk, ResetFontSize,
+    Run, SHORTCUT_GROUPS, SHORTCUTS, ToggleFileListMode, ToggleFileTree, ToggleKeyboardShortcuts,
+    ToggleRunPanel, ToggleRunPanelPosition, WORKSPACE_CONTEXT,
 };
 use crate::runtime::spawn_job;
 use crate::session::{
@@ -105,6 +106,11 @@ pub struct Workspace {
     fonts: InstalledFonts,
     session: Option<Entity<RepoSession>>,
     session_subscriptions: Vec<Subscription>,
+    /// The changed files of the session's diff (left dock).
+    file_tree: Option<Entity<FileTree>>,
+    /// The file last opened from the tree; the diff viewer (#9) scrolls to
+    /// it.
+    open_file: Option<SharedString>,
     picker: Option<OpenPicker>,
     picker_closed: Option<(Side, Instant)>,
     /// Reopen the most recent repository once the list first loads.
@@ -149,6 +155,8 @@ impl Workspace {
             fonts: InstalledFonts::load(cx),
             session: None,
             session_subscriptions: Vec::new(),
+            file_tree: None,
+            open_file: None,
             picker: None,
             picker_closed: None,
             restore_last_repo: true,
@@ -319,24 +327,59 @@ impl Workspace {
         if let Some(old) = self.session.take() {
             old.update(cx, |session, cx| session.shutdown(cx));
         }
+        if let Some(old) = self.file_tree.take() {
+            old.update(cx, |tree, cx| tree.shutdown(cx));
+        }
+        self.open_file = None;
         let session = cx.new(|cx| RepoSession::new(record, repo, cx));
+        let flat = self.settings.file_tree.flat_list;
+        let file_tree = cx.new(|cx| FileTree::new(flat, cx));
         self.session_subscriptions = vec![
             cx.observe(&session, |_, _, cx| cx.notify()),
-            cx.subscribe(&session, |this, _, event: &SessionEvent, cx| match event {
-                SessionEvent::Notice { message, is_error } => {
-                    this.notice = Some(Notice {
-                        message: message.clone(),
-                        is_error: *is_error,
-                    });
-                    cx.notify();
-                }
-                SessionEvent::TargetChanged(target) => {
-                    // The diff viewer (#7) loads `target` here.
-                    tracing::debug!(?target, "diff target changed");
-                }
-            }),
+            cx.observe(&file_tree, |_, _, cx| cx.notify()),
+            cx.subscribe(
+                &file_tree,
+                |this, _, event: &FileTreeEvent, cx| match event {
+                    FileTreeEvent::OpenFile { path, .. } => {
+                        this.open_file = Some(path.clone());
+                        cx.notify();
+                    }
+                    FileTreeEvent::OpenOutdated(item) => {
+                        // The outdated-comment view arrives with #15.
+                        tracing::debug!(item, "open outdated comment");
+                    }
+                    FileTreeEvent::ModeChanged { flat } => {
+                        if this.settings.file_tree.flat_list != *flat {
+                            this.settings.file_tree.flat_list = *flat;
+                            this.schedule_save(cx);
+                        }
+                    }
+                },
+            ),
+            cx.subscribe(
+                &session,
+                |this, session, event: &SessionEvent, cx| match event {
+                    SessionEvent::Notice { message, is_error } => {
+                        this.notice = Some(Notice {
+                            message: message.clone(),
+                            is_error: *is_error,
+                        });
+                        cx.notify();
+                    }
+                    SessionEvent::TargetChanged(target) => {
+                        tracing::debug!(?target, "diff target changed");
+                        let repo = session.read(cx).repo().clone();
+                        if let Some(file_tree) = this.file_tree.clone() {
+                            file_tree.update(cx, |tree, cx| {
+                                tree.set_target(&repo, target.as_ref(), cx);
+                            });
+                        }
+                    }
+                },
+            ),
         ];
         self.session = Some(session);
+        self.file_tree = Some(file_tree);
         cx.notify();
     }
 
@@ -542,8 +585,50 @@ impl Workspace {
         });
     }
 
+    fn next_file(&mut self, _: &NextFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_file(1, cx);
+    }
+
+    fn previous_file(&mut self, _: &PreviousFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_file(-1, cx);
+    }
+
+    /// `j` / `k`: the next or previous file of the tree, from anywhere.
+    fn step_file(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(file_tree) = self.file_tree.clone() {
+            file_tree.update(cx, |tree, cx| tree.select_adjacent_file(delta, cx));
+        }
+    }
+
+    fn focus_file_filter(
+        &mut self,
+        _: &FocusFileFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file_tree) = self.file_tree.clone() else {
+            return;
+        };
+        if !self.settings.file_tree.visible {
+            self.update_settings(window, cx, |settings| settings.file_tree.visible = true);
+        }
+        let handle = file_tree.read(cx).filter_focus_handle().clone();
+        window.focus(&handle, cx);
+    }
+
+    fn toggle_file_list_mode(
+        &mut self,
+        _: &ToggleFileListMode,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(file_tree) = self.file_tree.clone() {
+            file_tree.update(cx, |tree, cx| tree.toggle_mode(cx));
+        }
+    }
+
     /// Placeholder handler for review actions whose views land in later
-    /// issues (file tree #8, diff view #7, comments, runs #21, accept).
+    /// issues (diff view #9, comments #14, runs #21, accept #24).
     fn not_wired_yet<A: Action>(&mut self, action: &A, _: &mut Window, _: &mut Context<Self>) {
         tracing::debug!(action = action.name(), "action not wired yet");
     }
@@ -806,22 +891,37 @@ impl Workspace {
 
     fn render_file_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
-        let body = match self
+        let comparison = self
             .session
             .as_ref()
-            .map(|session| session.read(cx).comparison())
-        {
-            None => placeholder("No repository open.", cx),
-            Some(Comparison::Ready(target)) => placeholder(
-                format!(
-                    "{}...{}: the file list arrives with the diff viewer.",
-                    target.base, target.head
-                ),
-                cx,
-            ),
-            Some(Comparison::Resolving) => placeholder("Resolving the comparison…", cx),
-            Some(Comparison::Incomplete(message)) => placeholder(message.clone(), cx),
-            Some(Comparison::Invalid(_)) => placeholder("No diff to list.", cx),
+            .map(|session| session.read(cx).comparison());
+        // While a refresh resolves, the previous list stays up (with its
+        // expanded directories) instead of flashing a placeholder.
+        let has_list = self
+            .file_tree
+            .as_ref()
+            .is_some_and(|tree| tree.read(cx).file_list().is_some());
+        let body: AnyElement = match (comparison, self.file_tree.clone()) {
+            (Some(Comparison::Ready(_)), Some(tree)) => tree.into_any_element(),
+            (Some(Comparison::Resolving), Some(tree)) if has_list => tree.into_any_element(),
+            (comparison, _) => {
+                let text: SharedString = match comparison {
+                    None => "No repository open.".into(),
+                    Some(Comparison::Ready(_)) | Some(Comparison::Resolving) => {
+                        "Resolving the comparison…".into()
+                    }
+                    Some(Comparison::Incomplete(message)) => message.clone(),
+                    Some(Comparison::Invalid(_)) => "No diff to list.".into(),
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(panel_header("Files", cx))
+                    .child(placeholder(text, cx))
+                    .into_any_element()
+            }
         };
         div()
             .relative()
@@ -833,7 +933,6 @@ impl Workspace {
             .bg(colors.surface)
             .border_r_1()
             .border_color(colors.border)
-            .child(panel_header("Files", cx))
             .child(body)
             .child(self.resize_handle(DockResize::FileTree, false, cx))
     }
@@ -990,13 +1089,23 @@ impl Workspace {
                     .text_sm()
                     .text_color(colors.text_muted)
                     .child(format!(
-                        "{}...{} · merge-base {} · head {} · the diff viewer arrives with #7.",
+                        "{}...{} · merge-base {} · head {} · the diff viewer arrives with #9.",
                         target.base,
                         target.head,
                         target.merge_base.short(8),
                         target.head_tip.short(8),
                     )),
             )
+            .when_some(self.open_file.clone(), |column, path| {
+                column.child(
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .text_sm()
+                        .text_color(colors.text)
+                        .child(format!("Selected file: {path}")),
+                )
+            })
             .child(
                 // A preview of the diff colors in the code font, so the theme
                 // can be checked before the viewer lands.
@@ -1728,8 +1837,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
-            .on_action(cx.listener(Self::not_wired_yet::<NextFile>))
-            .on_action(cx.listener(Self::not_wired_yet::<PreviousFile>))
+            .on_action(cx.listener(Self::next_file))
+            .on_action(cx.listener(Self::previous_file))
+            .on_action(cx.listener(Self::focus_file_filter))
+            .on_action(cx.listener(Self::toggle_file_list_mode))
             .on_action(cx.listener(Self::not_wired_yet::<NextHunk>))
             .on_action(cx.listener(Self::not_wired_yet::<PreviousHunk>))
             .on_action(cx.listener(Self::not_wired_yet::<Comment>))
