@@ -1,0 +1,74 @@
+# runbase.config.yaml — agent pipeline: plan → implement → review → fix → merge.
+#
+# Flow:
+#   1. Label an issue "ready-to-plan"  → agent writes the technical plan.
+#      Runbase then labels the issue "ready-to-code".
+#   2. Label an issue "ready-to-code"  → agent implements and opens a PR.
+#      Runbase then labels the PR "ready-to-review".
+#   3. Label a PR "ready-to-review"    → agent reviews the spec and the code
+#      standards and posts the review comment. Runbase then labels the PR
+#      "ready-to-fix".
+#   4. Label a PR "ready-to-fix"       → agent applies the review fixes.
+#      Runbase then enables auto-merge.
+#
+# The root `run` block sets the launch settings every Automation inherits.
+# The Owner selects one saved AI Provider and one saved Sandbox Provider.
+# Every Run of this Repository uses those settings and the template built for
+# the Sandbox Provider.
+run:
+  ai:
+    provider: claude-personal
+    model: opus
+    thinking: medium
+  sandbox:
+    provider: boat-shared
+    config:
+      size: default
+  timeout: 14399
+
+# Preparation commands run after the clone, in the Repository root.
+# Runbase provides ready Docker before these commands run.
+commands:
+  pre_agent:
+    # Fails fast if the image's toolchain doesn't match rust-toolchain.toml.
+    - "cargo --version"
+    # Downloads crates and the pinned Zed git checkout for gpui.
+    - "cargo fetch --locked"
+    # Warms target/ for the commands in AGENTS.md: `build` compiles the
+    # dependencies once, `clippy` reuses them for the lint the agent runs.
+    # No `-D warnings` here: a lint on main must not stop the agent from
+    # starting; the agent runs the strict lint itself.
+    - "cargo build --workspace --all-targets --locked"
+    - "cargo clippy --workspace --all-targets --locked"
+
+# Delivery Labels name a target. `issue` is the triggering issue.
+# `pull_request` is the pull request the Delivery publishes.
+automations:
+  # Step 1 — implement the plan and open the pull request.
+  - name: implement
+    on:
+      issue:
+        action: labeled
+        labels: [rb-ready-to-code]
+        blocked: false
+    run:
+      prompt: >-
+        Implement issue {{ issue.number }}: {{ issue.title }}.
+
+        Original issue body:
+
+        {{ issue.body }}
+
+        Read the implementation asked in the issue and run the
+        retained checks.
+        Add automated tests only after an explicit user
+        request.
+
+        You can use context7 tools for incase to take a look to the technical docs of any dependency.
+
+        Follow the coding standards in AGENTS.md.
+
+    delivery:
+      type: pull_request
+      merge:
+        mode: automatic

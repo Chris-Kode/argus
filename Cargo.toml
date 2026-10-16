@@ -31,7 +31,7 @@ argus_ui = { path = "crates/argus_ui" }
 # commit. Both crates must always point at the same rev. See CONTRIBUTING.md for
 # the pinned rev, the Zed tag it belongs to, and how to bump it.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "fb69067729cb16a7f6135e2c1600c26a28c59659" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fb69067729cb16a7f6135e2c1600c26a28c59659", features = ["font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fb69067729cb16a7f6135e2c1600c26a28c59659", features = ["font-kit", "wayland", "x11"] }
 
 # Third-party dependencies shared by the workspace. Services get filled in by
 # later issues; keep versions here so every crate uses the same ones.
