@@ -16,7 +16,9 @@ pub mod settings;
 pub mod theme;
 mod workspace;
 
-use argus_git::GitService;
+use std::path::Path;
+
+use argus_git::{GitService, WorktreeManager};
 use argus_runs::RunManager;
 use argus_store::StorageService;
 use gpui::{
@@ -32,12 +34,13 @@ pub use workspace::Workspace;
 
 /// Application-wide handles to the services, stored as a GPUI global.
 ///
-/// Views read it with `cx.global::<AppContext>()`. The git and run services are
-/// filled in by later issues (#4/#17 git, #20 runs); for now they are
-/// placeholder handles so the wiring exists from the start.
+/// Views read it with `cx.global::<AppContext>()`. The run manager is still a
+/// placeholder handle until issue #20 lands.
 pub struct AppContext {
     /// Git reads (gix) and writes (git CLI).
     pub git: GitService,
+    /// Run and integration worktrees under `~/.argus/worktrees/`.
+    pub worktrees: WorktreeManager,
     /// SQLite storage in `~/.argus/argus.db`.
     pub store: StorageService,
     /// Claude run orchestration.
@@ -50,13 +53,64 @@ pub struct AppContext {
 impl Global for AppContext {}
 
 impl AppContext {
-    /// Builds the global from a live runtime handle and an opened store.
-    pub fn new(runtime: tokio::runtime::Handle, store: StorageService) -> Self {
+    /// Builds the global from a live runtime handle, an opened store and the
+    /// worktrees manager.
+    pub fn new(
+        runtime: tokio::runtime::Handle,
+        store: StorageService,
+        git: GitService,
+        worktrees: WorktreeManager,
+    ) -> Self {
         Self {
-            git: GitService::new(),
+            git,
+            worktrees,
             store,
             runs: RunManager::new(),
             runtime,
+        }
+    }
+}
+
+/// Opens the worktrees root under `argus_home` and marks the runs a previous
+/// session left queued or running as `Failed (interrupted)`.
+///
+/// Run it on the tokio runtime before the UI starts, so no run of the new
+/// session can be mistaken for an interrupted one.
+pub async fn open_worktrees(
+    argus_home: &Path,
+    store: &StorageService,
+) -> argus_git::Result<WorktreeManager> {
+    let worktrees = WorktreeManager::open(argus_home).await?;
+    let interrupted = WorktreeManager::mark_interrupted_runs(store).await?;
+    if !interrupted.is_empty() {
+        tracing::info!(
+            count = interrupted.len(),
+            "marked interrupted runs as failed"
+        );
+    }
+    Ok(worktrees)
+}
+
+/// Startup reconciliation of every known repository's worktrees (spec §5.2),
+/// in the background. Repositories that no longer open are skipped.
+async fn reconcile_worktrees(git: GitService, store: StorageService, worktrees: WorktreeManager) {
+    let repos = match store.repos().list().await {
+        Ok(repos) => repos,
+        Err(error) => {
+            tracing::warn!(%error, "cannot list repositories for worktree reconciliation");
+            return;
+        }
+    };
+    for record in repos {
+        let repo = match git.open(record.path.clone()).await {
+            Ok(repo) => repo,
+            Err(error) => {
+                tracing::debug!(path = %record.path.display(), %error, "skipping reconciliation");
+                continue;
+            }
+        };
+        if let Err(error) = worktrees.reconcile(&repo, &store).await {
+            tracing::warn!(path = %record.path.display(), %error, "worktree reconciliation failed");
         }
     }
 }
@@ -67,7 +121,18 @@ impl AppContext {
 /// platform run loop there). The UI settings are read on the tokio runtime
 /// before the event loop starts; then the thread is marked as the UI thread, so
 /// debug builds panic on any storage call made from it.
-pub fn run_gpui_app(runtime: tokio::runtime::Handle, store: StorageService) {
+pub fn run_gpui_app(
+    runtime: tokio::runtime::Handle,
+    store: StorageService,
+    worktrees: WorktreeManager,
+) {
+    let git = GitService::new();
+    runtime.spawn(reconcile_worktrees(
+        git.clone(),
+        store.clone(),
+        worktrees.clone(),
+    ));
+
     let ui_settings = runtime.block_on({
         let store = store.settings();
         async move { UiSettings::load(&store).await }
@@ -75,7 +140,12 @@ pub fn run_gpui_app(runtime: tokio::runtime::Handle, store: StorageService) {
 
     argus_store::mark_ui_thread();
     gpui_platform::application().run(move |cx: &mut App| {
-        cx.set_global(AppContext::new(runtime.clone(), store.clone()));
+        cx.set_global(AppContext::new(
+            runtime.clone(),
+            store.clone(),
+            git.clone(),
+            worktrees.clone(),
+        ));
         cx.set_global(BackgroundJobs::default());
         // A provisional theme so views can render before the workspace
         // resolves fonts and the window appearance.
