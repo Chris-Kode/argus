@@ -237,7 +237,10 @@ dependencies = [
  "argus_store",
  "gpui",
  "gpui_platform",
+ "serde",
+ "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
