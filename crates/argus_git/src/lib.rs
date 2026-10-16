@@ -1,12 +1,14 @@
 //! Git access for Argus: `gix` for reads and diffs, the `git` CLI for writes.
 //!
 //! The read side lives in [`read`] (open repo, list branches, merge-base,
-//! ahead/behind, checkouts, fetch). The write side (worktrees, commit,
-//! rebase, push) arrives with issue #17. Nothing here ever reads or modifies
+//! ahead/behind, checkouts, fetch). The write side lives in [`write`]; for
+//! now it only creates tracking branches; worktrees, commit, rebase and push
+//! arrive with issue #17. Nothing here ever reads or modifies
 //! a user's working checkout.
 
 mod error;
 pub mod read;
+pub mod write;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,6 +42,17 @@ impl GitService {
             .entry(repo.git_dir().to_owned())
             .or_insert(repo)
             .clone())
+    }
+
+    /// Re-opens `repo` and replaces its cached handle, so config written by
+    /// the CLI since it was opened (e.g. a new branch's upstream) is seen.
+    pub async fn reload(&self, repo: &Repo) -> Result<Repo> {
+        let fresh = read::open(repo.workdir().to_owned()).await?;
+        self.repos
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(fresh.git_dir().to_owned(), fresh.clone());
+        Ok(fresh)
     }
 
     /// Drops every cached handle of a repository, e.g. when it is closed.

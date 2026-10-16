@@ -23,7 +23,7 @@ pub struct Checkout {
 
 /// Builds a `git` command bound to `repo`'s git directory, isolated from
 /// git environment variables of the parent process and unable to prompt.
-fn git(repo: &Repo) -> Command {
+pub(crate) fn git(repo: &Repo) -> Command {
     let mut command = Command::new("git");
     command
         .arg("--git-dir")
