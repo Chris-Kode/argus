@@ -72,6 +72,12 @@ impl Sha {
     }
 }
 
+impl Sha {
+    pub(crate) fn object_id(&self) -> ObjectId {
+        self.0
+    }
+}
+
 impl From<ObjectId> for Sha {
     fn from(id: ObjectId) -> Self {
         Self(id)

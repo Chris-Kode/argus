@@ -1,17 +1,21 @@
 //! Git access for Argus: `gix` for reads and diffs, the `git` CLI for writes.
 //!
 //! The read side lives in [`read`] (open repo, list branches, merge-base,
-//! ahead/behind, checkouts, fetch). The write side (worktrees, commit,
+//! ahead/behind, checkouts, fetch) and [`objects`] (tree diffs with rename
+//! detection and blob reads for the diff engine). The write side (worktrees, commit,
 //! rebase, push) arrives with issue #17. Nothing here ever reads or modifies
 //! a user's working checkout.
 
+mod cancel;
 mod error;
+pub mod objects;
 pub mod read;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
+pub use cancel::{CancelGuard, CancelToken};
 pub use error::{GitError, Result};
 pub use read::{Branch, BranchKind, Checkout, Repo, RepoId, Sha};
 
