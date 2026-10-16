@@ -223,6 +223,7 @@ dependencies = [
 name = "argus_git"
 version = "0.1.0"
 dependencies = [
+ "argus_store",
  "gix",
  "thiserror 2.0.21",
  "tokio",

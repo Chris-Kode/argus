@@ -2,15 +2,17 @@
 //!
 //! The read side lives in [`read`] (open repo, list branches, merge-base,
 //! ahead/behind, checkouts, fetch) and [`objects`] (tree diffs with rename
-//! detection and blob reads for the diff engine). The write side lives in
-//! [`write`]; for now it only creates tracking branches; worktrees, commit,
-//! rebase and push arrive with issue #17. Nothing here ever reads or modifies
-//! a user's working checkout.
+//! detection and blob reads for the diff engine). Writes go through the
+//! [`cli`] wrapper: [`write`] creates tracking branches and [`worktrees`]
+//! manages the run and integration worktrees under `~/.argus/worktrees/`.
+//! Nothing here ever reads or modifies a user's working checkout.
 
 mod cancel;
+pub mod cli;
 mod error;
 pub mod objects;
 pub mod read;
+pub mod worktrees;
 pub mod write;
 
 use std::collections::HashMap;
@@ -18,8 +20,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 pub use cancel::{CancelGuard, CancelToken};
+pub use cli::{GitCli, GitOutput};
 pub use error::{GitError, Result};
 pub use read::{Branch, BranchKind, Checkout, Repo, RepoId, Sha};
+pub use worktrees::{ChangeKind, ChangedFile, Patch, ReconcileReport, Worktree, WorktreeManager};
 
 /// Handle to the git service.
 ///

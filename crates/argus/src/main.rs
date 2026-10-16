@@ -40,7 +40,13 @@ fn main() -> anyhow::Result<()> {
         .block_on(argus_store::StorageService::open(db_path.clone()))
         .with_context(|| format!("failed to open the database at {}", db_path.display()))?;
 
-    argus_ui::run_gpui_app(runtime.handle().clone(), store);
+    // Worktrees live under `<argus_home>/worktrees`; runs left active by a
+    // previous session are marked interrupted before any new run can start.
+    let worktrees = runtime
+        .block_on(argus_ui::open_worktrees(&argus_home, &store))
+        .context("failed to prepare the worktrees directory")?;
+
+    argus_ui::run_gpui_app(runtime.handle().clone(), store, worktrees);
 
     tracing::info!("Argus exited");
     Ok(())
