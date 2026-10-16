@@ -1,19 +1,52 @@
 //! Git access for Argus: `gix` for reads and diffs, the `git` CLI for writes.
 //!
-//! Filled in by issue #4 (read side: open repo, list branches, merge-base,
-//! ahead/behind, fetch) and issue #17 (write side: worktrees, commit, rebase,
-//! push). Nothing here ever reads or modifies a user's working checkout.
+//! The read side lives in [`read`] (open repo, list branches, merge-base,
+//! ahead/behind, checkouts, fetch). The write side (worktrees, commit,
+//! rebase, push) arrives with issue #17. Nothing here ever reads or modifies
+//! a user's working checkout.
+
+mod error;
+pub mod read;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
+
+pub use error::{GitError, Result};
+pub use read::{Branch, BranchKind, Checkout, Repo, RepoId, Sha};
 
 /// Handle to the git service.
 ///
-/// Placeholder until issue #4 lands: it will own the per-repo read cache and
-/// expose async, cancellable calls.
+/// Cheap to clone. It caches one opened [`Repo`] (and so one
+/// `gix::ThreadSafeRepository` with its loaded pack indices) per git
+/// directory, so each linked worktree keeps its own handle; the other reads are the free functions of [`read`].
 #[derive(Clone, Debug, Default)]
-pub struct GitService;
+pub struct GitService {
+    repos: Arc<Mutex<HashMap<PathBuf, Repo>>>,
+}
 
 impl GitService {
     /// Creates the service handle.
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Opens the repository containing `path` (see [`read::open`]), reusing
+    /// the cached handle when the repository was opened before.
+    pub async fn open(&self, path: impl Into<PathBuf>) -> Result<Repo> {
+        let repo = read::open(path).await?;
+        let mut repos = self.repos.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(repos
+            .entry(repo.git_dir().to_owned())
+            .or_insert(repo)
+            .clone())
+    }
+
+    /// Drops every cached handle of a repository, e.g. when it is closed.
+    pub fn forget(&self, id: &RepoId) {
+        self.repos
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, repo| repo.id() != id);
     }
 }
