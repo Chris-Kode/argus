@@ -32,7 +32,15 @@ fn main() -> anyhow::Result<()> {
         "starting Argus"
     );
 
-    argus_ui::run_gpui_app(runtime.handle().clone());
+    // Opening runs the migrations on the storage thread; the main thread only
+    // waits for it here, before the UI exists. A database from a newer Argus
+    // is refused rather than touched.
+    let db_path = argus_store::database_path(&argus_home);
+    let store = runtime
+        .block_on(argus_store::StorageService::open(db_path.clone()))
+        .with_context(|| format!("failed to open the database at {}", db_path.display()))?;
+
+    argus_ui::run_gpui_app(runtime.handle().clone(), store);
 
     tracing::info!("Argus exited");
     Ok(())

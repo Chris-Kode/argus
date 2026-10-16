@@ -8,6 +8,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+argus_store.workspace = true
 argus_ui.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
