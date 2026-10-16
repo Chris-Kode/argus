@@ -67,6 +67,8 @@ pub struct FileTreeDock {
     pub visible: bool,
     /// Width in pixels.
     pub width: f32,
+    /// Show a flat list of paths instead of the directory tree.
+    pub flat_list: bool,
 }
 
 impl Default for FileTreeDock {
@@ -74,6 +76,7 @@ impl Default for FileTreeDock {
         Self {
             visible: true,
             width: DEFAULT_FILE_TREE_WIDTH,
+            flat_list: false,
         }
     }
 }

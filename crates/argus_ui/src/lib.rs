@@ -6,6 +6,7 @@
 
 pub mod branch_picker;
 pub mod components;
+pub mod file_tree;
 mod fonts;
 pub mod fuzzy;
 pub mod jobs;
@@ -26,6 +27,7 @@ use gpui::{
     px, size,
 };
 
+pub use file_tree::{FileTree, FileTreeEvent};
 pub use jobs::BackgroundJobs;
 pub use session::{Comparison, DiffTarget, RepoSession, SessionEvent, Side};
 pub use settings::UiSettings;

@@ -255,6 +255,7 @@ dependencies = [
 name = "argus_ui"
 version = "0.1.0"
 dependencies = [
+ "argus_diff",
  "argus_git",
  "argus_runs",
  "argus_store",
