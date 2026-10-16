@@ -26,6 +26,12 @@ and `cmd-,` opens the settings (theme, font sizes, docks). User data lives in
 ARGUS_HOME=/tmp/argus-dev cargo run -p argus
 ```
 
+Once base and head are picked, the center shows the three-dot diff: every changed
+file in one virtualized list, laid out lazily as it scrolls into view. `j`/`k`
+jump between files, `n`/`p` between hunks, and `alt-z` toggles soft wrap. Click
+or drag the gutter to select lines, and use the "Expand" rows to reveal context.
+
+![Unified diff view](docs/screenshots/diff-unified-light.png)
 ![Argus in One Dark](docs/screenshots/shell-dark.png)
 ![Argus in One Light](docs/screenshots/shell-light.png)
 

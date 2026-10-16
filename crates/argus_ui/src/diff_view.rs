@@ -1625,6 +1625,9 @@ impl DiffView {
             .when(file > 0 && !sticky, |header| {
                 header.border_t_1().border_color(colors.border)
             })
+            // Keep the controls clear of the scrollbar; the sticky copy
+            // already ends before it.
+            .when(!sticky, |header| header.pr(SCROLLBAR_WIDTH + px(4.0)))
             .font_family(theme.fonts.ui_family.clone())
             .text_size(theme.fonts.ui_size * 0.9)
             .child(
@@ -1816,6 +1819,9 @@ impl Render for DiffView {
 
         let top_file = self.file_at(self.top_row());
         let sticky = self.render_file_header(top_file, &list.entries()[top_file], true, cx);
+        // The next file's header pushes the sticky one up as it arrives.
+        let next_header = self.starts[top_file + 1] as f64 * self.row_height() - self.scroll_top();
+        let sticky_top = px((next_header - self.row_height()).min(0.0) as f32);
         let scrollbar = self.scrollbar().map(|geometry| {
             let dragging = matches!(self.drag, Some(Drag::Scrollbar { .. }));
             div()
@@ -1891,7 +1897,7 @@ impl Render for DiffView {
                 .child(
                     div()
                         .absolute()
-                        .top_0()
+                        .top(sticky_top)
                         .left_0()
                         .right(SCROLLBAR_WIDTH)
                         .h(row_height)
