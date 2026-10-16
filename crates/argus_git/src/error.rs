@@ -57,6 +57,14 @@ pub enum GitError {
         name: String,
     },
 
+    /// A branch name that git would misinterpret (empty, option-like or
+    /// containing whitespace).
+    #[error("invalid branch name `{name}`")]
+    InvalidBranchName {
+        /// The rejected name.
+        name: String,
+    },
+
     /// A `gix` read failed.
     #[error("{context}: {message}")]
     Gix {

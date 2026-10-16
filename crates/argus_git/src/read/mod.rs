@@ -12,6 +12,7 @@
 
 mod branches;
 mod cli;
+mod refs;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,9 @@ use gix::ObjectId;
 use crate::error::{GitError, Result};
 
 pub use branches::{Branch, BranchKind, branches};
+pub(crate) use cli::git;
 pub use cli::{Checkout, current_checkouts, fetch};
+pub use refs::{current_branch, remote_default_branch, remote_names, split_remote_branch};
 
 /// Object cache given to every thread-local `gix` handle; speeds up repeated
 /// commit lookups during branch listing and history walks.
