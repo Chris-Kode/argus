@@ -31,6 +31,14 @@ file in one virtualized list, laid out lazily as it scrolls into view. `j`/`k`
 jump between files, `n`/`p` between hunks, and `alt-z` toggles soft wrap. Click
 or drag the gutter to select lines, and use the "Expand" rows to reveal context.
 
+The diff opens side by side by default: old lines on the left, new lines on the
+right, each column with its own gutter (the left one selects old lines, the
+right one new lines). `cmd-shift-d` (`ctrl-shift-d` on Linux) or the "Side by
+side" title-bar button switches to the unified layout and back, keeping the
+line at the top of the viewport in place. The settings choose the default
+layout and whether both columns scroll horizontally together.
+
+![Side-by-side diff view](docs/screenshots/diff-split-light.png)
 ![Unified diff view](docs/screenshots/diff-unified-light.png)
 ![Argus in One Dark](docs/screenshots/shell-dark.png)
 ![Argus in One Light](docs/screenshots/shell-light.png)

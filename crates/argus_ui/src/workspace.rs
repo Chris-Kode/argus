@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use argus_diff::layout::ViewMode;
 use argus_store::{Repo, StorageService};
 use gpui::{
     Action, AnyElement, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable,
@@ -31,8 +32,9 @@ use crate::jobs::BackgroundJobs;
 use crate::keymap::{
     Accept, Comment, CycleTheme, DecreaseFontSize, Dismiss, FocusFileFilter, IncreaseFontSize,
     NextFile, NextHunk, OpenRepository, OpenSettings, PreviousFile, PreviousHunk, ResetFontSize,
-    Run, SHORTCUT_GROUPS, SHORTCUTS, ToggleFileListMode, ToggleFileTree, ToggleKeyboardShortcuts,
-    ToggleRunPanel, ToggleRunPanelPosition, ToggleSoftWrap, WORKSPACE_CONTEXT,
+    Run, SHORTCUT_GROUPS, SHORTCUTS, ToggleDiffMode, ToggleFileListMode, ToggleFileTree,
+    ToggleKeyboardShortcuts, ToggleRunPanel, ToggleRunPanelPosition, ToggleSoftWrap,
+    WORKSPACE_CONTEXT,
 };
 use crate::runtime::spawn_job;
 use crate::session::{
@@ -40,8 +42,8 @@ use crate::session::{
 };
 use crate::settings::{
     DEFAULT_CODE_FONT_SIZE, DEFAULT_FILE_TREE_WIDTH, DEFAULT_RUN_PANEL_HEIGHT,
-    DEFAULT_RUN_PANEL_WIDTH, DEFAULT_UI_FONT_SIZE, MIN_DOCK_SIZE, RunPanelPosition, UiSettings,
-    clamp_font_size, clamp_tab_width,
+    DEFAULT_RUN_PANEL_WIDTH, DEFAULT_UI_FONT_SIZE, DiffViewMode, MIN_DOCK_SIZE, RunPanelPosition,
+    UiSettings, clamp_font_size, clamp_tab_width,
 };
 use crate::theme::{ActiveTheme, Theme, ThemeFonts, ThemeMode};
 
@@ -260,6 +262,11 @@ impl Workspace {
         DisplayOptions {
             tab_width: self.settings.diff_tab_width,
             soft_wrap: self.settings.diff_soft_wrap,
+            mode: match self.settings.diff_view_mode {
+                DiffViewMode::Unified => ViewMode::Unified,
+                DiffViewMode::SideBySide => ViewMode::Split,
+            },
+            link_horizontal_scroll: self.settings.diff_link_horizontal_scroll,
         }
     }
 
@@ -505,6 +512,19 @@ impl Workspace {
     ) {
         self.update_settings(window, cx, |settings| {
             settings.diff_soft_wrap = !settings.diff_soft_wrap;
+        });
+    }
+
+    /// Switches the diff between unified and side-by-side; the choice is
+    /// saved as the mode later diffs open in.
+    fn toggle_diff_mode(
+        &mut self,
+        _: &ToggleDiffMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_settings(window, cx, |settings| {
+            settings.diff_view_mode = settings.diff_view_mode.toggled();
         });
     }
 
@@ -913,6 +933,14 @@ impl Workspace {
             }
             _ => disabled_button("title-fetch", "Fetch", cx),
         };
+        let side_by_side = self.settings.diff_view_mode == DiffViewMode::SideBySide;
+        let diff_mode = toggle_button("title-diff-mode", "Side by side", side_by_side, cx)
+            .text_color(if side_by_side {
+                colors.text
+            } else {
+                colors.text_muted
+            })
+            .on_click(|_, window, cx| window.dispatch_action(ToggleDiffMode.boxed_clone(), cx));
         // Push itself arrives with #25; the counts are live already.
         let push_label = match session.and_then(|session| session.upstream()) {
             Some(status) => format!("Push ↑{} ↓{}", status.ahead, status.behind),
@@ -959,6 +987,7 @@ impl Workspace {
                     .flex_none()
                     .items_center()
                     .gap_1()
+                    .child(diff_mode)
                     .child(fetch)
                     .child(disabled_button("title-push", push_label, cx)),
             )
@@ -1726,6 +1755,21 @@ impl Workspace {
                 .into_any_element()
             })
             .collect();
+        let diff_mode_buttons = [DiffViewMode::SideBySide, DiffViewMode::Unified]
+            .into_iter()
+            .map(|mode| {
+                toggle_button(
+                    ("diff-view-mode", mode as usize),
+                    mode.label(),
+                    settings.diff_view_mode == mode,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.update_settings(window, cx, |settings| settings.diff_view_mode = mode)
+                }))
+                .into_any_element()
+            })
+            .collect();
         let position_buttons = [RunPanelPosition::Right, RunPanelPosition::Bottom]
             .into_iter()
             .map(|position| {
@@ -1789,6 +1833,27 @@ impl Workspace {
                         settings.diff_tab_width = clamp_tab_width(width.max(0.0) as u32);
                     },
                 ),
+            ))
+            .child(row("Diff layout", segmented(diff_mode_buttons)))
+            .child(row(
+                "Diff horizontal scroll",
+                toggle_button(
+                    "diff-link-scroll-setting",
+                    if settings.diff_link_horizontal_scroll {
+                        "Linked"
+                    } else {
+                        "Per column"
+                    },
+                    settings.diff_link_horizontal_scroll,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.update_settings(window, cx, |settings| {
+                        settings.diff_link_horizontal_scroll =
+                            !settings.diff_link_horizontal_scroll;
+                    })
+                }))
+                .into_any_element(),
             ))
             .child(row(
                 "Diff soft wrap",
@@ -1923,6 +1988,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_hunk))
             .on_action(cx.listener(Self::previous_hunk))
             .on_action(cx.listener(Self::toggle_soft_wrap))
+            .on_action(cx.listener(Self::toggle_diff_mode))
             .on_action(cx.listener(Self::not_wired_yet::<Comment>))
             .on_action(cx.listener(Self::not_wired_yet::<Run>))
             .on_action(cx.listener(Self::not_wired_yet::<Accept>))
