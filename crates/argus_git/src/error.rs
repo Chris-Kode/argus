@@ -114,6 +114,20 @@ pub enum GitError {
         source: std::io::Error,
     },
 
+    /// A write targeted a path outside `~/.argus/worktrees/` (safety
+    /// invariant 1: Argus only ever writes inside its own worktrees).
+    #[error("refusing to write to {}: it is not inside the Argus worktrees root {}", path.display(), root.display())]
+    OutsideWorktreesRoot {
+        /// The rejected path.
+        path: PathBuf,
+        /// The worktrees root.
+        root: PathBuf,
+    },
+
+    /// Reading or updating the runs table failed.
+    #[error("storage error: {0}")]
+    Store(#[from] argus_store::StoreError),
+
     /// The operation was cancelled by the caller.
     #[error("operation cancelled")]
     Cancelled,
