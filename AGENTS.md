@@ -11,10 +11,6 @@ that shows a three-dot git diff, lets the user comment on lines, and turns each
 comment into a headless `claude -p` run in its own git worktree. Nothing lands
 on a branch until the user accepts it.
 
-- The spec is **issue #1**: <https://github.com/Chris-Kode/argus/issues/1>.
-  Read the sections an issue references before changing code.
-- Work is tracked as sub-issues of #1, one feature per issue. Implement one
-  issue at a time and keep the diff focused on it.
 
 ## Hard rules
 
