@@ -17,12 +17,17 @@ Feature work is tracked as sub-issues of that spec.
 cargo run -p argus
 ```
 
-This opens an empty window titled **Argus**. User data lives in `~/.argus/`;
-set `ARGUS_HOME` to override it (used by tests and CI):
+This opens the Argus shell: open a repository (`cmd-o` / `ctrl-o`) or pick one
+from the recent list. `cmd-/` (`ctrl-/` on Linux) lists every keyboard shortcut,
+and `cmd-,` opens the settings (theme, font sizes, docks). User data lives in
+`~/.argus/`; set `ARGUS_HOME` to override it (used by tests and CI):
 
 ```sh
 ARGUS_HOME=/tmp/argus-dev cargo run -p argus
 ```
+
+![Argus in One Dark](docs/screenshots/shell-dark.png)
+![Argus in One Light](docs/screenshots/shell-light.png)
 
 ## Development
 
