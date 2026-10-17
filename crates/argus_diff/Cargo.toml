@@ -9,7 +9,9 @@ repository.workspace = true
 
 [dependencies]
 argus_git.workspace = true
+argus_store.workspace = true
 imara-diff.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+xxhash-rust.workspace = true

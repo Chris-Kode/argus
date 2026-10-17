@@ -232,8 +232,9 @@ impl CommentStore {
             .await
     }
 
-    /// Sets the workflow status. Transition rules (spec §7.2) are enforced by
-    /// the caller.
+    /// Sets the workflow status unconditionally. Transition rules (spec §7.2)
+    /// are enforced by the caller (`argus_diff::review::apply_event`, which
+    /// uses [`CommentStore::set_status_if`]).
     pub async fn set_status(&self, id: CommentId, status: CommentStatus) -> Result<()> {
         self.service
             .call("CommentStore::set_status", move |conn| {
@@ -242,6 +243,38 @@ impl CommentStore {
                     params![id, status, now_ms()],
                 )?;
                 expect_changed(changed, "comment", id)
+            })
+            .await
+    }
+
+    /// Sets the workflow status only if it is still `expected`, so a status
+    /// computed from a stale read is never applied. Returns `false` when the
+    /// status had changed in the meantime.
+    pub async fn set_status_if(
+        &self,
+        id: CommentId,
+        expected: CommentStatus,
+        status: CommentStatus,
+    ) -> Result<bool> {
+        self.service
+            .call("CommentStore::set_status_if", move |conn| {
+                let changed = conn.execute(
+                    "UPDATE comments SET status = ?3, updated_at = ?4
+                     WHERE id = ?1 AND status = ?2",
+                    params![id, expected, status, now_ms()],
+                )?;
+                if changed > 0 {
+                    return Ok(true);
+                }
+                let exists = conn
+                    .query_row("SELECT 1 FROM comments WHERE id = ?1", [id], |_| Ok(()))
+                    .optional()?
+                    .is_some();
+                if exists {
+                    Ok(false)
+                } else {
+                    expect_changed(0, "comment", id).map(|()| false)
+                }
             })
             .await
     }
@@ -330,6 +363,28 @@ impl CommentStore {
                 )?;
                 tx.commit()?;
                 Ok(reply)
+            })
+            .await
+    }
+
+    /// Lists the replies of every comment of one (repo, base, head) review,
+    /// grouped by comment and oldest first within a thread.
+    pub async fn replies_for(
+        &self,
+        repo_id: RepoId,
+        base_ref: String,
+        head_ref: String,
+    ) -> Result<Vec<Reply>> {
+        self.service
+            .call("CommentStore::replies_for", move |conn| {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT r.id, r.comment_id, r.author, r.body_md, r.created_at
+                     FROM comment_replies r JOIN comments c ON c.id = r.comment_id
+                     WHERE c.repo_id = ?1 AND c.base_ref = ?2 AND c.head_ref = ?3
+                     ORDER BY r.comment_id, r.created_at, r.id",
+                )?;
+                let rows = stmt.query_map(params![repo_id, base_ref, head_ref], reply_from_row)?;
+                Ok(rows.collect::<rusqlite::Result<_>>()?)
             })
             .await
     }

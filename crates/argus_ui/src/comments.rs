@@ -1,0 +1,207 @@
+//! The comments of the open review as a GPUI entity.
+//!
+//! [`ReviewComments`] wraps an [`argus_diff::review::CommentService`]: every
+//! storage call runs on the tokio runtime through [`spawn_job`], and the
+//! service's change broadcast is forwarded to views as
+//! [`ReviewCommentsEvent`]s. Views read the in-memory snapshot only.
+
+use std::sync::Arc;
+
+use argus_diff::review::{
+    Comment, CommentAnchor, CommentChange, CommentEvent, CommentId, CommentService, ReplyAuthor,
+    ReviewError, ReviewKey,
+};
+use gpui::{Context, EventEmitter, SharedString, Task};
+use tokio::sync::broadcast::error::RecvError;
+
+use crate::AppContext;
+use crate::runtime::spawn_job;
+
+/// Events for views showing comments.
+#[derive(Clone, Debug)]
+pub enum ReviewCommentsEvent {
+    /// The comment list changed; re-read [`ReviewComments::comments`].
+    /// `None` when changes were missed and the whole list may differ.
+    Changed(Option<CommentChange>),
+    /// A comment operation failed.
+    Error(SharedString),
+}
+
+/// The comment threads of the current (repo, base, head) review.
+pub struct ReviewComments {
+    service: CommentService,
+    comments: Arc<Vec<Comment>>,
+    /// The review last asked for; the service catches up once its load runs.
+    requested: Option<ReviewKey>,
+    load_task: Option<Task<()>>,
+    _listen_task: Task<()>,
+}
+
+impl EventEmitter<ReviewCommentsEvent> for ReviewComments {}
+
+impl ReviewComments {
+    /// An empty list, bound to the store of the [`AppContext`] global.
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let service = CommentService::new(cx.global::<AppContext>().store.comments());
+        let mut changes = service.subscribe();
+        let listen_task = cx.spawn(async move |this, cx| {
+            loop {
+                let change = match changes.recv().await {
+                    Ok(change) => Some(change),
+                    // Missed changes are covered by re-reading the snapshot.
+                    Err(RecvError::Lagged(_)) => None,
+                    Err(RecvError::Closed) => break,
+                };
+                let alive = this
+                    .update(cx, |this, cx| {
+                        this.comments = this.service.comments();
+                        cx.emit(ReviewCommentsEvent::Changed(change));
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        });
+        Self {
+            comments: service.comments(),
+            requested: None,
+            service,
+            load_task: None,
+            _listen_task: listen_task,
+        }
+    }
+
+    /// The underlying service, for components that drive statuses (runs).
+    pub fn service(&self) -> &CommentService {
+        &self.service
+    }
+
+    /// The review being shown (or loading).
+    pub fn key(&self) -> Option<&ReviewKey> {
+        self.requested.as_ref()
+    }
+
+    /// Whether the comments of the review are still loading.
+    pub fn is_loading(&self) -> bool {
+        self.load_task.is_some()
+    }
+
+    /// The loaded comments, by file, line and creation time.
+    pub fn comments(&self) -> &Arc<Vec<Comment>> {
+        &self.comments
+    }
+
+    /// Shows the comments of `key` (`None` clears them). A no-op when that
+    /// review is already loaded; replacing the task cancels a load in flight.
+    pub fn set_review(&mut self, key: Option<ReviewKey>, cx: &mut Context<Self>) {
+        if self.requested == key {
+            return;
+        }
+        self.requested = key.clone();
+        self.load(key, cx);
+    }
+
+    /// Reloads the shown review from storage, e.g. after a run or an Accept
+    /// changed comments behind the service.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        let key = self.requested.clone();
+        if key.is_some() {
+            self.load(key, cx);
+        }
+    }
+
+    fn load(&mut self, key: Option<ReviewKey>, cx: &mut Context<Self>) {
+        let service = self.service.clone();
+        let job = spawn_job(cx, async move { service.load(key).await });
+        self.load_task = Some(cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| {
+                this.load_task = None;
+                report(flatten(result), "load comments", cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Creates a comment on the loaded review.
+    pub fn create(&mut self, anchor: CommentAnchor, body_md: String, cx: &mut Context<Self>) {
+        let service = self.service.clone();
+        self.run(cx, "create the comment", async move {
+            service.create(anchor, body_md).await.map(drop)
+        });
+    }
+
+    /// Replaces a comment's body.
+    pub fn edit(&mut self, id: CommentId, body_md: String, cx: &mut Context<Self>) {
+        let service = self.service.clone();
+        self.run(cx, "edit the comment", async move {
+            service.edit(id, body_md).await
+        });
+    }
+
+    /// Adds a reviewer reply to a thread.
+    pub fn reply(&mut self, id: CommentId, body_md: String, cx: &mut Context<Self>) {
+        let service = self.service.clone();
+        self.run(cx, "reply", async move {
+            service
+                .reply(id, ReplyAuthor::User, body_md)
+                .await
+                .map(drop)
+        });
+    }
+
+    /// Deletes a thread with its replies.
+    pub fn delete(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        let service = self.service.clone();
+        self.run(
+            cx,
+            "delete the comment",
+            async move { service.delete(id).await },
+        );
+    }
+
+    /// Applies a status event (e.g. Dismiss, Reopen).
+    pub fn apply(&mut self, id: CommentId, event: CommentEvent, cx: &mut Context<Self>) {
+        let service = self.service.clone();
+        self.run(cx, "update the comment", async move {
+            service.apply(id, event).await.map(drop)
+        });
+    }
+
+    /// Runs a write on the tokio runtime to completion (a write must not be
+    /// cut short by the view going away) and reports its failure.
+    fn run(
+        &mut self,
+        cx: &mut Context<Self>,
+        what: &'static str,
+        future: impl Future<Output = Result<(), ReviewError>> + Send + 'static,
+    ) {
+        let handle = cx.global::<AppContext>().runtime.spawn(future);
+        cx.spawn(async move |this, cx| {
+            let result = handle.await;
+            this.update(cx, |_, cx| report(flatten(result), what, cx))
+                .ok();
+        })
+        .detach();
+    }
+}
+
+fn flatten(result: Result<Result<(), ReviewError>, tokio::task::JoinError>) -> Result<(), String> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn report(result: Result<(), String>, what: &str, cx: &mut Context<ReviewComments>) {
+    if let Err(message) = result {
+        tracing::warn!(%message, "could not {what}");
+        cx.emit(ReviewCommentsEvent::Error(
+            format!("Could not {what}: {message}").into(),
+        ));
+    }
+}

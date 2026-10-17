@@ -10,10 +10,12 @@
 
 use std::sync::Arc;
 
+use argus_diff::review::ReviewKey;
 use argus_git::{Branch, BranchKind, GitError, GitService, Sha};
-use gpui::{Context, EventEmitter, SharedString, Task};
+use gpui::{AppContext as _, Context, Entity, EventEmitter, SharedString, Subscription, Task};
 
 use crate::AppContext;
+use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::jobs::BackgroundJobs;
 use crate::runtime::{spawn_detached, spawn_job};
 
@@ -139,6 +141,8 @@ pub struct RepoSession {
     upstream: Option<UpstreamStatus>,
     tracking: Option<TrackingPrompt>,
     fetching: bool,
+    comments: Entity<ReviewComments>,
+    _comments_subscription: Subscription,
     load_task: Option<Task<()>>,
     compare_task: Option<Task<()>>,
     upstream_task: Option<Task<()>>,
@@ -153,6 +157,15 @@ impl RepoSession {
     /// branches. The base/head selection is restored from `record`, or
     /// defaulted on first open.
     pub fn new(record: argus_store::Repo, repo: argus_git::Repo, cx: &mut Context<Self>) -> Self {
+        let comments = cx.new(ReviewComments::new);
+        let comments_subscription = cx.subscribe(&comments, |_, _, event, cx| {
+            if let ReviewCommentsEvent::Error(message) = event {
+                cx.emit(SessionEvent::Notice {
+                    message: message.clone(),
+                    is_error: true,
+                });
+            }
+        });
         let mut this = Self {
             record,
             repo,
@@ -164,6 +177,8 @@ impl RepoSession {
             upstream: None,
             tracking: None,
             fetching: false,
+            comments,
+            _comments_subscription: comments_subscription,
             load_task: None,
             compare_task: None,
             upstream_task: None,
@@ -179,6 +194,12 @@ impl RepoSession {
     /// The stored repository record.
     pub fn record(&self) -> &argus_store::Repo {
         &self.record
+    }
+
+    /// The comments of the current (repo, base, head) review (spec Q2):
+    /// loaded whenever the comparison resolves, cleared when it is invalid.
+    pub fn comments(&self) -> &Entity<ReviewComments> {
+        &self.comments
     }
 
     /// The git repository handle.
@@ -454,6 +475,7 @@ impl RepoSession {
                             Comparison::Ready(target) => Some(target.clone()),
                             _ => None,
                         };
+                        this.show_comments(target.as_ref(), cx);
                         cx.emit(SessionEvent::TargetChanged(target));
                         cx.notify();
                     })
@@ -465,12 +487,20 @@ impl RepoSession {
                     BackgroundJobs::update(cx, |jobs| jobs.diffing = false);
                 }
                 self.comparison = comparison;
+                self.show_comments(None, cx);
             }
         }
         if previous.is_some() {
             cx.emit(SessionEvent::TargetChanged(None));
         }
         cx.notify();
+    }
+
+    /// Loads the comments keyed by the target's (repo, base, head).
+    fn show_comments(&mut self, target: Option<&DiffTarget>, cx: &mut Context<Self>) {
+        let key = target.map(|target| ReviewKey::new(self.record.id, &target.base, &target.head));
+        self.comments
+            .update(cx, |comments, cx| comments.set_review(key, cx));
     }
 
     /// Checks the selection without touching git: both sides picked and
@@ -653,6 +683,7 @@ impl RepoSession {
         self.load_task = None;
         self.upstream_task = None;
         self.tracking_task = None;
+        self.show_comments(None, cx);
         cx.global::<AppContext>().git.forget(self.repo.id());
     }
 }
