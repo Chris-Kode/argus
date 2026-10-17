@@ -807,6 +807,8 @@ pub struct DisplayLine {
     offsets: Vec<(usize, usize)>,
     /// Display bytes covered by the source text (before the CRLF mark).
     source_end: usize,
+    /// Source bytes of the characters drawn.
+    source_window: Range<usize>,
 }
 
 impl DisplayLine {
@@ -822,6 +824,12 @@ impl DisplayLine {
         let range = map(source.start)..map(source.end);
         (!range.is_empty()).then_some(range)
     }
+
+    /// The bytes of the source line this window draws, so callers can skip
+    /// highlights outside it (a long line shows only a few columns).
+    pub fn source_range(&self) -> Range<usize> {
+        self.source_window.clone()
+    }
 }
 
 /// Lays out the display columns `columns` of `text` (soft-wrap segment or
@@ -832,8 +840,12 @@ pub fn display_window(text: &str, crlf: bool, tab_width: u32, columns: Range<u32
     let mut out = DisplayLine::default();
     let mut trailing: Option<usize> = None;
     let mut column = 0u32;
+    // Source bytes of the drawn characters: first drawn..first past the end.
+    let mut window_start: Option<usize> = None;
+    let mut window_end = text.len();
     for (byte, ch) in text.char_indices() {
         if column >= columns.end {
+            window_end = byte;
             break;
         }
         let width = match ch {
@@ -845,6 +857,7 @@ pub fn display_window(text: &str, crlf: bool, tab_width: u32, columns: Range<u32
         if end <= columns.start {
             continue;
         }
+        window_start.get_or_insert(byte);
         out.offsets.push((byte, out.text.len()));
         let is_trailing = byte >= trailing_start;
         if is_trailing && trailing.is_none() {
@@ -873,6 +886,8 @@ pub fn display_window(text: &str, crlf: bool, tab_width: u32, columns: Range<u32
     }
     out.source_end = out.text.len();
     out.offsets.push((text.len(), out.source_end));
+    let window_start = window_start.unwrap_or(window_end);
+    out.source_window = window_start..window_end.max(window_start);
     out.trailing_whitespace = trailing.map(|start| start..out.source_end);
     if crlf && columns.contains(&display_width(text, tab_width)) {
         let start = out.text.len();

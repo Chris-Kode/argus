@@ -21,6 +21,7 @@ mod workspace;
 use std::path::Path;
 
 use argus_git::{GitService, WorktreeManager};
+use argus_highlight::HighlightService;
 use argus_runs::RunManager;
 use argus_store::StorageService;
 use gpui::{
@@ -33,7 +34,7 @@ pub use file_tree::{FileTree, FileTreeEvent};
 pub use jobs::BackgroundJobs;
 pub use session::{Comparison, DiffTarget, RepoSession, SessionEvent, Side};
 pub use settings::UiSettings;
-pub use theme::{ActiveTheme, Appearance, Theme, ThemeColors, ThemeFonts, ThemeMode};
+pub use theme::{ActiveTheme, Appearance, SyntaxTheme, Theme, ThemeColors, ThemeFonts, ThemeMode};
 pub use workspace::Workspace;
 
 /// Application-wide handles to the services, stored as a GPUI global.
@@ -49,6 +50,8 @@ pub struct AppContext {
     pub store: StorageService,
     /// Claude run orchestration.
     pub runs: RunManager,
+    /// Background syntax highlighting (its own worker threads).
+    pub highlighter: HighlightService,
     /// Handle to the process-wide tokio runtime. Service work runs there, never
     /// on the UI thread (spec §4.2).
     pub runtime: tokio::runtime::Handle,
@@ -70,6 +73,7 @@ impl AppContext {
             worktrees,
             store,
             runs: RunManager::new(),
+            highlighter: HighlightService::new(),
             runtime,
         }
     }
