@@ -270,8 +270,11 @@ name = "argus_runs"
 version = "0.1.0"
 dependencies = [
  "argus_diff",
+ "argus_git",
  "argus_store",
+ "libc",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

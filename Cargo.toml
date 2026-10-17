@@ -38,6 +38,8 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fb690677
 anyhow = "1.0.104"
 gix = "0.89.0"
 # The imara-diff fork maintained by gitoxide; the same crate gix diffs with.
+# Process-group signals for Stop (`kill(-pgid, …)`).
+libc = "0.2.190"
 imara-diff = { package = "gix-imara-diff", version = "0.3.1" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
