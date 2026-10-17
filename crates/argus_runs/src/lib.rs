@@ -1,35 +1,51 @@
 //! Claude runs for Argus: prompt builder, run manager and the `stream-json`
 //! parser.
 //!
-//! Filled in by issues #19 (prompt builder), #20 (run manager: spawn
-//! `claude -p`, parse `stream-json`, parallel runs, stop) and #21–#23 (run
-//! menu, proposal review, follow-up replies).
+//! - [`prompt`] renders the versioned prompts of comment, follow-up and
+//!   resolve runs.
+//! - [`claude`] detects the installed CLI and builds its exact command lines.
+//! - [`stream`] parses the `stream-json` lines a run prints.
+//! - [`run`] (through [`RunManager::start`] and [`RunManager::stop`]) spawns
+//!   one `claude -p` per run in its own worktree, streams and stores its
+//!   events, and records the outcome (spec §6.3).
+//! - The run defaults of the settings screen live in [`settings`]; the
+//!   review rules file in [`review_rules`].
 //!
-//! [`prompt`] renders the versioned prompts of comment, follow-up and
-//! resolve runs. The run defaults of the settings screen live in
-//! [`settings`]; the review rules file in [`review_rules`]. [`claude`]
-//! detects the installed CLI and builds its exact command lines.
+//! Runs interrupted by a crash are marked `Failed (interrupted)` at startup
+//! by [`argus_git::WorktreeManager::mark_interrupted_runs`], before any run
+//! of the new session starts.
 
 pub mod claude;
 pub mod prompt;
 pub mod review_rules;
+pub mod run;
 pub mod settings;
+pub mod stream;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::{Notify, watch};
+use argus_git::{GitService, WorktreeManager};
+use argus_store::{CommentId, RunId, StorageService};
+use tokio::sync::{Notify, broadcast, watch};
 
 pub use claude::{ClaudeCapabilities, ClaudeCommand, ClaudeStatus, SessionMode};
+pub use run::{RunError, RunFinished, RunStreamEvent, RunUpdate, STOP_GRACE};
 pub use settings::{ClaudeSettings, SettingError};
+pub use stream::StreamEvent;
 
 /// Handle to the run manager.
 ///
-/// It will spawn and track `claude -p` child processes, each in its own
-/// worktree, with unlimited parallelism (issue #20). Today it holds the live
-/// [`ClaudeSettings`]: the settings screen publishes every saved change here,
-/// and each run reads a fresh snapshot when it starts, so a new Claude path,
-/// default model or effort applies to the next run without a restart.
+/// It spawns and tracks `claude -p` child processes, each in its own
+/// worktree, with no queue and no limit ([`RunManager::start`],
+/// [`RunManager::stop`]). Lifecycle changes are broadcast to
+/// [`RunManager::subscribe_runs`], stream events to
+/// [`RunManager::subscribe_events`].
+///
+/// It holds the live [`ClaudeSettings`]: the settings screen publishes every
+/// saved change here, and each run reads a fresh snapshot when it starts, so
+/// a new Claude path, default model or effort applies to the next run
+/// without a restart.
 ///
 /// It also publishes the [`ClaudeStatus`] of the installed `claude`, detected
 /// at startup and again whenever the `claude_path` setting changes (see
@@ -40,11 +56,19 @@ pub struct RunManager {
     settings: Arc<watch::Sender<ClaudeSettings>>,
     claude: Arc<watch::Sender<ClaudeStatus>>,
     recheck: Arc<Notify>,
+    services: Arc<run::Services>,
 }
 
 impl RunManager {
-    /// Creates the service handle with the settings loaded at startup.
-    pub fn new(argus_home: PathBuf, settings: ClaudeSettings) -> Self {
+    /// Creates the service handle with the settings loaded at startup and
+    /// the services runs use.
+    pub fn new(
+        argus_home: PathBuf,
+        settings: ClaudeSettings,
+        store: StorageService,
+        git: GitService,
+        worktrees: WorktreeManager,
+    ) -> Self {
         let (sender, _) = watch::channel(settings);
         let (claude, _) = watch::channel(ClaudeStatus::Detecting);
         Self {
@@ -52,7 +76,72 @@ impl RunManager {
             settings: Arc::new(sender),
             claude: Arc::new(claude),
             recheck: Arc::new(Notify::new()),
+            services: Arc::new(run::Services::new(store, git, worktrees)),
         }
+    }
+
+    /// Starts a run for a comment with `model` and `effort` (an empty
+    /// effort, or a CLI without `--effort`, uses Claude's default).
+    ///
+    /// Records the run (`kind = comment`, a new session), creates its
+    /// worktree at the current head tip, builds the prompt and the command,
+    /// moves the comment to `Running` and spawns `claude`. Returns once the
+    /// process runs; an independent task streams it to completion. Must run
+    /// on the tokio runtime, never on the UI thread.
+    pub async fn start(
+        &self,
+        comment_id: CommentId,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+    ) -> Result<RunId, RunError> {
+        let status = self.claude_status();
+        if let Some(blocker) = status.run_blocker() {
+            return Err(RunError::ClaudeUnavailable(blocker));
+        }
+        let Some(capabilities) = status.capabilities().cloned() else {
+            return Err(RunError::ClaudeUnavailable(
+                "Claude Code is unavailable".to_owned(),
+            ));
+        };
+        run::start(
+            self.services.clone(),
+            run::StartRequest {
+                comment_id,
+                model: model.into(),
+                effort: effort.into(),
+                capabilities,
+                rules_path: self.review_rules_path(),
+            },
+        )
+        .await
+    }
+
+    /// Stops a run: `SIGTERM` to its process group, `SIGKILL` after
+    /// [`STOP_GRACE`]. It ends `Stopped`, with its worktree kept. Returns
+    /// `false` when the run is not running. Never blocks.
+    pub fn stop(&self, run_id: RunId) -> bool {
+        self.services.stop(run_id)
+    }
+
+    /// Whether the run's process is live in this session.
+    pub fn is_running(&self, run_id: RunId) -> bool {
+        self.services.is_active(run_id)
+    }
+
+    /// The runs whose process is live in this session.
+    pub fn active_runs(&self) -> Vec<RunId> {
+        self.services.active_runs()
+    }
+
+    /// Observes run starts and outcomes.
+    pub fn subscribe_runs(&self) -> broadcast::Receiver<RunUpdate> {
+        self.services.subscribe_status()
+    }
+
+    /// Observes the stream events of every live run. A lagging receiver can
+    /// replay a run from [`argus_store::RunStore::events`].
+    pub fn subscribe_events(&self) -> broadcast::Receiver<RunStreamEvent> {
+        self.services.subscribe_events()
     }
 
     /// Starts detecting `claude` on `runtime`: now, again whenever the
