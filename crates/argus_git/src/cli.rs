@@ -4,6 +4,13 @@
 //! and rebases behave exactly like git itself. Each command runs as
 //! `git -C <dir> ...`, cannot prompt for credentials, prints untranslated
 //! messages, and is logged at debug level.
+//!
+//! The wrapper is also where safety invariant 3 is enforced in code: every
+//! argv passes [`check_args`] before git starts, and a `git push` that could
+//! rewrite or delete remote history (`--force`, `--force-with-lease`, a
+//! `+refspec`, `--delete`, `--mirror`, ...) is refused with
+//! [`GitError::ForcePushRefused`]. The `--force` of `git worktree remove` and
+//! `git checkout` only ever target Argus' own worktrees and stay allowed.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -103,6 +110,7 @@ impl GitCli {
     }
 
     async fn output(&self, args: &[OsString], input: Option<&[u8]>) -> Result<GitOutput> {
+        check_args(args)?;
         let started = Instant::now();
         let spawn_error = |source| GitError::Spawn {
             command: command_line(args),
@@ -166,6 +174,86 @@ impl GitCli {
             .kill_on_drop(true);
         command
     }
+}
+
+/// Global options of `git` that take their value as the next argument.
+const GLOBAL_OPTIONS_WITH_VALUE: [&str; 6] = [
+    "-c",
+    "-C",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+];
+
+/// `git push` options that can overwrite or delete remote history.
+const FORBIDDEN_PUSH_OPTIONS: [&str; 7] = [
+    "--force",
+    "--force-with-lease",
+    "--force-if-includes",
+    "--delete",
+    "--mirror",
+    "--prune",
+    "--all",
+];
+
+/// Refuses an argv Argus must never run: a `git push` that forces, deletes
+/// or mirrors (safety invariant 3). Every command of [`GitCli`] passes here
+/// before git starts.
+///
+/// The subcommand is found after the global options (`-c key=value`, ...).
+/// For `push`, the long options in [`FORBIDDEN_PUSH_OPTIONS`] (also as
+/// `--option=value`), the short `-f` and `-d` (alone or in a cluster such
+/// as `-uf`), and refspecs that force (`+src:dst`) or delete (`:dst`) are
+/// refused. Arguments after `--` are refspecs too.
+pub fn check_args<S: AsRef<OsStr>>(args: &[S]) -> Result<()> {
+    let refused = || GitError::ForcePushRefused {
+        command: command_line(
+            &args
+                .iter()
+                .map(|a| a.as_ref().to_owned())
+                .collect::<Vec<_>>(),
+        ),
+    };
+    let mut rest = args.iter().map(|arg| arg.as_ref().to_string_lossy());
+    let subcommand = loop {
+        let Some(arg) = rest.next() else {
+            return Ok(());
+        };
+        if GLOBAL_OPTIONS_WITH_VALUE.contains(&arg.as_ref()) {
+            rest.next();
+        } else if !arg.starts_with('-') {
+            break arg;
+        }
+    };
+    if subcommand != "push" {
+        return Ok(());
+    }
+    let mut options_done = false;
+    for arg in rest {
+        if !options_done && arg == "--" {
+            options_done = true;
+            continue;
+        }
+        if !options_done && arg.starts_with("--") {
+            let name = arg.split_once('=').map_or(arg.as_ref(), |(name, _)| name);
+            if FORBIDDEN_PUSH_OPTIONS.contains(&name) {
+                return Err(refused());
+            }
+            continue;
+        }
+        if !options_done && arg.starts_with('-') && arg.len() > 1 {
+            if arg[1..].contains(['f', 'd']) {
+                return Err(refused());
+            }
+            continue;
+        }
+        // A positional argument: the remote or a refspec.
+        if arg.starts_with('+') || arg.starts_with(':') {
+            return Err(refused());
+        }
+    }
+    Ok(())
 }
 
 /// `git a b c`, for logs and error messages.

@@ -124,6 +124,15 @@ pub enum GitError {
         root: PathBuf,
     },
 
+    /// A `git push` that could overwrite or delete remote history (`--force`,
+    /// `--force-with-lease`, a `+refspec`, `--delete`, `--mirror`, ...) was
+    /// refused before git ran (safety invariant 3: Argus never force-pushes).
+    #[error("refusing to run `{command}`: Argus never force-pushes or deletes remote branches")]
+    ForcePushRefused {
+        /// The refused command line.
+        command: String,
+    },
+
     /// Reading or updating the runs table failed.
     #[error("storage error: {0}")]
     Store(#[from] argus_store::StoreError),

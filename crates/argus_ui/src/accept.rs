@@ -122,6 +122,11 @@ impl AcceptFlow {
         self.jobs.get(&run_id).map(|job| job.stage)
     }
 
+    /// Whether an Accept is queued or in progress (Push waits for it).
+    pub fn is_busy(&self) -> bool {
+        !self.jobs.is_empty()
+    }
+
     /// Whether a dialog is shown.
     pub fn has_dialog(&self) -> bool {
         !self.dialogs.is_empty()

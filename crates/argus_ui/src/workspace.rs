@@ -11,7 +11,11 @@
 //! [`ProposalView`] tab next to the main diff tab (#22); the navigation keys
 //! follow the active tab. Accept goes through the [`AcceptFlow`] (#24): its
 //! dialogs overlay the shell, and each landed commit refreshes the branches,
-//! so the diff, the comment anchors and the Push counts follow. Settings, the
+//! so the diff, the comment anchors and the Push counts follow. The title
+//! bar's Push button goes through the [`PushFlow`] (#25): it is disabled
+//! while an Accept is in flight, offers `git push -u` when the head has no
+//! upstream, and the head's upstream is fetched in the background every
+//! minute (a setting) so its counts stay current. Settings, the
 //! repository list and git are read and written on the tokio runtime; this
 //! view only receives the results.
 
@@ -38,7 +42,7 @@ use crate::comment_list::{CommentList, CommentListEvent};
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
     button, disabled_button, kbd, panel_header, placeholder, primary_button, section_header,
-    toggle_button,
+    text_tooltip, toggle_button,
 };
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
 use crate::file_tree::{FileTree, FileTreeEvent};
@@ -53,15 +57,16 @@ use crate::keymap::{
     WORKSPACE_CONTEXT,
 };
 use crate::proposal::{ProposalEvent, ProposalSource, ProposalView};
+use crate::push::{PushFlow, PushFlowEvent};
 use crate::run_panel::{RunPanel, RunPanelEvent};
 use crate::runtime::spawn_job;
 use crate::session::{
     BranchList, Comparison, DiffTarget, RepoSession, SessionEvent, Side, open_repository,
 };
 use crate::settings::{
-    DEFAULT_CODE_FONT_SIZE, DEFAULT_FILE_TREE_WIDTH, DEFAULT_RUN_PANEL_HEIGHT,
-    DEFAULT_RUN_PANEL_WIDTH, DEFAULT_UI_FONT_SIZE, DiffViewMode, MIN_DOCK_SIZE, RunPanelPosition,
-    UiSettings, clamp_font_size, clamp_tab_width,
+    BACKGROUND_FETCH_INTERVAL_SECS, DEFAULT_CODE_FONT_SIZE, DEFAULT_FILE_TREE_WIDTH,
+    DEFAULT_RUN_PANEL_HEIGHT, DEFAULT_RUN_PANEL_WIDTH, DEFAULT_UI_FONT_SIZE, DiffViewMode,
+    MIN_DOCK_SIZE, RunPanelPosition, UiSettings, clamp_font_size, clamp_tab_width,
 };
 use crate::theme::{ActiveTheme, Theme, ThemeFonts, ThemeMode};
 
@@ -165,6 +170,10 @@ pub struct Workspace {
     active_proposal: Option<usize>,
     /// Queued accepts and their dialogs.
     accept_flow: Entity<AcceptFlow>,
+    /// The Push in flight, its progress popover and its dialogs.
+    push_flow: Entity<PushFlow>,
+    /// Fetches the head's upstream every minute, when the setting is on.
+    _background_fetch: Task<()>,
     /// Focus the workspace at the next render (e.g. after leaving a tab).
     focus_requested: bool,
     /// "Viewed" marks of the last closed diff view, by (base, head), so a
@@ -223,6 +232,22 @@ impl Workspace {
         let mut subscriptions = subscriptions;
         subscriptions.push(cx.observe(&accept_flow, |_, _, cx| cx.notify()));
         subscriptions.push(cx.subscribe(&accept_flow, Self::accept_flow_event));
+        let push_flow = cx.new(PushFlow::new);
+        subscriptions.push(cx.observe(&push_flow, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.subscribe(&push_flow, Self::push_flow_event));
+        let background_fetch = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(BACKGROUND_FETCH_INTERVAL_SECS))
+                    .await;
+                if this
+                    .update(cx, |this, cx| this.background_fetch(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
 
         let mut this = Self {
             focus_handle,
@@ -242,6 +267,8 @@ impl Workspace {
             proposals: Vec::new(),
             active_proposal: None,
             accept_flow,
+            push_flow,
+            _background_fetch: background_fetch,
             focus_requested: false,
             viewed_stash: None,
             picker: None,
@@ -919,6 +946,75 @@ impl Workspace {
         }
     }
 
+    /// Follows the Push: refresh the branches (a rebase moved the head, the
+    /// counts changed) and show its notices.
+    fn push_flow_event(
+        &mut self,
+        _: Entity<PushFlow>,
+        event: &PushFlowEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            PushFlowEvent::Finished => {
+                if let Some(session) = self.session.clone() {
+                    session.update(cx, |session, cx| session.reload_after_push(cx));
+                }
+            }
+            PushFlowEvent::DialogsClosed => self.activate_tab(self.active_proposal, cx),
+            PushFlowEvent::Notice { message, is_error } => {
+                self.notice = Some(Notice {
+                    message: message.clone(),
+                    is_error: *is_error,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// The title bar's Push button was clicked: push to the upstream, or
+    /// offer `git push -u` when the head has none.
+    fn start_push(&mut self, cx: &mut Context<Self>) {
+        self.close_picker(cx);
+        if self.push_flow.read(cx).is_running() {
+            self.push_flow
+                .update(cx, |flow, cx| flow.toggle_popover(cx));
+            return;
+        }
+        if self.accept_flow.read(cx).is_busy() {
+            return;
+        }
+        let Some(session) = self.session.as_ref().map(|session| session.read(cx)) else {
+            return;
+        };
+        let Some(head) = session.local_head().map(|branch| branch.name.clone()) else {
+            return;
+        };
+        let request = argus_runs::PushRequest {
+            repo_id: session.record().id,
+            repo: session.repo().clone(),
+            head,
+            mode: argus_runs::PushMode::Upstream,
+        };
+        if session.head_has_upstream() {
+            self.push_flow.update(cx, |flow, cx| flow.push(request, cx));
+        } else {
+            let remotes = session.remotes().to_vec();
+            self.push_flow
+                .update(cx, |flow, cx| flow.offer_set_upstream(request, remotes, cx));
+        }
+    }
+
+    /// The minute tick: fetch the head's upstream, unless the setting is
+    /// off or a Push is running (it fetches itself).
+    fn background_fetch(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.background_fetch || self.push_flow.read(cx).is_running() {
+            return;
+        }
+        if let Some(session) = self.session.clone() {
+            session.update(cx, |session, cx| session.fetch_head_upstream(cx));
+        }
+    }
+
     /// `a` outside a proposal tab: there is nothing to accept here.
     fn accept(&mut self, _: &Accept, _: &mut Window, cx: &mut Context<Self>) {
         self.notice = Some(Notice {
@@ -1149,6 +1245,10 @@ impl Workspace {
             .session
             .as_ref()
             .is_some_and(|session| session.read(cx).tracking_prompt().is_some());
+        if self.push_flow.read(cx).is_visible() {
+            self.push_flow.update(cx, |flow, cx| flow.dismiss(cx));
+            return;
+        }
         if self.accept_flow.read(cx).has_dialog() {
             self.accept_flow.update(cx, |flow, cx| flow.dismiss(cx));
         } else if self.picker.is_some() {
@@ -1483,11 +1583,7 @@ impl Workspace {
                 colors.text_muted
             })
             .on_click(|_, window, cx| window.dispatch_action(ToggleDiffMode.boxed_clone(), cx));
-        // Push itself arrives with #25; the counts are live already.
-        let push_label = match session.and_then(|session| session.upstream()) {
-            Some(status) => format!("Push ↑{} ↓{}", status.ahead, status.behind),
-            None => "Push".to_owned(),
-        };
+        let push = self.render_push_button(session, cx);
 
         div()
             .id("title-bar")
@@ -1531,8 +1627,90 @@ impl Workspace {
                     .gap_1()
                     .child(diff_mode)
                     .child(fetch)
-                    .child(disabled_button("title-push", push_label, cx)),
+                    .child(push),
             )
+    }
+
+    /// The Push button and its state (spec §5.4): `Push ↑ahead ↓behind`,
+    /// disabled with a tooltip when there is nothing to do or an Accept is
+    /// in flight, "No upstream" to offer `git push -u`, "Pushing…" (which
+    /// toggles the progress popover) while a Push runs.
+    fn render_push_button(&self, session: Option<&RepoSession>, cx: &Context<Self>) -> AnyElement {
+        let disabled = |label: String, tooltip: String| {
+            disabled_button("title-push", label, cx)
+                .tooltip(text_tooltip(tooltip))
+                .into_any_element()
+        };
+        let enabled = |label: String, tooltip: String| {
+            button("title-push", label, cx)
+                .tooltip(text_tooltip(tooltip))
+                .on_click(cx.listener(|this, _, _, cx| this.start_push(cx)))
+                .into_any_element()
+        };
+        if self.push_flow.read(cx).is_running() {
+            return enabled("Pushing…".to_owned(), "Show the push progress".to_owned());
+        }
+        let Some(session) = session else {
+            return disabled("Push".to_owned(), "Open a repository first.".to_owned());
+        };
+        let Some(head) = session.local_head() else {
+            return disabled(
+                "Push".to_owned(),
+                "Pick a local head branch to push.".to_owned(),
+            );
+        };
+        let counts = session
+            .upstream()
+            .map(|status| format!("Push ↑{} ↓{}", status.ahead, status.behind));
+        if self.accept_flow.read(cx).is_busy() {
+            return disabled(
+                counts.unwrap_or_else(|| "Push".to_owned()),
+                "An Accept is in progress; Push is available once it lands.".to_owned(),
+            );
+        }
+        if !session.head_has_upstream() {
+            if !session.has_remotes() {
+                return disabled(
+                    "Push · No upstream".to_owned(),
+                    "This repository has no remote to push to.".to_owned(),
+                );
+            }
+            return enabled(
+                "Push · No upstream".to_owned(),
+                format!(
+                    "`{}` has no upstream: push it with `git push -u`.",
+                    head.name
+                ),
+            );
+        }
+        match session.upstream() {
+            Some(status) if status.ahead == 0 && status.behind == 0 => disabled(
+                counts.unwrap_or_default(),
+                format!(
+                    "Nothing to push: `{}` is up to date with `{}`.",
+                    head.name, status.upstream
+                ),
+            ),
+            Some(status) if status.ahead == 0 => enabled(
+                counts.unwrap_or_default(),
+                format!(
+                    "`{}` is behind `{}`: pull it (rebase) and push what is left.",
+                    head.name, status.upstream
+                ),
+            ),
+            Some(status) => enabled(
+                counts.unwrap_or_default(),
+                format!(
+                    "Push `{}` to `{}`; pulls with rebase first when the remote is ahead. \
+                     Never forced.",
+                    head.name, status.upstream
+                ),
+            ),
+            None => enabled(
+                "Push".to_owned(),
+                format!("Push `{}` to its upstream.", head.name),
+            ),
+        }
     }
 
     /// A `base ▾` / `head ▾` button, with its picker popover when open.
@@ -2688,6 +2866,31 @@ impl Workspace {
                     .into_any_element(),
             ));
 
+        let git = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header("Git", div(), cx))
+            .child(row(
+                "Background fetch of the head's upstream (every minute)",
+                toggle_button(
+                    "background-fetch-setting",
+                    if settings.background_fetch {
+                        "On"
+                    } else {
+                        "Off"
+                    },
+                    settings.background_fetch,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.update_settings(window, cx, |settings| {
+                        settings.background_fetch = !settings.background_fetch;
+                    })
+                }))
+                .into_any_element(),
+            ));
+
         div()
             .flex()
             .flex_col()
@@ -2696,6 +2899,7 @@ impl Workspace {
             .child(diff)
             .child(appearance)
             .child(layout)
+            .child(git)
     }
 }
 
@@ -2809,6 +3013,9 @@ impl Render for Workspace {
             .children(self.render_tracking_dialog(cx))
             .when(self.accept_flow.read(cx).has_dialog(), |root| {
                 root.child(self.accept_flow.clone())
+            })
+            .when(self.push_flow.read(cx).is_visible(), |root| {
+                root.child(self.push_flow.clone())
             })
     }
 }

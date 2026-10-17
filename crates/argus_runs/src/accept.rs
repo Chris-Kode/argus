@@ -3,7 +3,9 @@
 //!
 //! Runs are parallel, accepts are not: every repository has one accept
 //! queue, a tokio task fed by an mpsc channel, which handles one Accept at a
-//! time, in order. [`RunManager::accept`](crate::RunManager::accept) queues
+//! time, in order. Push ([`crate::push`]) goes through the same queue, so a
+//! pull-before-push rebase and an Accept never move the head branch at the
+//! same time. [`RunManager::accept`](crate::RunManager::accept) queues
 //! a run and hands back an [`AcceptTicket`]: a stream of [`AcceptEvent`]s
 //! (progress, and the two questions only the user can answer) and the final
 //! [`AcceptOutcome`]. The UI answers through the `reply` channel of each
@@ -297,22 +299,58 @@ pub(crate) struct AcceptEnv {
 }
 
 /// One Accept waiting in a queue.
-struct Job {
+pub(crate) struct Job {
     run_id: RunId,
     events: mpsc::UnboundedSender<AcceptEvent>,
     result: oneshot::Sender<Result<AcceptOutcome, AcceptError>>,
 }
 
+/// Work for a repository's queue: an Accept or a Push, handled one at a
+/// time in submission order.
+pub(crate) enum QueueJob {
+    /// Commit a proposal.
+    Accept(Job),
+    /// Pull with rebase if needed, then push.
+    Push(crate::push::PushJob),
+}
+
+type Queues = HashMap<RepoId, mpsc::UnboundedSender<QueueJob>>;
+
 /// The per-repository accept queues.
 #[derive(Debug, Default)]
 pub(crate) struct AcceptQueues {
-    queues: Mutex<HashMap<RepoId, mpsc::UnboundedSender<Job>>>,
+    queues: Mutex<Queues>,
     pending: Arc<Mutex<HashSet<RunId>>>,
 }
 
 impl AcceptQueues {
-    fn lock_queues(&self) -> MutexGuard<'_, HashMap<RepoId, mpsc::UnboundedSender<Job>>> {
+    fn lock_queues(&self) -> MutexGuard<'_, Queues> {
         self.queues.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Hands `job` to the repository's queue, starting the queue task if it
+    /// is not running. Must run on the tokio runtime. Gives the job back
+    /// when the queue cannot take it (runtime shutdown).
+    pub fn enqueue(&self, env: &AcceptEnv, repo: &RepoId, job: QueueJob) -> Result<(), QueueJob> {
+        let mut job = job;
+        let mut queues = self.lock_queues();
+        // A queue whose task ended (runtime shutdown) is replaced once.
+        for _ in 0..2 {
+            let sender = queues.entry(repo.clone()).or_insert_with(|| {
+                let (tx, rx) = mpsc::unbounded_channel();
+                tokio::spawn(queue_loop(env.clone(), rx, self.pending.clone()));
+                tracing::debug!(%repo, "started accept queue");
+                tx
+            });
+            match sender.send(job) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::SendError(returned)) => {
+                    job = returned;
+                    queues.remove(repo);
+                }
+            }
+        }
+        Err(job)
     }
 
     /// Runs queued or being accepted.
@@ -339,37 +377,25 @@ impl AcceptQueues {
         let (events_tx, events) = mpsc::unbounded_channel();
         let (result_tx, result) = oneshot::channel();
         let _ = events_tx.send(AcceptEvent::Stage(AcceptStage::Queued));
-        let mut job = Job {
+        let job = Job {
             run_id,
             events: events_tx,
             result: result_tx,
         };
-        let mut queues = self.lock_queues();
-        // A queue whose task ended (runtime shutdown) is replaced.
-        for _ in 0..2 {
-            let sender = queues.entry(repo.id().clone()).or_insert_with(|| {
-                let (tx, rx) = mpsc::unbounded_channel();
-                tokio::spawn(queue_loop(env.clone(), rx, self.pending.clone()));
-                tracing::debug!(repo = %repo.id(), "started accept queue");
-                tx
-            });
-            match sender.send(job) {
-                Ok(()) => {
-                    tracing::info!(run = %run_id, repo = %repo.id(), "accept queued");
-                    return Ok(AcceptTicket {
-                        run_id,
-                        events,
-                        result,
-                    });
-                }
-                Err(mpsc::error::SendError(returned)) => {
-                    job = returned;
-                    queues.remove(repo.id());
-                }
+        match self.enqueue(env, repo.id(), QueueJob::Accept(job)) {
+            Ok(()) => {
+                tracing::info!(run = %run_id, repo = %repo.id(), "accept queued");
+                Ok(AcceptTicket {
+                    run_id,
+                    events,
+                    result,
+                })
+            }
+            Err(_) => {
+                lock(&self.pending).remove(&run_id);
+                Err(AcceptError::QueueClosed)
             }
         }
-        lock(&self.pending).remove(&run_id);
-        Err(AcceptError::QueueClosed)
     }
 }
 
@@ -386,13 +412,21 @@ fn check_comment(comment: &Comment) -> Result<(), AcceptError> {
     }
 }
 
-/// One repository's queue: one Accept at a time, in submission order.
+/// One repository's queue: one Accept or Push at a time, in submission
+/// order.
 async fn queue_loop(
     env: AcceptEnv,
-    mut jobs: mpsc::UnboundedReceiver<Job>,
+    mut jobs: mpsc::UnboundedReceiver<QueueJob>,
     pending: Arc<Mutex<HashSet<RunId>>>,
 ) {
     while let Some(job) = jobs.recv().await {
+        let job = match job {
+            QueueJob::Accept(job) => job,
+            QueueJob::Push(job) => {
+                crate::push::run_job(&env, job).await;
+                continue;
+            }
+        };
         let run_id = job.run_id;
         let result = if job.events.is_closed() {
             // Cancelled while queued.
@@ -678,22 +712,10 @@ async fn confirm_checked_out(
     events: &mpsc::UnboundedSender<AcceptEvent>,
 ) -> Result<bool, AcceptError> {
     let services = &env.services;
-    let key = format!("{CHECKED_OUT_ACK_KEY}{}", comment.repo_id);
-    let settings = services.store.settings();
-    if settings.get::<bool>(key.clone()).await? == Some(true) {
+    if checked_out_acknowledged(services, comment.repo_id).await? {
         return Ok(true);
     }
-    let root = services.worktrees.root();
-    let checkout = read::current_checkouts(repo)
-        .await?
-        .into_iter()
-        .find(|checkout| {
-            checkout.branch.as_deref() == Some(comment.head_ref.as_str())
-                && !std::fs::canonicalize(&checkout.path)
-                    .unwrap_or_else(|_| checkout.path.clone())
-                    .starts_with(root)
-        });
-    let Some(checkout) = checkout else {
+    let Some(path) = user_checkout_of(services, repo, &comment.head_ref).await? else {
         return Ok(true);
     };
     let (reply, answer) = oneshot::channel();
@@ -701,7 +723,7 @@ async fn confirm_checked_out(
         events,
         AcceptEvent::CheckedOut {
             head: comment.head_ref.clone(),
-            path: checkout.path,
+            path,
             reply,
         },
     ) {
@@ -710,8 +732,48 @@ async fn confirm_checked_out(
     if answer.await != Ok(true) {
         return Ok(false);
     }
-    settings.set(key, &true).await?;
+    acknowledge_checked_out(services, comment.repo_id).await?;
     Ok(true)
+}
+
+/// Whether the user already agreed, for this repository, that Argus moves
+/// a head branch checked out in one of their checkouts.
+pub(crate) async fn checked_out_acknowledged(
+    services: &Services,
+    repo_id: argus_store::RepoId,
+) -> Result<bool, StoreError> {
+    let key = format!("{CHECKED_OUT_ACK_KEY}{repo_id}");
+    Ok(services.store.settings().get::<bool>(key).await? == Some(true))
+}
+
+/// Remembers that the user agreed to move checked-out head branches of this
+/// repository.
+pub(crate) async fn acknowledge_checked_out(
+    services: &Services,
+    repo_id: argus_store::RepoId,
+) -> Result<(), StoreError> {
+    let key = format!("{CHECKED_OUT_ACK_KEY}{repo_id}");
+    services.store.settings().set(key, &true).await
+}
+
+/// The checkout of the user's (not an Argus worktree) that has `head`
+/// checked out, if any.
+pub(crate) async fn user_checkout_of(
+    services: &Services,
+    repo: &Repo,
+    head: &str,
+) -> Result<Option<PathBuf>, GitError> {
+    let root = services.worktrees.root();
+    Ok(read::current_checkouts(repo)
+        .await?
+        .into_iter()
+        .find(|checkout| {
+            checkout.branch.as_deref() == Some(head)
+                && !std::fs::canonicalize(&checkout.path)
+                    .unwrap_or_else(|_| checkout.path.clone())
+                    .starts_with(root)
+        })
+        .map(|checkout| checkout.path))
 }
 
 /// The dialog's prefilled content, without a body.

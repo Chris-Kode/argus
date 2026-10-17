@@ -1,5 +1,6 @@
 //! The open repository: its branches, the base/head selection, the
-//! comparison it resolves to, the upstream counts and Fetch (spec §3.1, §5.1).
+//! comparison it resolves to, the upstream counts, Fetch and the background
+//! fetch of the head's upstream (spec §3.1, §5.1, §5.4).
 //!
 //! Every git and storage call runs on the tokio runtime through
 //! [`spawn_job`]; this entity only stores results. Each kind of work keeps
@@ -148,6 +149,7 @@ pub struct RepoSession {
     compare_task: Option<Task<()>>,
     upstream_task: Option<Task<()>>,
     fetch_task: Option<Task<()>>,
+    background_fetch_task: Option<Task<()>>,
     tracking_task: Option<Task<()>>,
 }
 
@@ -185,6 +187,7 @@ impl RepoSession {
             compare_task: None,
             upstream_task: None,
             fetch_task: None,
+            background_fetch_task: None,
             tracking_task: None,
         };
         this.load(cx);
@@ -245,6 +248,26 @@ impl RepoSession {
     /// Whether the repository has any remote to fetch from.
     pub fn has_remotes(&self) -> bool {
         !self.remotes.is_empty()
+    }
+
+    /// The configured remotes, sorted.
+    pub fn remotes(&self) -> &[String] {
+        &self.remotes
+    }
+
+    /// The selected head when it is a local branch.
+    pub fn local_head(&self) -> Option<&Branch> {
+        self.head
+            .as_deref()
+            .and_then(|head| self.branch(head))
+            .filter(|branch| branch.kind == BranchKind::Local)
+    }
+
+    /// Whether the local head has an upstream configured (its remote-tracking
+    /// branch may not exist locally yet).
+    pub fn head_has_upstream(&self) -> bool {
+        self.local_head()
+            .is_some_and(|branch| branch.upstream.is_some())
     }
 
     // ---- loading ------------------------------------------------------------
@@ -653,6 +676,74 @@ impl RepoSession {
         cx.notify();
     }
 
+    /// Fetches only the head's upstream branch, quietly (the 60 s background
+    /// fetch, spec §5.4), then refreshes the branches and the Push counts.
+    /// Skipped while a Fetch runs or when the head has no upstream; failures
+    /// are only logged.
+    pub fn fetch_head_upstream(&mut self, cx: &mut Context<Self>) {
+        if self.fetching || self.background_fetch_task.is_some() || !self.head_has_upstream() {
+            return;
+        }
+        let Some(head) = self.local_head().map(|branch| branch.name.clone()) else {
+            return;
+        };
+        let repo = self.repo.clone();
+        let job = spawn_job(cx, async move {
+            if let Some(upstream) = argus_git::push::upstream_of(&repo, &head).await? {
+                let (log, outcome) =
+                    argus_git::push::fetch_upstream(repo.workdir(), &upstream).await?;
+                if outcome == argus_git::push::FetchOutcome::Failed {
+                    tracing::info!(command = %log.command, output = %log.output, "background fetch failed");
+                }
+            }
+            argus_git::read::branches(&repo).await
+        });
+        self.background_fetch_task = Some(cx.spawn(async move |this, cx| {
+            let result = flatten(job.await);
+            this.update(cx, |this, cx| {
+                this.background_fetch_task = None;
+                match result {
+                    Ok(branches) => this.replace_branches(branches, cx),
+                    Err(message) => tracing::info!(%message, "background fetch failed"),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Re-opens the repository (so config written by `git push
+    /// --set-upstream` is seen) and re-reads the branches, after a Push: the
+    /// diff and the comment anchors follow a rebased head, and the Push
+    /// counts are recomputed.
+    pub fn reload_after_push(&mut self, cx: &mut Context<Self>) {
+        let repo = self.repo.clone();
+        let git = cx.global::<AppContext>().git.clone();
+        let job = spawn_job(cx, async move {
+            let repo = git.reload(&repo).await?;
+            let branches = argus_git::read::branches(&repo).await?;
+            Ok((repo, branches))
+        });
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let result = flatten(job.await);
+            this.update(cx, |this, cx| {
+                this.refresh_task = None;
+                match result {
+                    Ok((repo, branches)) => {
+                        this.repo = repo;
+                        this.replace_branches(branches, cx);
+                    }
+                    Err(message) => cx.emit(SessionEvent::Notice {
+                        message: format!("Could not refresh branches: {message}").into(),
+                        is_error: true,
+                    }),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// Re-reads the branches after Argus moved one (an Accept): the
     /// comparison re-resolves if a tip moved, which refreshes the diff and
     /// re-anchors the comments, and the Push counts are recomputed.
@@ -707,6 +798,7 @@ impl RepoSession {
         }
         self.load_task = None;
         self.refresh_task = None;
+        self.background_fetch_task = None;
         self.upstream_task = None;
         self.tracking_task = None;
         self.show_comments(None, cx);

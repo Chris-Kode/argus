@@ -17,6 +17,9 @@
 //!   and rejects it ([`RunManager::open_proposal`], [`RunManager::reject`]).
 //! - [`accept`] turns a proposal into one local commit on the head branch,
 //!   through a per-repository queue ([`RunManager::accept`]).
+//! - [`push`] sends the head branch to its upstream through the same queue,
+//!   pulling with rebase first when the remote is ahead
+//!   ([`RunManager::push`]).
 //! - The run defaults of the settings screen live in [`settings`]; the
 //!   review rules file in [`review_rules`].
 //!
@@ -29,6 +32,7 @@ pub mod claude;
 pub mod log;
 pub mod prompt;
 pub mod proposal;
+pub mod push;
 pub mod review_rules;
 pub mod run;
 pub mod settings;
@@ -48,6 +52,10 @@ pub use accept::{
 pub use claude::{ClaudeCapabilities, ClaudeCommand, ClaudeStatus, SessionMode};
 pub use log::{LogChange, LogEntry, RunLog, ToolCall};
 pub use proposal::{Proposal, ProposalError, WorktreeWatch};
+pub use push::{
+    PULL_BEFORE_PUSH, PushConflict, PushError, PushEvent, PushMode, PushOutcome, PushReport,
+    PushRequest, PushStep, PushTicket,
+};
 pub use run::{
     FollowupMode, RunError, RunFinished, RunStreamEvent, RunUpdate, SESSION_NOT_FOUND, STOP_GRACE,
     is_session_not_found,
@@ -318,6 +326,21 @@ impl RunManager {
             claude: self.claude.subscribe(),
         };
         self.accepts.submit(&env, run_id).await
+    }
+
+    /// Queues a Push of the head branch (spec §5.4) on the repository's
+    /// accept queue, behind its earlier accepts: fetch the upstream, rebase
+    /// on it when it is ahead, then push without ever forcing. The returned
+    /// ticket streams each step with git's output (and the checked-out
+    /// question) and ends with the [`PushOutcome`]; dropping it cancels the
+    /// Push. Must run on the tokio runtime.
+    pub fn push(&self, request: PushRequest) -> Result<PushTicket, PushError> {
+        let env = accept::AcceptEnv {
+            services: self.services.clone(),
+            settings: self.settings.subscribe(),
+            claude: self.claude.subscribe(),
+        };
+        push::submit(&self.accepts, &env, request)
     }
 
     /// The runs queued for Accept or being accepted.
