@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
         .block_on(argus_ui::open_worktrees(&argus_home, &store))
         .context("failed to prepare the worktrees directory")?;
 
-    argus_ui::run_gpui_app(runtime.handle().clone(), store, worktrees);
+    argus_ui::run_gpui_app(runtime.handle().clone(), store, worktrees, argus_home);
 
     tracing::info!("Argus exited");
     Ok(())
