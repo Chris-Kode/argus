@@ -10,6 +10,8 @@
 //!   events, and records the outcome (spec §6.3).
 //! - [`proposal`] shows what a finished run changed (`start_sha → worktree`)
 //!   and rejects it ([`RunManager::open_proposal`], [`RunManager::reject`]).
+//! - [`accept`] turns a proposal into one local commit on the head branch,
+//!   through a per-repository queue ([`RunManager::accept`]).
 //! - The run defaults of the settings screen live in [`settings`]; the
 //!   review rules file in [`review_rules`].
 //!
@@ -17,6 +19,7 @@
 //! by [`argus_git::WorktreeManager::mark_interrupted_runs`], before any run
 //! of the new session starts.
 
+pub mod accept;
 pub mod claude;
 pub mod prompt;
 pub mod proposal;
@@ -32,6 +35,10 @@ use argus_git::{GitService, WorktreeManager};
 use argus_store::{CommentId, RunId, StorageService};
 use tokio::sync::{Notify, broadcast, watch};
 
+pub use accept::{
+    AcceptConflict, AcceptError, AcceptEvent, AcceptOutcome, AcceptStage, AcceptTicket, Accepted,
+    CommitDraft, CommitInput,
+};
 pub use claude::{ClaudeCapabilities, ClaudeCommand, ClaudeStatus, SessionMode};
 pub use proposal::{Proposal, ProposalError, WorktreeWatch};
 pub use run::{RunError, RunFinished, RunStreamEvent, RunUpdate, STOP_GRACE};
@@ -61,6 +68,7 @@ pub struct RunManager {
     claude: Arc<watch::Sender<ClaudeStatus>>,
     recheck: Arc<Notify>,
     services: Arc<run::Services>,
+    accepts: Arc<accept::AcceptQueues>,
 }
 
 impl RunManager {
@@ -81,6 +89,7 @@ impl RunManager {
             claude: Arc::new(claude),
             recheck: Arc::new(Notify::new()),
             services: Arc::new(run::Services::new(store, git, worktrees)),
+            accepts: Arc::new(accept::AcceptQueues::default()),
         }
     }
 
@@ -160,6 +169,25 @@ impl RunManager {
     /// comment back to `Open`. Publishes [`RunUpdate::Rejected`].
     pub async fn reject(&self, run_id: RunId) -> Result<(), ProposalError> {
         proposal::reject(&self.services, run_id).await
+    }
+
+    /// Queues the Accept of a run's proposal (spec §5.3): accepts of one
+    /// repository land one at a time, in order. The returned ticket streams
+    /// the progress and the questions for the user (the checked-out notice,
+    /// the commit dialog) and ends with the [`AcceptOutcome`]; dropping it
+    /// cancels the Accept. Must run on the tokio runtime.
+    pub async fn accept(&self, run_id: RunId) -> Result<AcceptTicket, AcceptError> {
+        let env = accept::AcceptEnv {
+            services: self.services.clone(),
+            settings: self.settings.subscribe(),
+            claude: self.claude.subscribe(),
+        };
+        self.accepts.submit(&env, run_id).await
+    }
+
+    /// The runs queued for Accept or being accepted.
+    pub fn accepting(&self) -> Vec<RunId> {
+        self.accepts.pending()
     }
 
     /// Whether the run's process is live in this session.

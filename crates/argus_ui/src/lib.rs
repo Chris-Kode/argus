@@ -4,6 +4,7 @@
 //! hands control to [`run_gpui_app`]. Service handles reach every view through
 //! the [`AppContext`] global; colors and fonts through the [`Theme`] global.
 
+pub mod accept;
 pub mod branch_picker;
 pub mod claude_settings;
 pub mod claude_status;

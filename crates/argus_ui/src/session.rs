@@ -144,6 +144,7 @@ pub struct RepoSession {
     comments: Entity<ReviewComments>,
     _comments_subscription: Subscription,
     load_task: Option<Task<()>>,
+    refresh_task: Option<Task<()>>,
     compare_task: Option<Task<()>>,
     upstream_task: Option<Task<()>>,
     fetch_task: Option<Task<()>>,
@@ -180,6 +181,7 @@ impl RepoSession {
             comments,
             _comments_subscription: comments_subscription,
             load_task: None,
+            refresh_task: None,
             compare_task: None,
             upstream_task: None,
             fetch_task: None,
@@ -651,6 +653,29 @@ impl RepoSession {
         cx.notify();
     }
 
+    /// Re-reads the branches after Argus moved one (an Accept): the
+    /// comparison re-resolves if a tip moved, which refreshes the diff and
+    /// re-anchors the comments, and the Push counts are recomputed.
+    pub fn refresh_branches(&mut self, cx: &mut Context<Self>) {
+        let repo = self.repo.clone();
+        let job = spawn_job(cx, async move { argus_git::read::branches(&repo).await });
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let result = flatten(job.await);
+            this.update(cx, |this, cx| {
+                this.refresh_task = None;
+                match result {
+                    Ok(branches) => this.replace_branches(branches, cx),
+                    Err(message) => cx.emit(SessionEvent::Notice {
+                        message: format!("Could not refresh branches: {message}").into(),
+                        is_error: true,
+                    }),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// Installs a fresh branch list and re-resolves only what moved.
     fn replace_branches(&mut self, branches: Vec<Branch>, cx: &mut Context<Self>) {
         let tip =
@@ -681,6 +706,7 @@ impl RepoSession {
             BackgroundJobs::update(cx, |jobs| jobs.fetching = false);
         }
         self.load_task = None;
+        self.refresh_task = None;
         self.upstream_task = None;
         self.tracking_task = None;
         self.show_comments(None, cx);
