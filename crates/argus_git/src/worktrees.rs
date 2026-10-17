@@ -113,6 +113,23 @@ pub enum CommitOutcome {
     },
 }
 
+/// How [`WorktreeManager::rebase`] went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RebaseOutcome {
+    /// The worktree's commits now sit on top of the target; its detached
+    /// `HEAD` is this commit.
+    Rebased(Sha),
+    /// A commit did not apply. The rebase was aborted and the worktree reset
+    /// to where it started; nothing changed.
+    Conflict {
+        /// The conflicted paths, relative to the repository root.
+        files: Vec<PathBuf>,
+    },
+    /// The rebase failed for another reason (e.g. commit signing); it was
+    /// aborted and the worktree reset.
+    Failed,
+}
+
 /// What [`WorktreeManager::reconcile`] did for one repository.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
@@ -446,6 +463,80 @@ impl WorktreeManager {
         })?;
         tracing::info!(path = %worktree.path.display(), %sha, "committed in worktree");
         Ok(CommitOutcome::Committed(sha))
+    }
+
+    /// `git rebase <onto>` of the worktree's detached `HEAD` (the integration
+    /// worktree of a Push, spec §5.4), with the user's identity and signing
+    /// config. Returns the outcome and the command's log line and output.
+    ///
+    /// Config that would make the rebase reach outside the worktree or wait
+    /// for input is pinned off: `rebase.updateRefs` (would move other
+    /// branches), `rebase.autoStash`, `rebase.autoSquash`, and the editor.
+    /// On a conflict the unmerged paths are collected, then `git rebase
+    /// --abort` and a reset to the starting commit leave the worktree as it
+    /// was, so a conflict never leaves half-rebased state behind.
+    pub async fn rebase(
+        &self,
+        worktree: &Worktree,
+        onto: &Sha,
+    ) -> Result<(RebaseOutcome, crate::push::StepLog)> {
+        self.guard(&worktree.path)?;
+        let cli = GitCli::new(&worktree.path);
+        let start = cli.run(["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+        let start_hex = start.stdout_lossy().trim().to_owned();
+        let start_sha = Sha::parse(&start_hex).ok_or_else(|| GitError::Parse {
+            command: "git rev-parse --verify HEAD^{commit}".to_owned(),
+            message: format!("not an object id: `{start_hex}`"),
+        })?;
+        let onto_hex = onto.to_hex();
+        let args = [
+            "-c",
+            "rebase.updateRefs=false",
+            "-c",
+            "rebase.autoStash=false",
+            "-c",
+            "rebase.autoSquash=false",
+            "-c",
+            "core.editor=true",
+            "rebase",
+            onto_hex.as_str(),
+        ];
+        let output = cli.run_unchecked(args).await?;
+        let log = crate::push::StepLog::from_output(format!("git rebase {onto_hex}"), &output);
+        if output.success() {
+            let head = cli.run(["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+            let hex = head.stdout_lossy();
+            let sha = Sha::parse(hex.trim()).ok_or_else(|| GitError::Parse {
+                command: "git rev-parse --verify HEAD^{commit}".to_owned(),
+                message: format!("not an object id: `{}`", hex.trim()),
+            })?;
+            tracing::info!(path = %worktree.path.display(), %onto, %sha, "rebased in worktree");
+            return Ok((RebaseOutcome::Rebased(sha), log));
+        }
+        let unmerged = cli
+            .run_unchecked(["diff", "--name-only", "--diff-filter=U", "-z"])
+            .await?
+            .stdout;
+        let mut files = Vec::new();
+        for path in unmerged.split(|&b| b == 0).filter(|path| !path.is_empty()) {
+            let path = gix::path::from_byte_slice(path).map_err(|err| GitError::Parse {
+                command: "git diff --name-only --diff-filter=U -z".to_owned(),
+                message: format!("invalid path: {err}"),
+            })?;
+            files.push(path.to_owned());
+        }
+        cli.run_unchecked(["rebase", "--abort"]).await?;
+        self.reset(worktree, &start_sha).await?;
+        tracing::info!(
+            path = %worktree.path.display(),
+            files = files.len(),
+            "rebase stopped; aborted"
+        );
+        if files.is_empty() {
+            Ok((RebaseOutcome::Failed, log))
+        } else {
+            Ok((RebaseOutcome::Conflict { files }, log))
+        }
     }
 
     /// Marks every run left `Queued` or `Running` by a previous session as

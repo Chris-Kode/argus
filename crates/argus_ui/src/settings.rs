@@ -44,6 +44,9 @@ pub const MIN_TAB_WIDTH: u32 = 1;
 /// Largest allowed tab width.
 pub const MAX_TAB_WIDTH: u32 = 16;
 
+/// Seconds between two background fetches of the head's upstream.
+pub const BACKGROUND_FETCH_INTERVAL_SECS: u64 = 60;
+
 /// Every persisted setting, as loaded at startup.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
@@ -198,6 +201,9 @@ pub struct UiSettings {
     /// Diff view, side by side: one horizontal scroll for both columns
     /// instead of one per column.
     pub diff_link_horizontal_scroll: bool,
+    /// Fetch the head's upstream every [`BACKGROUND_FETCH_INTERVAL_SECS`]
+    /// seconds so the Push counts stay current (spec §5.4).
+    pub background_fetch: bool,
 }
 
 impl Default for UiSettings {
@@ -214,6 +220,7 @@ impl Default for UiSettings {
             diff_soft_wrap: false,
             diff_view_mode: DiffViewMode::default(),
             diff_link_horizontal_scroll: true,
+            background_fetch: true,
         }
     }
 }

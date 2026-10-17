@@ -4,13 +4,15 @@
 //! ahead/behind, checkouts, fetch) and [`objects`] (tree diffs with rename
 //! detection and blob reads for the diff engine). Writes go through the
 //! [`cli`] wrapper: [`write`] creates tracking branches and [`worktrees`]
-//! manages the run and integration worktrees under `~/.argus/worktrees/`.
+//! manages the run and integration worktrees under `~/.argus/worktrees/`;
+//! [`push`] holds the fetch, count and push steps of the Push button.
 //! Nothing here ever reads or modifies a user's working checkout.
 
 mod cancel;
 pub mod cli;
 mod error;
 pub mod objects;
+pub mod push;
 pub mod read;
 pub mod worktrees;
 pub mod write;
@@ -24,8 +26,8 @@ pub use cli::{GitCli, GitOutput};
 pub use error::{GitError, Result};
 pub use read::{Branch, BranchKind, Checkout, Repo, RepoId, Sha};
 pub use worktrees::{
-    ApplyOutcome, ChangeKind, ChangedFile, CommitOutcome, Patch, ReconcileReport, Worktree,
-    WorktreeManager,
+    ApplyOutcome, ChangeKind, ChangedFile, CommitOutcome, Patch, RebaseOutcome, ReconcileReport,
+    Worktree, WorktreeManager,
 };
 
 /// Handle to the git service.
