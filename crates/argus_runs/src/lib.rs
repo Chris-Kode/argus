@@ -8,6 +8,10 @@
 //! - [`run`] (through [`RunManager::start`] and [`RunManager::stop`]) spawns
 //!   one `claude -p` per run in its own worktree, streams and stores its
 //!   events, and records the outcome (spec §6.3).
+//! - [`RunManager::follow_up`] continues a `Proposed` comment in the same
+//!   Claude session and worktree (`--resume`); when the session is gone,
+//!   [`RunManager::follow_up_fresh`] starts a new one with the thread as
+//!   context.
 //! - [`log`] folds a run's events into the rows of the run panel's live log.
 //! - [`proposal`] shows what a finished run changed (`start_sha → worktree`)
 //!   and rejects it ([`RunManager::open_proposal`], [`RunManager::reject`]).
@@ -44,7 +48,10 @@ pub use accept::{
 pub use claude::{ClaudeCapabilities, ClaudeCommand, ClaudeStatus, SessionMode};
 pub use log::{LogChange, LogEntry, RunLog, ToolCall};
 pub use proposal::{Proposal, ProposalError, WorktreeWatch};
-pub use run::{RunError, RunFinished, RunStreamEvent, RunUpdate, STOP_GRACE};
+pub use run::{
+    FollowupMode, RunError, RunFinished, RunStreamEvent, RunUpdate, SESSION_NOT_FOUND, STOP_GRACE,
+    is_session_not_found,
+};
 pub use settings::{ClaudeSettings, SettingError};
 pub use stream::StreamEvent;
 
@@ -117,15 +124,7 @@ impl RunManager {
         model: impl Into<String>,
         effort: impl Into<String>,
     ) -> Result<RunId, RunError> {
-        let status = self.claude_status();
-        if let Some(blocker) = status.run_blocker() {
-            return Err(RunError::ClaudeUnavailable(blocker));
-        }
-        let Some(capabilities) = status.capabilities().cloned() else {
-            return Err(RunError::ClaudeUnavailable(
-                "Claude Code is unavailable".to_owned(),
-            ));
-        };
+        let capabilities = self.capabilities()?;
         let (model, effort) = (model.into(), effort.into());
         let run_id = run::start(
             self.services.clone(),
@@ -138,7 +137,13 @@ impl RunManager {
             },
         )
         .await?;
-        if self.remember_choice(&model, &effort) {
+        self.remember_in_background(&model, &effort);
+        Ok(run_id)
+    }
+
+    /// [`RunManager::remember_choice`], saved in the background on a change.
+    fn remember_in_background(&self, model: &str, effort: &str) {
+        if self.remember_choice(model, effort) {
             let manager = self.clone();
             tokio::spawn(async move {
                 if let Err(error) = manager.save_settings().await {
@@ -146,7 +151,6 @@ impl RunManager {
                 }
             });
         }
-        Ok(run_id)
     }
 
     /// Makes `model` and `effort` the Run menu defaults when they are
@@ -176,6 +180,88 @@ impl RunManager {
         let _guard = self.save_lock.lock().await;
         let snapshot = self.settings();
         snapshot.save(&self.services.store.settings()).await
+    }
+
+    /// Starts a follow-up of a `Proposed` comment: saves `reply` in the
+    /// thread and resumes the thread's Claude session (`--resume
+    /// <session_id>`) with the follow-up prompt, in the worktree of the
+    /// current proposal, as a new run (`kind = followup`). The comment moves
+    /// `Proposed → Running`, and back to `Proposed` with the combined
+    /// proposal (`start_sha → worktree`). `model` and `effort` may differ
+    /// from the earlier runs; the session is the same. Like
+    /// [`RunManager::start`], they become the Run menu defaults.
+    ///
+    /// Fails with [`RunError::FollowupUnavailable`] when the proposal's
+    /// worktree is gone (e.g. rejected): a new run is needed then. A resume
+    /// that finds no session fails the run with [`SESSION_NOT_FOUND`]
+    /// (see [`RunFinished::session_not_found`]); offer
+    /// [`RunManager::follow_up_fresh`] then. Must run on the tokio runtime.
+    pub async fn follow_up(
+        &self,
+        comment_id: CommentId,
+        reply: impl Into<String>,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+    ) -> Result<RunId, RunError> {
+        self.start_followup(
+            comment_id,
+            FollowupMode::Resume {
+                reply: reply.into(),
+            },
+            model.into(),
+            effort.into(),
+        )
+        .await
+    }
+
+    /// Runs a follow-up fresh, with the thread as context: a new Claude
+    /// session whose prompt carries the comment, every reply of the thread
+    /// and the latest reviewer reply as the task, in the same worktree. For
+    /// a thread whose session could not be resumed.
+    pub async fn follow_up_fresh(
+        &self,
+        comment_id: CommentId,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+    ) -> Result<RunId, RunError> {
+        self.start_followup(comment_id, FollowupMode::Fresh, model.into(), effort.into())
+            .await
+    }
+
+    async fn start_followup(
+        &self,
+        comment_id: CommentId,
+        mode: FollowupMode,
+        model: String,
+        effort: String,
+    ) -> Result<RunId, RunError> {
+        let capabilities = self.capabilities()?;
+        let run_id = run::follow_up(
+            self.services.clone(),
+            run::FollowupRequest {
+                comment_id,
+                mode,
+                model: model.clone(),
+                effort: effort.clone(),
+                capabilities,
+                rules_path: self.review_rules_path(),
+            },
+        )
+        .await?;
+        self.remember_in_background(&model, &effort);
+        Ok(run_id)
+    }
+
+    /// The detected CLI, or why runs are blocked.
+    fn capabilities(&self) -> Result<ClaudeCapabilities, RunError> {
+        let status = self.claude_status();
+        if let Some(blocker) = status.run_blocker() {
+            return Err(RunError::ClaudeUnavailable(blocker));
+        }
+        status
+            .capabilities()
+            .cloned()
+            .ok_or_else(|| RunError::ClaudeUnavailable("Claude Code is unavailable".to_owned()))
     }
 
     /// Stops a run: `SIGTERM` to its process group, `SIGKILL` after

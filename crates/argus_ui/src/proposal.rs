@@ -13,9 +13,15 @@
 //! summary, and a banner when the head branch moved since the run started.
 //!
 //! Actions: Accept (`a`), Reject (`x`, asks first), Reply (`r`) and Open in
-//! editor. Accept is handed to the workspace's accept flow; while it is
-//! queued or in progress the tab shows "Accepting…" and stops following the
-//! worktree, since the patch was already taken. A file watcher on the worktree takes a new snapshot after manual
+//! editor. A reply is sent as a follow-up run by default (the same Claude
+//! session, in this worktree, with the picked model and effort) or added as
+//! a note only. While the follow-up runs, the diff follows its edits and
+//! Accept / Reject wait; when it ends, the tab shows the combined proposal
+//! of the latest run. A follow-up whose session is gone offers a fresh run
+//! with the thread as context. Accept is handed to the workspace's accept
+//! flow; while it is queued or in progress the tab shows "Accepting…" and
+//! stops following the worktree, since the patch was already taken. A file
+//! watcher on the worktree takes a new snapshot after manual
 //! edits, so the diff follows them. Every git call runs on the tokio
 //! runtime; this view only stores results.
 
@@ -25,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use argus_diff::Side as DiffSide;
-use argus_diff::review::{CommentId, ReplyAuthor};
+use argus_diff::review::{CommentId, CommentStatus, ReplyAuthor};
 use argus_runs::{AcceptStage, Proposal, RunUpdate};
 use argus_store::{RunId, RunStatus};
 use gpui::{
@@ -38,6 +44,7 @@ use crate::AppContext;
 use crate::comments::ReviewComments;
 use crate::components::{button, disabled_button, kbd, placeholder, primary_button};
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
+use crate::followup::{self, FollowupKind};
 use crate::keymap::{Accept, PROPOSAL_CONTEXT, RejectProposal, ReplyToProposal, SHORTCUTS};
 use crate::markdown::{self, Markdown, MarkdownCache};
 use crate::runtime::spawn_job;
@@ -73,14 +80,11 @@ pub enum ProposalEvent {
     /// Accept was asked for the run.
     AcceptRequested(RunId),
     /// The user replied to the proposal; the reply is saved in the thread.
-    /// A follow-up run resumes the session from here.
     Replied {
         /// The comment.
         comment_id: CommentId,
-        /// The run whose proposal was answered.
-        run_id: RunId,
-        /// The reply text.
-        body: String,
+        /// The follow-up run the reply started; `None` for a note only.
+        followup: Option<RunId>,
     },
     /// The proposal was rejected (here or elsewhere); the tab closes.
     Rejected(RunId),
@@ -118,6 +122,10 @@ pub struct ProposalView {
     reply_open: bool,
     sending_reply: bool,
     _reply_subscription: Option<Subscription>,
+    /// The follow-up running in this proposal's worktree.
+    followup_run: Option<RunId>,
+    /// The latest follow-up could not resume its Claude session.
+    session_lost: bool,
     confirm_reject: bool,
     rejecting: bool,
     /// Where the Accept of this proposal is, while queued or in progress.
@@ -173,6 +181,8 @@ impl ProposalView {
             reply_open: false,
             sending_reply: false,
             _reply_subscription: None,
+            followup_run: None,
+            session_lost: false,
             confirm_reject: false,
             rejecting: false,
             accepting: None,
@@ -296,7 +306,11 @@ impl ProposalView {
                 this.load_task = None;
                 match result {
                     Ok(Ok((proposal, watch))) => {
-                        this.show(proposal, None, cx);
+                        let keep = this.diff_view().map(|view| {
+                            let view = view.read(cx);
+                            (view.viewed_paths(), view.active_path())
+                        });
+                        this.show(proposal, keep, cx);
                         this.start_watching(watch, cx);
                     }
                     Ok(Err(error)) => {
@@ -323,6 +337,13 @@ impl ProposalView {
         if let State::Ready(loaded) = &mut self.state
             && loaded.proposal.tree == proposal.tree
         {
+            // A follow-up that changed nothing still brings a new summary.
+            if loaded.proposal.run.id != proposal.run.id {
+                self.summary_doc = proposal.run.summary.as_deref().map(|summary| {
+                    self.markdown
+                        .prepare(summary, |this: &mut Self| &mut this.markdown, cx)
+                });
+            }
             loaded.proposal = proposal;
             cx.notify();
             return;
@@ -461,16 +482,56 @@ impl ProposalView {
             }
             return;
         }
-        let RunUpdate::Rejected { run_id, .. } = update else {
-            return;
-        };
-        let ours = matches!(&self.state, State::Ready(loaded) if loaded.proposal.run.id == run_id);
-        if ours {
-            self.state = State::Rejected;
-            self.watch_task = None;
-            cx.emit(ProposalEvent::Rejected(run_id));
-            cx.notify();
+        let comment_id = self.loaded().map(|loaded| loaded.proposal.comment.id);
+        match update {
+            RunUpdate::Rejected { run_id, .. } => {
+                let ours = self
+                    .loaded()
+                    .is_some_and(|loaded| loaded.proposal.run.id == run_id);
+                if ours {
+                    self.state = State::Rejected;
+                    self.watch_task = None;
+                    cx.emit(ProposalEvent::Rejected(run_id));
+                    cx.notify();
+                }
+            }
+            RunUpdate::Started {
+                run_id,
+                comment_id: Some(id),
+            } if Some(id) == comment_id => {
+                // A follow-up of this comment edits this worktree.
+                self.followup_run = Some(run_id);
+                self.session_lost = false;
+                self.confirm_reject = false;
+                cx.notify();
+            }
+            RunUpdate::Finished(finished)
+                if finished.comment_id.is_some() && finished.comment_id == comment_id =>
+            {
+                self.followup_run = None;
+                self.session_lost = finished.session_not_found;
+                if let Some(error) = finished.error.filter(|_| !finished.session_not_found) {
+                    let first = error.lines().next().unwrap_or_default().to_owned();
+                    self.notice(format!("The follow-up run failed: {first}"), true, cx);
+                }
+                // Show the latest run's combined proposal (or the earlier one
+                // when the follow-up failed); the comment status is fresh too.
+                if let Some(id) = comment_id {
+                    self.source = ProposalSource::Comment(id);
+                    self.load(cx);
+                }
+                cx.notify();
+            }
+            _ => {}
         }
+    }
+
+    /// Whether a follow-up is running in this proposal's worktree.
+    fn followup_running(&self) -> bool {
+        self.followup_run.is_some()
+            || self
+                .loaded()
+                .is_some_and(|loaded| loaded.proposal.comment.status == CommentStatus::Running)
     }
 
     fn loaded(&self) -> Option<&Loaded> {
@@ -496,6 +557,10 @@ impl ProposalView {
         let Some(run_id) = self.loaded().map(|loaded| loaded.proposal.run.id) else {
             return;
         };
+        if self.followup_running() {
+            self.notice("Wait for the follow-up run to finish.", false, cx);
+            return;
+        }
         cx.emit(ProposalEvent::AcceptRequested(run_id));
     }
 
@@ -504,7 +569,9 @@ impl ProposalView {
         if self.accepting.is_some() {
             return;
         }
-        if self.confirm_reject {
+        if self.followup_running() {
+            self.notice("Wait for the follow-up run to finish.", false, cx);
+        } else if self.confirm_reject {
             self.reject(cx);
         } else if self.loaded().is_some() {
             self.confirm_reject = true;
@@ -610,7 +677,13 @@ impl ProposalView {
         cx.notify();
     }
 
+    /// Sends the reply as a follow-up run (`note_only = false`, the default
+    /// of Enter) or saves it as a note in the thread.
     fn send_reply(&mut self, cx: &mut Context<Self>) {
+        self.send_reply_as(false, cx);
+    }
+
+    fn send_reply_as(&mut self, note_only: bool, cx: &mut Context<Self>) {
         let (Some(editor), Some(loaded)) = (self.reply.clone(), self.loaded()) else {
             return;
         };
@@ -621,40 +694,106 @@ impl ProposalView {
         if body.is_empty() {
             return;
         }
-        let (comment_id, run_id) = (loaded.proposal.comment.id, loaded.proposal.run.id);
-        let comments = cx.global::<AppContext>().store.comments();
-        let saved = body.clone();
-        let handle = cx.global::<AppContext>().runtime.spawn(async move {
-            comments
-                .add_reply(comment_id, ReplyAuthor::User, saved)
-                .await
-        });
+        let comment_id = loaded.proposal.comment.id;
+        let followup = !note_only;
+        if followup && self.followup_running() {
+            self.notice(
+                "A follow-up is already running; add the reply as a note, or wait.",
+                false,
+                cx,
+            );
+            return;
+        }
+        let task: Task<Result<Option<RunId>, String>> = if followup {
+            let choice = followup::current(cx);
+            let start =
+                followup::spawn_followup(comment_id, FollowupKind::Resume(body), choice, cx);
+            cx.background_executor()
+                .spawn(async move { start.await.map(Some) })
+        } else {
+            let comments = cx.global::<AppContext>().store.comments();
+            let handle = cx.global::<AppContext>().runtime.spawn(async move {
+                comments
+                    .add_reply(comment_id, ReplyAuthor::User, body)
+                    .await
+            });
+            cx.background_executor().spawn(async move {
+                match handle.await {
+                    Ok(Ok(_)) => Ok(None),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                }
+            })
+        };
         self.sending_reply = true;
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = handle.await;
+            let result = task.await;
             this.update(cx, |this, cx| {
                 this.sending_reply = false;
-                let error = match result {
-                    Ok(Ok(_)) => None,
-                    Ok(Err(error)) => Some(error.to_string()),
-                    Err(error) => Some(error.to_string()),
-                };
-                match error {
-                    None => {
+                match result {
+                    Ok(run) => {
                         if let Some(editor) = &this.reply {
                             editor.update(cx, |editor, cx| editor.set_text("", cx));
                         }
                         this.reply_open = false;
                         this.focus_requested = true;
+                        if let Some(run_id) = run {
+                            this.followup_run = Some(run_id);
+                            this.session_lost = false;
+                        }
                         cx.emit(ProposalEvent::Replied {
                             comment_id,
-                            run_id,
-                            body,
+                            followup: run,
                         });
                     }
-                    Some(message) => {
+                    Err(message) if followup => {
+                        this.notice(
+                            format!("Could not start the follow-up run: {message}"),
+                            true,
+                            cx,
+                        );
+                    }
+                    Err(message) => {
                         this.notice(format!("Could not save the reply: {message}"), true, cx);
                     }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Runs the follow-up fresh, with the thread as context, after a resume
+    /// found no session.
+    fn run_fresh(&mut self, cx: &mut Context<Self>) {
+        let Some(comment_id) = self.loaded().map(|loaded| loaded.proposal.comment.id) else {
+            return;
+        };
+        if self.followup_running() || self.sending_reply {
+            return;
+        }
+        let choice = followup::current(cx);
+        let start = followup::spawn_followup(comment_id, FollowupKind::Fresh, choice, cx);
+        self.sending_reply = true;
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = start.await;
+            this.update(cx, |this, cx| {
+                this.sending_reply = false;
+                match result {
+                    Ok(run_id) => {
+                        this.followup_run = Some(run_id);
+                        this.session_lost = false;
+                        cx.emit(ProposalEvent::Replied {
+                            comment_id,
+                            followup: Some(run_id),
+                        });
+                    }
+                    Err(message) => this.notice(
+                        format!("Could not start the fresh run: {message}"),
+                        true,
+                        cx,
+                    ),
                 }
                 cx.notify();
             })
@@ -881,11 +1020,14 @@ impl ProposalView {
 
     fn render_actions(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let busy = self.rejecting || self.load_task.is_some();
+        let running = self.followup_running();
+        let busy = self.rejecting || self.load_task.is_some() || running;
         let reject = if self.accepting.is_some() {
             disabled_button("proposal-reject", "Reject", cx).into_any_element()
         } else if self.rejecting {
             disabled_button("proposal-reject", "Rejecting…", cx).into_any_element()
+        } else if running {
+            disabled_button("proposal-reject", "Reject", cx).into_any_element()
         } else {
             button("proposal-reject", "Reject", cx)
                 .text_color(colors.error)
@@ -962,6 +1104,58 @@ impl ProposalView {
                         .on_click(cx.listener(|this, _, _, cx| this.reject(cx))),
                 )
         });
+        let followup_banner = if running {
+            Some(
+                div()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(colors.accent.opacity(0.4))
+                    .bg(colors.accent.opacity(0.08))
+                    .text_sm()
+                    .text_color(colors.accent)
+                    .child(
+                        "Follow-up running: Claude resumes the session in this worktree; the \
+                         diff follows its edits. Accept and Reject wait until it ends.",
+                    )
+                    .into_any_element(),
+            )
+        } else if self.session_lost {
+            let fresh = if self.sending_reply {
+                disabled_button("proposal-run-fresh", "Starting…", cx).into_any_element()
+            } else {
+                primary_button(
+                    "proposal-run-fresh",
+                    "Run fresh with the thread as context",
+                    cx,
+                )
+                .h(px(24.0))
+                .on_click(cx.listener(|this, _, _, cx| this.run_fresh(cx)))
+                .into_any_element()
+            };
+            Some(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(colors.error.opacity(0.4))
+                    .bg(colors.error.opacity(0.08))
+                    .text_sm()
+                    .child(div().flex_1().min_w_0().text_color(colors.error).child(
+                        "The follow-up failed: Claude could not resume this comment's \
+                                 session (session not found). A fresh run starts a new session \
+                                 whose prompt carries the comment and every reply.",
+                    ))
+                    .child(fresh)
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
         let reply_box = self
             .reply
             .clone()
@@ -969,11 +1163,22 @@ impl ProposalView {
             .map(|editor| {
                 let send = if self.sending_reply {
                     disabled_button("proposal-reply-send", "Sending…", cx).into_any_element()
+                } else if running {
+                    disabled_button("proposal-reply-send", "Send as follow-up run", cx)
+                        .into_any_element()
                 } else {
-                    primary_button("proposal-reply-send", "Send reply", cx)
+                    primary_button("proposal-reply-send", "Send as follow-up run", cx)
                         .h(px(24.0))
                         .on_click(cx.listener(|this, _, _, cx| this.send_reply(cx)))
                         .into_any_element()
+                };
+                let note = if self.sending_reply {
+                    None
+                } else {
+                    Some(
+                        button("proposal-reply-note", "Add note only", cx)
+                            .on_click(cx.listener(|this, _, _, cx| this.send_reply_as(true, cx))),
+                    )
                 };
                 div()
                     .flex()
@@ -1000,14 +1205,16 @@ impl ProposalView {
                                     .text_xs()
                                     .text_color(colors.text_placeholder)
                                     .child(
-                                        "Claude resumes the same session in this worktree · \
-                                         Esc to close",
+                                        "A follow-up resumes the same Claude session in this \
+                                         worktree · Esc to close",
                                     ),
                             )
+                            .child(followup::choice_buttons("proposal-reply", cx))
                             .child(
                                 button("proposal-reply-cancel", "Cancel", cx)
                                     .on_click(cx.listener(|this, _, _, cx| this.close_reply(cx))),
                             )
+                            .children(note)
                             .child(send),
                     )
             });
@@ -1032,6 +1239,7 @@ impl ProposalView {
                     .child(editor)
                     .child(refresh),
             )
+            .children(followup_banner)
             .children(confirm)
             .children(reply_box)
             .into_any_element()

@@ -15,6 +15,9 @@
 //!   the MVP passes exactly one, a numbered list is rendered for more
 //!   (batch-ready, spec §3.2).
 //! - [`followup_prompt`]: a reply resuming the same Claude session.
+//! - [`fresh_followup_prompt`]: a follow-up in a new session, when the
+//!   comment's session cannot be resumed; it carries the comment and the
+//!   whole thread ([`ThreadMessage`]) instead.
 //! - [`resolve_prompt`]: a conflict-resolution run ([`ResolveContext`]).
 
 mod excerpt;
@@ -23,7 +26,7 @@ use std::fmt::Write as _;
 
 use argus_diff::review::Comment;
 use argus_diff::{Side, TextDiff};
-use argus_store::RunKind;
+use argus_store::{ReplyAuthor, RunKind};
 
 pub use excerpt::{
     DiffExcerpt, EXTRA_CONTEXT_LINES, ExcerptTrim, MAX_EXCERPT_CHARS, TRIMMED_CONTEXT_LINES,
@@ -31,7 +34,7 @@ pub use excerpt::{
 
 /// Version of the prompt templates. Bump it whenever the rendered text
 /// changes in a way that matters for auditing or comparing runs.
-pub const PROMPT_VERSION: u32 = 1;
+pub const PROMPT_VERSION: u32 = 2;
 
 /// Scope rule of comment and follow-up runs (spec §6.1).
 pub const SCOPE_RULE: &str = "Change only what the comment asks. Touch other files only if needed, and say why in your final message.";
@@ -234,6 +237,79 @@ pub fn followup_prompt(reply: &str) -> Prompt {
     );
     out.push_str("\n## Reply (verbatim)\n\n");
     fenced(&mut out, "markdown", reply);
+    rules(&mut out, &[SCOPE_RULE, NO_COMMIT_RULE, SUMMARY_RULE]);
+    Prompt {
+        kind: RunKind::Followup,
+        version: PROMPT_VERSION,
+        text: out,
+    }
+}
+
+/// One message of a comment thread, oldest first, for a follow-up that
+/// cannot resume the thread's session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadMessage {
+    /// Who wrote it.
+    pub author: ReplyAuthor,
+    /// The Markdown text, verbatim.
+    pub body: String,
+}
+
+/// Renders the prompt of a follow-up started in a new session because the
+/// comment's session could not be resumed: the comment, the thread so far
+/// and the reviewer's latest reply as the task. The previous change is
+/// still applied in the worktree.
+///
+/// The task is the last reviewer message of `thread`; without one, the
+/// comment itself.
+pub fn fresh_followup_prompt(
+    repo: &RepoContext,
+    comment: &CommentContext,
+    thread: &[ThreadMessage],
+) -> Prompt {
+    let mut out = String::new();
+    marker(&mut out, RunKind::Followup);
+    repo_intro(&mut out, repo);
+    out.push_str(
+        "A reviewer left a comment on this branch, and an earlier Claude session made a change \
+         for it. That change is already applied in this working directory, but the session \
+         itself is no longer available, so the comment and the conversation so far are \
+         repeated below.\n",
+    );
+    comment_section(&mut out, comment, "##");
+    let task = thread
+        .iter()
+        .rposition(|message| message.author == ReplyAuthor::User);
+    if !thread.is_empty() {
+        out.push_str("\n## Conversation so far (oldest first)\n");
+        for (index, message) in thread.iter().enumerate() {
+            let who = match message.author {
+                ReplyAuthor::User => "Reviewer",
+                ReplyAuthor::Claude => "Claude (earlier session)",
+            };
+            let latest = if Some(index) == task {
+                ", latest reply"
+            } else {
+                ""
+            };
+            let _ = write!(out, "\n### {}. {who}{latest}\n\n", index + 1);
+            fenced(&mut out, "markdown", &message.body);
+        }
+    }
+    match task {
+        Some(index) => {
+            let _ = writeln!(
+                out,
+                "\nYour task is to update the change as the reviewer's latest reply (message {}) \
+                 asks, starting from the current state of the files.",
+                index + 1
+            );
+        }
+        None => out.push_str(
+            "\nYour task is to finish applying the comment, starting from the current state of \
+             the files.\n",
+        ),
+    }
     rules(&mut out, &[SCOPE_RULE, NO_COMMIT_RULE, SUMMARY_RULE]);
     Prompt {
         kind: RunKind::Followup,

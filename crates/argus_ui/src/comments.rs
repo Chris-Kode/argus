@@ -10,6 +10,13 @@
 //! After every diff refresh the workspace calls [`ReviewComments::reanchor`]
 //! with the new diff session, so comments follow their code or turn
 //! outdated (spec §7.3).
+//!
+//! Replies on a `Proposed` comment can start a follow-up run
+//! ([`ReviewComments::follow_up`]). When a follow-up's `--resume` finds no
+//! session, the comment is remembered in [`ReviewComments::session_lost`]
+//! so its thread offers a fresh run with the thread as context.
+
+use std::collections::HashSet;
 
 use std::sync::Arc;
 
@@ -23,6 +30,7 @@ use gpui::{Context, EventEmitter, SharedString, Task};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::AppContext;
+use crate::followup::{self, FollowupKind};
 use crate::runtime::spawn_job;
 
 /// Events for views showing comments.
@@ -44,6 +52,8 @@ pub struct ReviewComments {
     load_task: Option<Task<()>>,
     /// The re-anchoring pass in flight; replacing it cancels it.
     reanchor_task: Option<Task<()>>,
+    /// Comments whose latest follow-up could not resume its session.
+    session_lost: HashSet<CommentId>,
     _listen_task: Task<()>,
     _runs_task: Task<()>,
 }
@@ -78,16 +88,25 @@ impl ReviewComments {
         let mut runs = cx.global::<AppContext>().runs.subscribe_runs();
         let runs_task = cx.spawn(async move |this, cx| {
             loop {
-                let comment_id = match runs.recv().await {
-                    Ok(RunUpdate::Started { comment_id, .. }) => comment_id,
-                    Ok(RunUpdate::Finished(finished)) => finished.comment_id,
+                let (comment_id, lost) = match runs.recv().await {
+                    Ok(RunUpdate::Started { comment_id, .. }) => (comment_id, Some(false)),
+                    Ok(RunUpdate::Finished(finished)) => {
+                        (finished.comment_id, Some(finished.session_not_found))
+                    }
                     Ok(RunUpdate::Rejected { comment_id, .. })
-                    | Ok(RunUpdate::Accepted { comment_id, .. }) => comment_id,
-                    Err(RecvError::Lagged(_)) => None,
+                    | Ok(RunUpdate::Accepted { comment_id, .. }) => (comment_id, Some(false)),
+                    Err(RecvError::Lagged(_)) => (None, None),
                     Err(RecvError::Closed) => break,
                 };
                 let alive = this
                     .update(cx, |this, cx| {
+                        if let (Some(id), Some(lost)) = (comment_id, lost) {
+                            if lost {
+                                this.session_lost.insert(id);
+                            } else {
+                                this.session_lost.remove(&id);
+                            }
+                        }
                         let shown =
                             comment_id.is_none_or(|id| this.comments.iter().any(|c| c.id == id));
                         if shown {
@@ -106,6 +125,7 @@ impl ReviewComments {
             service,
             load_task: None,
             reanchor_task: None,
+            session_lost: HashSet::new(),
             _listen_task: listen_task,
             _runs_task: runs_task,
         }
@@ -243,6 +263,43 @@ impl ReviewComments {
                 .reply(id, ReplyAuthor::User, body_md)
                 .await
                 .map(drop)
+        })
+    }
+
+    /// Whether the latest follow-up of `id` failed because its Claude
+    /// session could not be resumed; the thread then offers a fresh run.
+    pub fn session_lost(&self, id: CommentId) -> bool {
+        self.session_lost.contains(&id)
+    }
+
+    /// Starts a follow-up run of a `Proposed` comment with `choice` (model,
+    /// effort) (the reply is saved in the thread by the run manager), or a
+    /// fresh one with the thread as context. The task resolves to whether the run started; a failure is
+    /// reported as an error event.
+    pub fn follow_up(
+        &mut self,
+        id: CommentId,
+        kind: FollowupKind,
+        choice: (String, String),
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
+        let start = followup::spawn_followup(id, kind, choice, cx);
+        cx.spawn(async move |this, cx| {
+            let result = start.await;
+            this.update(cx, |this, cx| match result {
+                Ok(run_id) => {
+                    tracing::info!(comment = %id, run = %run_id, "follow-up started");
+                    this.session_lost.remove(&id);
+                    true
+                }
+                Err(message) => {
+                    report(Err(message), "start the follow-up run", cx);
+                    // The reply may be saved even when the run did not start.
+                    this.reload(cx);
+                    false
+                }
+            })
+            .unwrap_or(false)
         })
     }
 

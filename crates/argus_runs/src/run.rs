@@ -9,9 +9,17 @@
 //! computes the proposal patch and writes the outcome. There is no queue and
 //! no limit: every run is its own task, and nothing ever waits on one from
 //! the UI thread.
+//!
+//! [`follow_up`] continues a `Proposed` comment: a new run (`kind =
+//! followup`) resumes the thread's Claude session (`--resume`) in the
+//! worktree of the current proposal, so the next proposal combines both
+//! runs (`start_sha → worktree`). When the session cannot be resumed, the
+//! run fails with [`SESSION_NOT_FOUND`] in its error, and a fresh follow-up
+//! ([`FollowupMode::Fresh`]) starts a new session with the whole thread in
+//! its prompt.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -20,10 +28,10 @@ use argus_diff::review::{
     Comment, CommentEvent, ReviewError, apply_event, transition as comment_transition,
 };
 use argus_diff::{DiffError, DiffOptions, DiffSession, LoadMode};
-use argus_git::{GitError, GitService, Sha, Worktree, WorktreeManager};
+use argus_git::{GitError, GitService, Repo, Sha, Worktree, WorktreeManager};
 use argus_store::{
-    CommentId, NewRun, ReplyAuthor, RunId, RunKind, RunOutcome, RunStatus, StorageService,
-    StoreError,
+    CommentId, CommentStatus, NewRun, ReplyAuthor, RunId, RunKind, RunOutcome, RunStatus,
+    StorageService, StoreError,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::Child;
@@ -34,7 +42,10 @@ use uuid::Uuid;
 use crate::claude::{
     AUTH_ERROR_HINT, ClaudeCapabilities, ClaudeCommand, SessionMode, is_auth_error,
 };
-use crate::prompt::{CommentContext, PromptError, RepoContext, comment_prompt};
+use crate::prompt::{
+    CommentContext, Prompt, PromptError, RepoContext, ThreadMessage, comment_prompt,
+    followup_prompt, fresh_followup_prompt,
+};
 use crate::stream::{RunResult, StreamEvent, parse_line};
 
 /// How long Stop waits after `SIGTERM` before it sends `SIGKILL`.
@@ -55,6 +66,33 @@ const LINE_BUFFER: usize = 256;
 
 /// Longest prefix of a malformed line written to the log, in bytes.
 const MALFORMED_LOG_BYTES: usize = 200;
+
+/// Starts the error of a follow-up whose Claude session could not be
+/// resumed; [`is_session_not_found`] recognizes it in a stored run.
+pub const SESSION_NOT_FOUND: &str = "Claude could not resume this comment's session";
+
+/// Lower-case fragments of what Claude Code prints when `--resume` names a
+/// session it does not have.
+const SESSION_NOT_FOUND_PATTERNS: [&str; 3] = [
+    "no conversation found",
+    "session not found",
+    "no session found",
+];
+
+/// Whether a run's stored `error` says its session could not be resumed,
+/// so the UI can offer a fresh follow-up with the thread as context.
+pub fn is_session_not_found(error: &str) -> bool {
+    error.starts_with(SESSION_NOT_FOUND)
+}
+
+/// Whether Claude's output (stderr, or a failed `result` text) reports a
+/// missing session.
+fn reports_missing_session(text: &str) -> bool {
+    let text = text.to_lowercase();
+    SESSION_NOT_FOUND_PATTERNS
+        .iter()
+        .any(|pattern| text.contains(pattern))
+}
 
 /// Why a run could not start.
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +124,18 @@ pub enum RunError {
     /// The `claude` process could not be started.
     #[error("cannot start claude: {0}")]
     Spawn(String),
+    /// The comment has no proposal whose worktree still exists (e.g. it was
+    /// rejected), so there is nothing to follow up on; a new run is needed.
+    #[error(
+        "comment {0} has no proposal to follow up on (its worktree is gone); start a new run instead"
+    )]
+    FollowupUnavailable(CommentId),
+    /// A run of the comment is still running.
+    #[error("comment {0} already has a run in progress")]
+    Busy(CommentId),
+    /// The stored session id of the thread is not a UUID.
+    #[error("the Claude session of comment {0} is not a valid id: `{1}`")]
+    InvalidSession(CommentId, String),
 }
 
 /// A run's lifecycle change, for views that show statuses.
@@ -134,6 +184,11 @@ pub struct RunFinished {
     pub summary: Option<String>,
     /// Why the run failed.
     pub error: Option<String>,
+    /// Why the run was started.
+    pub kind: RunKind,
+    /// The run's `--resume` failed: the thread's session is gone. The UI
+    /// offers a fresh follow-up with the thread as context.
+    pub session_not_found: bool,
 }
 
 /// One stream-json event of a live run, in stream order (`seq`).
@@ -224,6 +279,111 @@ pub(crate) struct StartRequest {
     pub rules_path: PathBuf,
 }
 
+/// How a follow-up talks to Claude.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowupMode {
+    /// Resume the thread's session with the reviewer's reply as the prompt.
+    /// The reply is saved in the thread when the run starts.
+    Resume {
+        /// The reply text.
+        reply: String,
+    },
+    /// Start a new session whose prompt carries the comment and the whole
+    /// thread, for a thread whose session could not be resumed.
+    Fresh,
+}
+
+/// What [`follow_up`] needs besides the comment.
+pub(crate) struct FollowupRequest {
+    pub comment_id: CommentId,
+    pub mode: FollowupMode,
+    pub model: String,
+    pub effort: String,
+    pub capabilities: ClaudeCapabilities,
+    pub rules_path: PathBuf,
+}
+
+/// The stored comment with its repository, checked for a new run.
+struct Target {
+    stored: argus_store::Comment,
+    repo_name: String,
+    repo: Repo,
+}
+
+async fn load_target(services: &Services, comment_id: CommentId) -> Result<Target, RunError> {
+    let store = &services.store;
+    let stored = store
+        .comments()
+        .get(comment_id)
+        .await?
+        .ok_or(RunError::CommentNotFound(comment_id))?;
+    // Refuse early, before any git work; `apply_event` checks again later.
+    if stored.outdated {
+        return Err(ReviewError::Outdated(comment_id).into());
+    }
+    let record = store
+        .repos()
+        .get(stored.repo_id)
+        .await?
+        .ok_or(RunError::RepoNotFound(comment_id))?;
+    let repo = services.git.open(record.path.clone()).await?;
+    Ok(Target {
+        stored,
+        repo_name: record.name,
+        repo,
+    })
+}
+
+/// The comment as the prompt shows it, from the current diff of its review,
+/// and the head tip that diff ends at.
+async fn comment_context(
+    target: &Target,
+) -> Result<(Sha, impl FnOnce() -> CommentContext + Send + 'static), RunError> {
+    let stored = &target.stored;
+    let session = DiffSession::new(
+        &target.repo,
+        &stored.base_ref,
+        &stored.head_ref,
+        DiffOptions::default(),
+    )
+    .await?;
+    let head = session.head();
+    let comment = Comment::from_stored(stored.clone(), Vec::new());
+    let file_diff = match session
+        .file_diff(&comment.anchor.file_path, LoadMode::Normal)
+        .await
+    {
+        Ok(diff) => Some(diff),
+        Err(error) => {
+            // The prompt falls back to the snippet saved with the comment.
+            tracing::debug!(comment = %stored.id, %error, "no line diff for the prompt");
+            None
+        }
+    };
+    // Building the excerpt walks the file diff: callers run this off the
+    // async workers.
+    let build =
+        move || CommentContext::from_comment(&comment, file_diff.as_ref().and_then(|d| d.text()));
+    Ok((head, build))
+}
+
+fn repo_context(target: &Target, start_sha: &str) -> RepoContext {
+    RepoContext {
+        repo_name: target.repo_name.clone(),
+        base_branch: target.stored.base_ref.clone(),
+        head_branch: target.stored.head_ref.clone(),
+        start_sha: start_sha.to_owned(),
+    }
+}
+
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, RunError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| RunError::Spawn(error.to_string()))
+}
+
 /// Starts a comment run and returns once its process is spawned.
 ///
 /// Errors before the run row exists leave nothing behind. Once it exists, a
@@ -240,128 +400,306 @@ pub(crate) async fn start(
         capabilities,
         rules_path,
     } = request;
-    let store = &services.store;
-    let stored = store
-        .comments()
-        .get(comment_id)
-        .await?
-        .ok_or(RunError::CommentNotFound(comment_id))?;
-    // Refuse early, before any git work; `apply_event` checks again below.
-    if stored.outdated {
-        return Err(ReviewError::Outdated(comment_id).into());
-    }
-    comment_transition(stored.status, CommentEvent::RunStarted).map_err(ReviewError::from)?;
-    let record = store
-        .repos()
-        .get(stored.repo_id)
-        .await?
-        .ok_or(RunError::RepoNotFound(comment_id))?;
-    let repo = services.git.open(record.path.clone()).await?;
+    let target = load_target(&services, comment_id).await?;
+    comment_transition(target.stored.status, CommentEvent::RunStarted)
+        .map_err(ReviewError::from)?;
 
     // The worktree starts at the head tip as it is now (spec §6.3).
-    let session = DiffSession::new(
-        &repo,
-        &stored.base_ref,
-        &stored.head_ref,
-        DiffOptions::default(),
-    )
-    .await?;
-    let start_sha = session.head();
-    let comment = Comment::from_stored(stored, Vec::new());
-    let file_diff = match session
-        .file_diff(&comment.anchor.file_path, LoadMode::Normal)
-        .await
-    {
-        Ok(diff) => Some(diff),
-        Err(error) => {
-            // The prompt falls back to the snippet saved with the comment.
-            tracing::debug!(comment = %comment_id, %error, "no line diff for the prompt");
-            None
-        }
-    };
-    let repo_context = RepoContext {
-        repo_name: record.name.clone(),
-        base_branch: comment.base_ref.clone(),
-        head_branch: comment.head_ref.clone(),
-        start_sha: start_sha.to_hex(),
-    };
-    // Building the excerpt walks the file diff: keep it off the async workers.
-    let prompt = tokio::task::spawn_blocking(move || {
-        let context =
-            CommentContext::from_comment(&comment, file_diff.as_ref().and_then(|d| d.text()));
-        comment_prompt(&repo_context, &[context])
-    })
-    .await
-    .map_err(|error| RunError::Spawn(error.to_string()))??;
+    let (start_sha, build_context) = comment_context(&target).await?;
+    let repo_context = repo_context(&target, &start_sha.to_hex());
+    let prompt = blocking(move || comment_prompt(&repo_context, &[build_context()])).await??;
 
     // 1. The run row (`kind = comment`, a new session for the thread).
     let run_id = RunId::new();
     let session_id = Uuid::now_v7();
-    let worktree_path = services.worktrees.run_path(repo.id(), run_id);
-    store
-        .runs()
-        .create_with_id(
-            run_id,
-            NewRun {
-                comment_id: Some(comment_id),
-                kind: RunKind::Comment,
-                session_id: session_id.hyphenated().to_string(),
-                model: model.clone(),
-                effort: effort.clone(),
-                worktree_path,
-                start_sha: start_sha.to_hex(),
-                prompt: prompt.text.clone(),
-            },
-        )
-        .await?;
-
-    // The comment moves to `Running` before any expensive work, so a second
-    // start of the same comment is refused by the compare-and-swap.
-    if let Err(error) = apply_event(&store.comments(), comment_id, CommentEvent::RunStarted).await {
-        if let Err(delete_error) = store.runs().delete(run_id).await {
-            tracing::warn!(run = %run_id, error = %delete_error, "cannot delete unstarted run");
-        }
-        return Err(error.into());
-    }
-
-    let fail = |reason: String| {
-        let services = services.clone();
-        async move {
-            let mut outcome = RunOutcome::new(RunStatus::Failed);
-            outcome.error = Some(reason.clone());
-            record_finish(&services, run_id, Some(comment_id), outcome).await;
-        }
+    let worktree_path = services.worktrees.run_path(target.repo.id(), run_id);
+    let pending = PendingRun {
+        run_id,
+        comment_id,
+        kind: RunKind::Comment,
+        start_sha,
+        model,
+        effort,
+        session: SessionMode::New(session_id),
+        capabilities,
+        rules_path,
     };
+    record_run(&services, &pending, worktree_path, &prompt).await?;
+    claim_comment(&services, &pending, CommentEvent::RunStarted).await?;
 
     // 2. The worktree at the head tip.
     let worktree = match services
         .worktrees
-        .create_run_worktree(&repo, &start_sha, run_id)
+        .create_run_worktree(&target.repo, &start_sha, run_id)
         .await
     {
         Ok(worktree) => worktree,
         Err(error) => {
-            fail(format!("cannot create the run worktree: {error}")).await;
+            let reason = format!("cannot create the run worktree: {error}");
+            fail_unstarted(&services, &pending, None, reason).await;
             return Err(error.into());
         }
     };
 
     // 3. The command, spawned in the worktree.
-    let effort_arg = (!effort.trim().is_empty()).then_some(effort.as_str());
+    spawn(services, pending, worktree, prompt.text).await
+}
+
+/// Starts a follow-up of a `Proposed` comment and returns once its process
+/// is spawned (spec §6.2).
+///
+/// The run (`kind = followup`) works in the worktree of the comment's
+/// current proposal and keeps its `start_sha`, so its proposal combines the
+/// changes of every run of the thread. [`FollowupMode::Resume`] resumes the
+/// thread's session; [`FollowupMode::Fresh`] starts a new one.
+///
+/// A follow-up that fails, stops or changes nothing leaves the comment
+/// `Proposed` with the change already in the worktree.
+pub(crate) async fn follow_up(
+    services: Arc<Services>,
+    request: FollowupRequest,
+) -> Result<RunId, RunError> {
+    let FollowupRequest {
+        comment_id,
+        mode,
+        model,
+        effort,
+        capabilities,
+        rules_path,
+    } = request;
+    let target = load_target(&services, comment_id).await?;
+    let event = match (&mode, target.stored.status) {
+        // A fresh follow-up may also continue a thread that went back to
+        // Open, as long as its worktree is still there.
+        (FollowupMode::Fresh, CommentStatus::Open) => CommentEvent::RunStarted,
+        _ => CommentEvent::FollowUp,
+    };
+    comment_transition(target.stored.status, event).map_err(|error| {
+        match target.stored.status {
+            CommentStatus::Running => RunError::Busy(comment_id),
+            // Rejected (or never proposed): no proposal to continue.
+            CommentStatus::Open => RunError::FollowupUnavailable(comment_id),
+            _ => RunError::Review(error.into()),
+        }
+    })?;
+
+    // The previous run whose worktree carries on.
+    let runs = services.store.runs().list_for_comment(comment_id).await?;
+    let previous = runs
+        .iter()
+        .rev()
+        .find(|run| match mode {
+            FollowupMode::Resume { .. } => {
+                matches!(run.status, RunStatus::Succeeded | RunStatus::Stopped)
+            }
+            FollowupMode::Fresh => run.status != RunStatus::Rejected,
+        })
+        .filter(|run| run.worktree_path.is_dir())
+        .cloned()
+        .ok_or(RunError::FollowupUnavailable(comment_id))?;
+    if runs.iter().any(|run| {
+        run.status.is_active()
+            && services.is_active(run.id)
+            && same_path(&run.worktree_path, &previous.worktree_path)
+    }) {
+        return Err(RunError::Busy(comment_id));
+    }
+    let start_sha = Sha::parse(&previous.start_sha).ok_or_else(|| GitError::Parse {
+        command: "runs.start_sha".to_owned(),
+        message: format!("not an object id: `{}`", previous.start_sha),
+    })?;
+    let worktree = services
+        .worktrees
+        .worktree_at(&target.repo, previous.worktree_path.clone())?;
+
+    let (session, prompt, reply) = match mode {
+        FollowupMode::Resume { reply } => {
+            let session = Uuid::parse_str(previous.session_id.trim())
+                .map_err(|_| RunError::InvalidSession(comment_id, previous.session_id.clone()))?;
+            (
+                SessionMode::Resume(session),
+                followup_prompt(&reply),
+                Some(reply),
+            )
+        }
+        FollowupMode::Fresh => {
+            let thread: Vec<ThreadMessage> = services
+                .store
+                .comments()
+                .replies(comment_id)
+                .await?
+                .into_iter()
+                .map(|reply| ThreadMessage {
+                    author: reply.author,
+                    body: reply.body_md,
+                })
+                .collect();
+            let (_, build_context) = comment_context(&target).await?;
+            let repo_context = repo_context(&target, &previous.start_sha);
+            let prompt =
+                blocking(move || fresh_followup_prompt(&repo_context, &build_context(), &thread))
+                    .await?;
+            (SessionMode::New(Uuid::now_v7()), prompt, None)
+        }
+    };
+
+    let pending = PendingRun {
+        run_id: RunId::new(),
+        comment_id,
+        kind: RunKind::Followup,
+        start_sha,
+        model,
+        effort,
+        session,
+        capabilities,
+        rules_path,
+    };
+    record_run(&services, &pending, previous.worktree_path.clone(), &prompt).await?;
+    claim_comment(&services, &pending, event).await?;
+    if let Some(reply) = reply
+        && let Err(error) = services
+            .store
+            .comments()
+            .add_reply(comment_id, ReplyAuthor::User, reply)
+            .await
+    {
+        let reason = format!("cannot save the reply: {error}");
+        fail_unstarted(&services, &pending, Some(&worktree), reason).await;
+        return Err(error.into());
+    }
+    spawn(services, pending, worktree, prompt.text).await
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
+        || std::fs::canonicalize(a)
+            .ok()
+            .zip(std::fs::canonicalize(b).ok())
+            .is_some_and(|(a, b)| a == b)
+}
+
+/// A run being started: everything [`spawn`] needs besides its worktree.
+struct PendingRun {
+    run_id: RunId,
+    comment_id: CommentId,
+    kind: RunKind,
+    start_sha: Sha,
+    model: String,
+    effort: String,
+    session: SessionMode,
+    capabilities: ClaudeCapabilities,
+    rules_path: PathBuf,
+}
+
+impl PendingRun {
+    fn session_id(&self) -> Uuid {
+        match self.session {
+            SessionMode::New(id) | SessionMode::Resume(id) => id,
+        }
+    }
+}
+
+/// Records the run row (`Queued`).
+async fn record_run(
+    services: &Services,
+    run: &PendingRun,
+    worktree_path: PathBuf,
+    prompt: &Prompt,
+) -> Result<(), RunError> {
+    services
+        .store
+        .runs()
+        .create_with_id(
+            run.run_id,
+            NewRun {
+                comment_id: Some(run.comment_id),
+                kind: run.kind,
+                session_id: run.session_id().hyphenated().to_string(),
+                model: run.model.clone(),
+                effort: run.effort.clone(),
+                worktree_path,
+                start_sha: run.start_sha.to_hex(),
+                prompt: prompt.text.clone(),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Moves the comment to `Running` before any expensive work, so a second
+/// start of the same comment is refused by the compare-and-swap. On a
+/// refusal the unstarted run row is deleted.
+async fn claim_comment(
+    services: &Services,
+    run: &PendingRun,
+    event: CommentEvent,
+) -> Result<(), RunError> {
+    let store = &services.store;
+    if let Err(error) = apply_event(&store.comments(), run.comment_id, event).await {
+        if let Err(delete_error) = store.runs().delete(run.run_id).await {
+            tracing::warn!(run = %run.run_id, error = %delete_error, "cannot delete unstarted run");
+        }
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// Records a run that failed before its process ran, and moves its comment
+/// on (a follow-up's comment back to `Proposed` when `worktree` still holds
+/// a change).
+async fn fail_unstarted(
+    services: &Services,
+    run: &PendingRun,
+    worktree: Option<&Worktree>,
+    reason: String,
+) {
+    let mut outcome = RunOutcome::new(RunStatus::Failed);
+    outcome.error = Some(reason);
+    let comment_event = match worktree {
+        Some(worktree) if run.kind == RunKind::Followup => {
+            followup_event(services, worktree, &run.start_sha, RunStatus::Failed).await
+        }
+        _ => CommentEvent::from_run_status(RunStatus::Failed),
+    };
+    record_finish(
+        services,
+        Finish {
+            run_id: run.run_id,
+            comment_id: Some(run.comment_id),
+            kind: run.kind,
+            comment_event,
+            session_not_found: false,
+        },
+        outcome,
+    )
+    .await;
+}
+
+/// Spawns `claude` for `run` in `worktree` and hands it to [`supervise`].
+async fn spawn(
+    services: Arc<Services>,
+    run: PendingRun,
+    worktree: Worktree,
+    prompt: String,
+) -> Result<RunId, RunError> {
+    let run_id = run.run_id;
+    let comment_id = run.comment_id;
+    let effort_arg = (!run.effort.trim().is_empty()).then_some(run.effort.as_str());
     let command = ClaudeCommand::review_run(
         worktree.path(),
-        prompt.text,
-        model,
+        prompt,
+        run.model.clone(),
         effort_arg,
-        SessionMode::New(session_id),
-        rules_path,
+        run.session,
+        run.rules_path.clone(),
     )
-    .adapt_to(&capabilities);
-    let mut child = match command.to_command(capabilities.path()).spawn() {
+    .adapt_to(&run.capabilities);
+    let program = run.capabilities.path().to_owned();
+    let mut child = match command.to_command(&program).spawn() {
         Ok(child) => child,
         Err(error) => {
-            let reason = format!("cannot start {}: {error}", capabilities.path().display());
-            fail(reason.clone()).await;
+            let reason = format!("cannot start {}: {error}", program.display());
+            fail_unstarted(&services, &run, Some(&worktree), reason.clone()).await;
             return Err(RunError::Spawn(reason));
         }
     };
@@ -377,7 +715,8 @@ pub(crate) async fn start(
         });
     }
 
-    // 4. Running; register for Stop before anyone can see the run.
+    // Running; register for Stop before anyone can see the run.
+    let store = &services.store;
     if let Err(error) = store.runs().set_status(run_id, RunStatus::Running).await {
         tracing::warn!(run = %run_id, %error, "cannot mark the run as running");
     }
@@ -388,8 +727,10 @@ pub(crate) async fn start(
     tracing::info!(
         run = %run_id,
         comment = %comment_id,
+        kind = %run.kind,
+        session = ?run.session,
         worktree = %worktree.path().display(),
-        start_sha = %start_sha,
+        start_sha = %run.start_sha,
         "started run"
     );
     services.publish(RunUpdate::Started {
@@ -401,8 +742,10 @@ pub(crate) async fn start(
         LiveRun {
             run_id,
             comment_id,
+            kind: run.kind,
+            resumed: matches!(run.session, SessionMode::Resume(_)),
             worktree,
-            start_sha,
+            start_sha: run.start_sha,
         },
         child,
         stop_rx,
@@ -414,6 +757,9 @@ pub(crate) async fn start(
 struct LiveRun {
     run_id: RunId,
     comment_id: CommentId,
+    kind: RunKind,
+    /// Started with `--resume`.
+    resumed: bool,
     worktree: Worktree,
     start_sha: Sha,
 }
@@ -490,7 +836,7 @@ async fn supervise(
         tracing::warn!(run = %run_id, count = state.malformed, "run printed malformed stream-json lines");
     }
 
-    let outcome = match exit {
+    let (outcome, session_not_found) = match exit {
         Ok(exit) => {
             complete(
                 &services,
@@ -506,10 +852,52 @@ async fn supervise(
         Err(error) => {
             let mut outcome = RunOutcome::new(RunStatus::Failed);
             outcome.error = Some(format!("cannot wait for claude: {error}"));
-            outcome
+            (outcome, false)
         }
     };
-    record_finish(&services, run_id, Some(run.comment_id), outcome).await;
+    let comment_event = if run.kind == RunKind::Followup {
+        followup_event(&services, &run.worktree, &run.start_sha, outcome.status).await
+    } else {
+        CommentEvent::from_run_status(outcome.status)
+    };
+    record_finish(
+        &services,
+        Finish {
+            run_id,
+            comment_id: Some(run.comment_id),
+            kind: run.kind,
+            comment_event,
+            session_not_found,
+        },
+        outcome,
+    )
+    .await;
+}
+
+/// The comment event of a finished follow-up. Its worktree holds the change
+/// of the earlier runs too, so whatever this run did, the comment stays
+/// `Proposed` while `start_sha → worktree` is non-empty.
+async fn followup_event(
+    services: &Services,
+    worktree: &Worktree,
+    start_sha: &Sha,
+    status: RunStatus,
+) -> Option<CommentEvent> {
+    if status == RunStatus::Succeeded {
+        return Some(CommentEvent::RunSucceeded);
+    }
+    match services
+        .worktrees
+        .diff_against_start(worktree, start_sha)
+        .await
+    {
+        Ok(patch) if !patch.is_empty() => Some(CommentEvent::RunSucceeded),
+        Ok(_) => CommentEvent::from_run_status(status),
+        Err(error) => {
+            tracing::warn!(%error, "cannot check the follow-up's worktree");
+            CommentEvent::from_run_status(status)
+        }
+    }
 }
 
 /// Parses, stores and publishes one stdout line.
@@ -564,7 +952,8 @@ fn handle_line(
     *seq += 1;
 }
 
-/// The terminal outcome of an exited run.
+/// The terminal outcome of an exited run, and whether its `--resume`
+/// failed because the session is gone.
 async fn complete(
     services: &Services,
     run: &LiveRun,
@@ -573,7 +962,7 @@ async fn complete(
     state: &StreamState,
     stderr_tail: &str,
     wall_ms: i64,
-) -> RunOutcome {
+) -> (RunOutcome, bool) {
     let result = state.result.as_ref();
     let mut outcome = RunOutcome::new(RunStatus::Failed);
     outcome.exit_code = exit.code();
@@ -588,11 +977,25 @@ async fn complete(
     if stopped {
         // The worktree stays: the partial diff can still be reviewed.
         outcome.status = RunStatus::Stopped;
-        return outcome;
+        return (outcome, false);
     }
     if !exit.success() || result.is_some_and(|r| r.is_error) {
-        outcome.error = Some(failure_reason(exit, result, stderr_tail));
-        return outcome;
+        let reason = failure_reason(exit, result, stderr_tail);
+        let missing = run.resumed
+            && (reports_missing_session(stderr_tail)
+                || result
+                    .and_then(|r| r.result.as_deref())
+                    .is_some_and(reports_missing_session));
+        outcome.error = Some(if missing {
+            // The fixed prefix lets the UI recognize the failure later.
+            format!(
+                "{SESSION_NOT_FOUND} (session not found). Run fresh with the thread as context \
+                 to start a new session.\n\n{reason}"
+            )
+        } else {
+            reason
+        });
+        return (outcome, missing);
     }
     match services
         .worktrees
@@ -608,7 +1011,7 @@ async fn complete(
             outcome.error = Some(format!("cannot compute the proposed change: {error}"));
         }
     }
-    outcome
+    (outcome, false)
 }
 
 /// A clear failure reason: the `result` subtype and message (or the exit
@@ -645,13 +1048,26 @@ fn failure_reason(exit: ExitStatus, result: Option<&RunResult>, stderr_tail: &st
     reason
 }
 
-/// Writes the outcome, moves the comment on, and publishes the result.
-async fn record_finish(
-    services: &Services,
+/// How a run's end is recorded.
+struct Finish {
     run_id: RunId,
     comment_id: Option<CommentId>,
-    outcome: RunOutcome,
-) {
+    kind: RunKind,
+    /// What happens to the comment.
+    comment_event: Option<CommentEvent>,
+    session_not_found: bool,
+}
+
+/// Writes the outcome, moves the comment on, adds Claude's final message to
+/// the thread, and publishes the result.
+async fn record_finish(services: &Services, finish: Finish, outcome: RunOutcome) {
+    let Finish {
+        run_id,
+        comment_id,
+        kind,
+        comment_event,
+        session_not_found,
+    } = finish;
     let status = outcome.status;
     let finished = RunFinished {
         run_id,
@@ -659,26 +1075,27 @@ async fn record_finish(
         status,
         summary: outcome.summary.clone(),
         error: outcome.error.clone(),
+        kind,
+        session_not_found,
     };
     // `finish` is a storage job, so every queued event is written first.
     if let Err(error) = services.store.runs().finish(run_id, outcome).await {
         tracing::error!(run = %run_id, %error, "cannot store the run outcome");
     }
-    if let Some(comment_id) = comment_id
-        && let Some(event) = CommentEvent::from_run_status(status)
-    {
+    if let Some(comment_id) = comment_id {
         let comments = services.store.comments();
-        if let Err(error) = apply_event(&comments, comment_id, event).await {
-            tracing::warn!(run = %run_id, comment = %comment_id, %error, "cannot update the comment status");
-        }
-        // Nothing to review: show Claude's final message in the thread.
-        if status == RunStatus::NoChanges
+        // Claude's final message joins the thread first, so the thread reads
+        // as a conversation by the time the comment's status changes.
+        if matches!(status, RunStatus::Succeeded | RunStatus::NoChanges)
             && let Some(summary) = finished.summary.clone()
-            && let Err(error) = comments
-                .add_reply(comment_id, ReplyAuthor::Claude, summary)
-                .await
+            && let Err(error) = comments.add_run_reply(comment_id, run_id, summary).await
         {
             tracing::warn!(run = %run_id, %error, "cannot add Claude's reply");
+        }
+        if let Some(event) = comment_event
+            && let Err(error) = apply_event(&comments, comment_id, event).await
+        {
+            tracing::warn!(run = %run_id, comment = %comment_id, %error, "cannot update the comment status");
         }
     }
     services.lock_active().remove(&run_id);

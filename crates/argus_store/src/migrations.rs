@@ -144,6 +144,12 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX runs_comment ON runs(comment_id);
     CREATE INDEX runs_status ON runs(status);
     "#,
+    // 3: a Claude reply names the run that wrote it (#23), so the thread can
+    // show its model and effort. Replies outlive their run (SET NULL).
+    r#"
+    ALTER TABLE comment_replies
+        ADD COLUMN run_id TEXT REFERENCES runs(id) ON DELETE SET NULL;
+    "#,
 ];
 
 /// Newest schema version this build understands.

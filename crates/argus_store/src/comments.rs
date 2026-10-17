@@ -3,7 +3,7 @@
 use rusqlite::{OptionalExtension as _, Row, params};
 
 use crate::error::Result;
-use crate::model::{CommentId, CommentStatus, ReplyAuthor, ReplyId, RepoId, Side};
+use crate::model::{CommentId, CommentStatus, ReplyAuthor, ReplyId, RepoId, RunId, Side};
 use crate::{StorageService, expect_changed, now_ms};
 
 /// Fields needed to create a comment thread.
@@ -103,7 +103,24 @@ pub struct Reply {
     pub body_md: String,
     /// Creation time, unix ms.
     pub created_at: i64,
+    /// The run that wrote it (Claude's replies), while the run exists.
+    pub run: Option<ReplyRun>,
 }
+
+/// The run behind a Claude reply, as the thread shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplyRun {
+    /// The run.
+    pub id: RunId,
+    /// Model it used.
+    pub model: String,
+    /// Thinking effort it used (empty for Claude's default).
+    pub effort: String,
+}
+
+/// Columns of [`reply_from_row`], for `comment_replies r LEFT JOIN runs u`.
+const REPLY_COLUMNS: &str =
+    "r.id, r.comment_id, r.author, r.body_md, r.created_at, u.id, u.model, u.effort";
 
 const COLUMNS: &str = "id, repo_id, base_ref, head_ref, file_path, old_file_path, side, \
      start_line, end_line, context_hash, anchor_sha, snippet, body_md, status, outdated, \
@@ -140,6 +157,14 @@ fn reply_from_row(row: &Row<'_>) -> rusqlite::Result<Reply> {
         author: row.get(2)?,
         body_md: row.get(3)?,
         created_at: row.get(4)?,
+        run: match row.get::<_, Option<RunId>>(5)? {
+            Some(id) => Some(ReplyRun {
+                id,
+                model: row.get(6)?,
+                effort: row.get(7)?,
+            }),
+            None => None,
+        },
     })
 }
 
@@ -442,14 +467,54 @@ impl CommentStore {
         author: ReplyAuthor,
         body_md: String,
     ) -> Result<Reply> {
+        self.insert_reply(comment_id, author, body_md, None).await
+    }
+
+    /// Appends Claude's final message of `run_id` to its comment's thread,
+    /// linked to the run so the thread can show its model and effort.
+    pub async fn add_run_reply(
+        &self,
+        comment_id: CommentId,
+        run_id: RunId,
+        body_md: String,
+    ) -> Result<Reply> {
+        self.insert_reply(comment_id, ReplyAuthor::Claude, body_md, Some(run_id))
+            .await
+    }
+
+    async fn insert_reply(
+        &self,
+        comment_id: CommentId,
+        author: ReplyAuthor,
+        body_md: String,
+        run_id: Option<RunId>,
+    ) -> Result<Reply> {
         self.service
             .call("CommentStore::add_reply", move |conn| {
+                let created_at = now_ms();
+                let run = match run_id {
+                    Some(id) => conn
+                        .query_row(
+                            "SELECT model, effort FROM runs WHERE id = ?1",
+                            [id],
+                            |row| {
+                                Ok(ReplyRun {
+                                    id,
+                                    model: row.get(0)?,
+                                    effort: row.get(1)?,
+                                })
+                            },
+                        )
+                        .optional()?,
+                    None => None,
+                };
                 let reply = Reply {
                     id: ReplyId::new(),
                     comment_id,
                     author,
                     body_md,
-                    created_at: now_ms(),
+                    created_at,
+                    run,
                 };
                 let tx = conn.transaction()?;
                 let changed = tx.execute(
@@ -458,14 +523,16 @@ impl CommentStore {
                 )?;
                 expect_changed(changed, "comment", comment_id)?;
                 tx.execute(
-                    "INSERT INTO comment_replies (id, comment_id, author, body_md, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO comment_replies (id, comment_id, author, body_md, created_at,
+                         run_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         reply.id,
                         reply.comment_id,
                         reply.author,
                         reply.body_md,
-                        reply.created_at
+                        reply.created_at,
+                        reply.run.as_ref().map(|run| run.id),
                     ],
                 )?;
                 tx.commit()?;
@@ -484,12 +551,13 @@ impl CommentStore {
     ) -> Result<Vec<Reply>> {
         self.service
             .call("CommentStore::replies_for", move |conn| {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT r.id, r.comment_id, r.author, r.body_md, r.created_at
+                let mut stmt = conn.prepare_cached(&format!(
+                    "SELECT {REPLY_COLUMNS}
                      FROM comment_replies r JOIN comments c ON c.id = r.comment_id
+                     LEFT JOIN runs u ON u.id = r.run_id
                      WHERE c.repo_id = ?1 AND c.base_ref = ?2 AND c.head_ref = ?3
-                     ORDER BY r.comment_id, r.created_at, r.id",
-                )?;
+                     ORDER BY r.comment_id, r.created_at, r.id"
+                ))?;
                 let rows = stmt.query_map(params![repo_id, base_ref, head_ref], reply_from_row)?;
                 Ok(rows.collect::<rusqlite::Result<_>>()?)
             })
@@ -500,10 +568,11 @@ impl CommentStore {
     pub async fn replies(&self, comment_id: CommentId) -> Result<Vec<Reply>> {
         self.service
             .call("CommentStore::replies", move |conn| {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT id, comment_id, author, body_md, created_at FROM comment_replies
-                     WHERE comment_id = ?1 ORDER BY created_at, id",
-                )?;
+                let mut stmt = conn.prepare_cached(&format!(
+                    "SELECT {REPLY_COLUMNS}
+                     FROM comment_replies r LEFT JOIN runs u ON u.id = r.run_id
+                     WHERE r.comment_id = ?1 ORDER BY r.created_at, r.id"
+                ))?;
                 let rows = stmt.query_map([comment_id], reply_from_row)?;
                 Ok(rows.collect::<rusqlite::Result<_>>()?)
             })

@@ -826,19 +826,22 @@ impl Workspace {
                     .update(cx, |flow, cx| flow.accept(run_id, cx));
             }
             ProposalEvent::Replied {
-                comment_id, run_id, ..
+                comment_id,
+                followup,
             } => {
-                // Starting the follow-up run (`--resume` in the same
-                // worktree) lands with #23; the reply is in the thread.
-                tracing::debug!(comment = %comment_id, run = %run_id, "proposal reply saved");
+                tracing::debug!(comment = %comment_id, run = ?followup, "proposal reply sent");
                 if let Some(session) = self.session.clone() {
                     let comments = session.read(cx).comments().clone();
                     comments.update(cx, |comments, cx| comments.reload(cx));
                 }
+                let message = if followup.is_some() {
+                    "Follow-up run started: Claude resumes the same session in the proposal's \
+                     worktree."
+                } else {
+                    "Note added to the thread."
+                };
                 self.notice = Some(Notice {
-                    message: "Reply saved in the thread. Follow-up runs are not available yet \
-                              (#23)."
-                        .into(),
+                    message: message.into(),
                     is_error: false,
                 });
                 cx.notify();

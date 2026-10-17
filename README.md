@@ -98,9 +98,27 @@ proposal, `x` rejects it (press it again to confirm), and `r` opens the reply
 box. Reject deletes the run's worktree and sets the comment back to Open; the
 run stays in history as Rejected. "Open in editor" opens a changed file of the
 worktree in `$VISUAL` / `$EDITOR`, or with the system's default application.
-The proposal refreshes as soon as the file changes on disk. Accept (#24) and
-follow-up runs (#23) are not available yet: Accept shows a notice, and a reply
-is saved in the thread.
+The proposal refreshes as soon as the file changes on disk. Accept (#24) is not
+available yet and shows a notice.
+
+A reply on a Proposed comment, in the proposal tab or in the thread, has two
+send options. **Send as follow-up run** (the default, also on Enter) starts a
+follow-up: it resumes the comment's Claude session (`--resume <session>`) in
+the same worktree, so Claude continues from its earlier edits. **Add note
+only** just saves the reply. A follow-up uses the Run menu's model and effort.
+On a Proposed thread the Run split button reads "Follow up · model · effort",
+and its menu picks them. In the proposal tab, the model and effort buttons of
+the reply box change the Run menu defaults. The model and effort can change
+between follow-ups; the session stays the same. While the
+follow-up runs, the comment is Running and the proposal's diff follows its
+edits. When it finishes, the comment is Proposed again, with the combined
+change of every run since the first one. Claude's final message of each run
+joins the thread as a Claude reply labelled with that run's model and effort,
+so the thread reads as a conversation. Once a proposal is rejected, its
+worktree is gone and follow-ups are no longer offered; start a new run instead.
+If Claude cannot find the session to resume, the run fails with a clear message
+and a **Run fresh with the thread as context** button. That button starts a new
+session whose prompt carries the comment and every reply.
 
 ![A proposal tab](docs/screenshots/proposal-light.png)
 

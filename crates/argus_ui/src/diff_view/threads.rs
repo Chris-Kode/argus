@@ -52,6 +52,7 @@ use super::{
 };
 use crate::AppContext;
 use crate::components::{button, chip, disabled_button, primary_button, status_chip};
+use crate::followup::{self, FollowupKind};
 use crate::keymap::SubmitComment;
 use crate::markdown::{self, MarkdownCache};
 use crate::session::{now_seconds, relative_time};
@@ -756,7 +757,13 @@ impl DiffView {
         cx.notify();
     }
 
+    /// Saves an editor. A reply on a `Proposed` comment is sent as a
+    /// follow-up run, unless `note_only`.
     fn submit_editor(&mut self, draft: &DraftKey, cx: &mut Context<Self>) {
+        self.submit_editor_as(draft, false, cx);
+    }
+
+    fn submit_editor_as(&mut self, draft: &DraftKey, note_only: bool, cx: &mut Context<Self>) {
         let Some(slot) = self.slot(draft) else {
             return;
         };
@@ -786,8 +793,17 @@ impl DiffView {
             }
             DraftKey::Reply(id) => {
                 let id = *id;
-                self.comments
-                    .update(cx, |comments, cx| comments.reply(id, body, cx))
+                if !note_only && self.offers_followup(id) {
+                    // The Run menu's choice; like a run, it is used up.
+                    let choice = self.run_choice(id, cx);
+                    self.threads.run_choice.remove(&id);
+                    self.comments.update(cx, |comments, cx| {
+                        comments.follow_up(id, FollowupKind::Resume(body), choice, cx)
+                    })
+                } else {
+                    self.comments
+                        .update(cx, |comments, cx| comments.reply(id, body, cx))
+                }
             }
         };
         if let Some(slot) = self.slot_mut(draft) {
@@ -1004,6 +1020,25 @@ impl DiffView {
         }
     }
 
+    /// Whether a reply on `id` can be sent as a follow-up run: the comment
+    /// has a proposal (its worktree is checked when the run starts).
+    fn offers_followup(&self, id: CommentId) -> bool {
+        self.comment(id)
+            .is_some_and(|comment| comment.status == CommentStatus::Proposed && !comment.outdated)
+    }
+
+    /// Starts a fresh follow-up with the thread as context, after a resume
+    /// found no session.
+    fn run_fresh(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        let choice = self.run_choice(id, cx);
+        self.comments
+            .update(cx, |comments, cx| {
+                comments.follow_up(id, FollowupKind::Fresh, choice, cx)
+            })
+            .detach();
+        cx.notify();
+    }
+
     /// Asks the workspace to open the comment's proposal in its own tab.
     fn view_proposal(&mut self, id: CommentId, cx: &mut Context<Self>) {
         self.threads.menu = None;
@@ -1092,7 +1127,8 @@ impl DiffView {
             return Some("Outdated comments cannot run; re-anchor them first.".to_owned());
         }
         match comment.status {
-            CommentStatus::Open => {}
+            // A Proposed comment runs again as a follow-up (a reply).
+            CommentStatus::Open | CommentStatus::Proposed => {}
             CommentStatus::Running => return Some("This comment is already running.".to_owned()),
             _ => return Some("Only open comments can run.".to_owned()),
         }
@@ -1109,6 +1145,11 @@ impl DiffView {
         if let Some(blocker) = self.run_blocker(comment, cx) {
             self.hint = Some(blocker.into());
             cx.notify();
+            return;
+        }
+        if comment.status == CommentStatus::Proposed {
+            // A follow-up starts from a reply; the choice stays for it.
+            self.start_reply(id, cx);
             return;
         }
         let (model, effort) = self.run_choice(id, cx);
@@ -1694,7 +1735,7 @@ impl DiffView {
 
         let body = (!collapsed).then(|| {
             let content = match self.threads.edits.get(&id) {
-                Some(slot) => self.render_editor(slot, "Save", cx),
+                Some(slot) => self.render_editor(slot, "Save", false, cx),
                 None => self.render_body(
                     &comment.body_md,
                     SharedString::from(format!("{key}-body")),
@@ -1712,6 +1753,12 @@ impl DiffView {
                         ReplyAuthor::User => "You",
                         ReplyAuthor::Claude => "Claude",
                     };
+                    // The run (model · effort) behind each Claude reply.
+                    let run = reply.run.as_ref().map(|run| {
+                        div()
+                            .text_color(colors.text_muted)
+                            .child(followup::label(&run.model, &run.effort))
+                    });
                     div()
                         .flex()
                         .flex_col()
@@ -1731,6 +1778,7 @@ impl DiffView {
                                         .text_color(colors.text)
                                         .child(author),
                                 )
+                                .children(run)
                                 .child(
                                     div()
                                         .text_color(colors.text_placeholder)
@@ -1743,6 +1791,38 @@ impl DiffView {
                             cx,
                         ))
                 }))
+        });
+        let session_lost = (!collapsed
+            && comment.status != CommentStatus::Running
+            && self.comments.read(cx).session_lost(id))
+        .then(|| {
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1p5()
+                .border_t_1()
+                .border_color(colors.error.opacity(0.4))
+                .bg(colors.error.opacity(0.08))
+                .text_xs()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.0))
+                        .text_color(colors.error)
+                        .child(
+                            "Claude could not resume this comment's session (session not \
+                             found).",
+                        ),
+                )
+                .child(
+                    primary_button((key.clone(), 4), "Run fresh with the thread as context", cx)
+                        .h(px(22.0))
+                        .text_xs()
+                        .on_click(cx.listener(move |this, _, _, cx| this.run_fresh(id, cx))),
+                )
         });
         let confirm = (self.threads.confirm_delete == Some(id)).then(|| {
             confirm_bar(
@@ -1760,8 +1840,12 @@ impl DiffView {
             )
         });
         let reply_box = (!collapsed).then(|| {
+            let followup = self.offers_followup(id);
             let content = match self.threads.replies.get(&id) {
-                Some(slot) => self.render_editor(slot, "Reply", cx),
+                Some(slot) if followup => {
+                    self.render_editor(slot, "Send as follow-up run", true, cx)
+                }
+                Some(slot) => self.render_editor(slot, "Reply", false, cx),
                 None => div()
                     .id((key.clone(), 2))
                     .px_2()
@@ -1773,7 +1857,11 @@ impl DiffView {
                     .cursor_text()
                     .text_color(colors.text_placeholder)
                     .on_click(cx.listener(move |this, _, _, cx| this.start_reply(id, cx)))
-                    .child("Reply…")
+                    .child(if followup {
+                        "Reply… (sent as a follow-up run, or as a note)"
+                    } else {
+                        "Reply…"
+                    })
                     .into_any_element(),
             };
             div()
@@ -1809,6 +1897,7 @@ impl DiffView {
             .child(header)
             .children(body)
             .children(reply_list)
+            .children(session_lost)
             .children(confirm)
             .children(reply_box)
             .into_any_element()
@@ -1894,8 +1983,12 @@ impl DiffView {
             .child({
                 let enabled = self.run_blocker(comment, cx).is_none();
                 let (model, effort) = self.run_choice(id, cx);
-                let label: SharedString =
-                    format!("Run with Claude ({})", choice_label(&model, &effort)).into();
+                let label: SharedString = format!(
+                    "{} with Claude ({})",
+                    run_verb(comment.status),
+                    choice_label(&model, &effort)
+                )
+                .into();
                 item(3, "", enabled).child(label).when(enabled, |item| {
                     item.on_click(cx.listener(move |this, _, _, cx| this.request_run(id, cx)))
                 })
@@ -1924,7 +2017,10 @@ impl DiffView {
         key: &SharedString,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !matches!(comment.status, CommentStatus::Open | CommentStatus::Running) {
+        if !matches!(
+            comment.status,
+            CommentStatus::Open | CommentStatus::Running | CommentStatus::Proposed
+        ) {
             return None;
         }
         let colors = cx.theme().colors.clone();
@@ -1941,7 +2037,8 @@ impl DiffView {
             );
         }
         let (model, effort) = self.run_choice(id, cx);
-        let label = format!("Run · {}", choice_label(&model, &effort));
+        let verb = run_verb(comment.status);
+        let label = format!("{verb} · {}", choice_label(&model, &effort));
         if let Some(blocker) = self.run_blocker(comment, cx) {
             let hint: SharedString = blocker.into();
             return Some(
@@ -2121,7 +2218,11 @@ impl DiffView {
                 div().p_0p5().child(
                     primary_button(
                         (key.clone(), 98),
-                        format!("Run · {}", choice_label(&model, &effort)),
+                        format!(
+                            "{} · {}",
+                            run_verb(self.comment(id).map_or(CommentStatus::Open, |c| c.status)),
+                            choice_label(&model, &effort)
+                        ),
                         cx,
                     )
                     .w_full()
@@ -2163,7 +2264,7 @@ impl DiffView {
                     .text_color(colors.text_muted)
                     .child(format!("New comment on {lines} ({side})")),
             )
-            .child(self.render_editor(&composer.slot, "Comment", cx))
+            .child(self.render_editor(&composer.slot, "Comment", false, cx))
             .into_any_element()
     }
 
@@ -2172,11 +2273,17 @@ impl DiffView {
         &self,
         slot: &EditorSlot,
         save: &'static str,
+        followup: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let followup_id = match &slot.draft {
+            DraftKey::Reply(id) if followup => Some(*id),
+            _ => None,
+        };
         let colors = cx.theme().colors.clone();
         let key = SharedString::from(format!("editor-{:?}", slot.draft));
         let (cancel_draft, save_draft) = (slot.draft.clone(), slot.draft.clone());
+        let note_draft = slot.draft.clone();
         let confirm = slot.confirm_discard.then(|| {
             let (discard, keep) = (slot.draft.clone(), slot.draft.clone());
             confirm_bar(
@@ -2203,6 +2310,31 @@ impl DiffView {
                 .on_click(cx.listener(move |this, _, _, cx| this.submit_editor(&save_draft, cx)))
                 .into_any_element()
         };
+        // A reply on a proposal: the follow-up's model and effort, and the
+        // note-only alternative.
+        let followup_controls = followup_id.filter(|_| !slot.saving).map(|id| {
+            // The thread's Run menu choice; the button opens the menu.
+            let (model, effort) = self.run_choice(id, cx);
+            (
+                button((key.clone(), 3), choice_label(&model, &effort), cx)
+                    .h(px(20.0))
+                    .text_xs()
+                    .text_color(colors.text_muted)
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_run_menu(id, cx))),
+                button((key.clone(), 2), "Add note only", cx).on_click(
+                    cx.listener(move |this, _, _, cx| this.submit_editor_as(&note_draft, true, cx)),
+                ),
+            )
+        });
+        let (choice, note_button) = match followup_controls {
+            Some((choice, note)) => (Some(choice), Some(note)),
+            None => (None, None),
+        };
+        let hint = if followup {
+            format!("{save_keys} to send as a follow-up · Esc to cancel")
+        } else {
+            format!("Markdown · {save_keys} to save · Esc to cancel")
+        };
         div()
             .flex()
             .flex_col()
@@ -2225,11 +2357,13 @@ impl DiffView {
                             .whitespace_nowrap()
                             .text_xs()
                             .text_color(colors.text_placeholder)
-                            .child(format!("Markdown · {save_keys} to save · Esc to cancel")),
+                            .child(hint),
                     )
+                    .children(choice)
                     .child(button((key.clone(), 0), "Cancel", cx).on_click(
                         cx.listener(move |this, _, _, cx| this.cancel_editor(&cancel_draft, cx)),
                     ))
+                    .children(note_button)
                     .child(save_button),
             )
             .into_any_element()
@@ -2278,6 +2412,16 @@ fn confirm_bar(
 }
 
 /// `sonnet · medium`, or just the model without an effort.
+/// The verb of the Run button: a Proposed comment runs again as a
+/// follow-up, which starts from a reply.
+fn run_verb(status: CommentStatus) -> &'static str {
+    if status == CommentStatus::Proposed {
+        "Follow up"
+    } else {
+        "Run"
+    }
+}
+
 fn choice_label(model: &str, effort: &str) -> String {
     if effort.is_empty() {
         model.to_owned()
