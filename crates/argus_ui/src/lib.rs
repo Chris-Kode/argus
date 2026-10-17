@@ -5,6 +5,7 @@
 //! the [`AppContext`] global; colors and fonts through the [`Theme`] global.
 
 pub mod branch_picker;
+pub mod claude_settings;
 pub mod comments;
 pub mod components;
 pub mod diff_view;
@@ -16,10 +17,11 @@ pub mod keymap;
 pub mod runtime;
 pub mod session;
 pub mod settings;
+pub mod text_field;
 pub mod theme;
 mod workspace;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use argus_git::{GitService, WorktreeManager};
 use argus_highlight::HighlightService;
@@ -35,14 +37,14 @@ pub use diff_view::{DiffView, DiffViewEvent, DisplayOptions, LineSelection};
 pub use file_tree::{FileTree, FileTreeEvent};
 pub use jobs::BackgroundJobs;
 pub use session::{Comparison, DiffTarget, RepoSession, SessionEvent, Side};
-pub use settings::UiSettings;
+pub use settings::{Settings, UiSettings};
 pub use theme::{ActiveTheme, Appearance, SyntaxTheme, Theme, ThemeColors, ThemeFonts, ThemeMode};
 pub use workspace::Workspace;
 
 /// Application-wide handles to the services, stored as a GPUI global.
 ///
-/// Views read it with `cx.global::<AppContext>()`. The run manager is still a
-/// placeholder handle until issue #20 lands.
+/// Views read it with `cx.global::<AppContext>()`. The run manager carries the
+/// live Claude settings; spawning runs lands with issue #20.
 pub struct AppContext {
     /// Git reads (gix) and writes (git CLI).
     pub git: GitService,
@@ -50,7 +52,7 @@ pub struct AppContext {
     pub worktrees: WorktreeManager,
     /// SQLite storage in `~/.argus/argus.db`.
     pub store: StorageService,
-    /// Claude run orchestration.
+    /// Claude run orchestration and the live run defaults.
     pub runs: RunManager,
     /// Background syntax highlighting (its own worker threads).
     pub highlighter: HighlightService,
@@ -62,19 +64,20 @@ pub struct AppContext {
 impl Global for AppContext {}
 
 impl AppContext {
-    /// Builds the global from a live runtime handle, an opened store and the
-    /// worktrees manager.
+    /// Builds the global from a live runtime handle, an opened store, the
+    /// worktrees manager and the run manager.
     pub fn new(
         runtime: tokio::runtime::Handle,
         store: StorageService,
         git: GitService,
         worktrees: WorktreeManager,
+        runs: RunManager,
     ) -> Self {
         Self {
             git,
             worktrees,
             store,
-            runs: RunManager::new(),
+            runs,
             highlighter: HighlightService::new(),
             runtime,
         }
@@ -157,16 +160,31 @@ async fn reconcile_worktrees(git: GitService, store: StorageService, worktrees: 
     }
 }
 
+/// Creates `<argus_home>/review-rules.md` with the default rules on first
+/// launch. An existing file is never touched. Failures are logged, not fatal.
+async fn ensure_default_review_rules(argus_home: &Path) {
+    let path = argus_runs::settings::default_review_rules_path(argus_home);
+    match argus_runs::review_rules::ensure_review_rules(&path).await {
+        Ok(true) => tracing::info!(path = %path.display(), "created default review rules"),
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "cannot create review rules");
+        }
+    }
+}
+
 /// Opens the Argus window and runs the GPUI event loop until the app quits.
 ///
 /// Blocks the calling thread, which must be the main thread (macOS requires the
-/// platform run loop there). The UI settings are read on the tokio runtime
-/// before the event loop starts; then the thread is marked as the UI thread, so
-/// debug builds panic on any storage call made from it.
+/// platform run loop there). The settings are read, and the default review
+/// rules created, on the tokio runtime before the event loop starts; then the
+/// thread is marked as the UI thread, so debug builds panic on any storage call
+/// made from it.
 pub fn run_gpui_app(
     runtime: tokio::runtime::Handle,
     store: StorageService,
     worktrees: WorktreeManager,
+    argus_home: PathBuf,
 ) {
     let git = GitService::new();
     runtime.spawn(reconcile_worktrees(
@@ -175,10 +193,16 @@ pub fn run_gpui_app(
         worktrees.clone(),
     ));
 
-    let ui_settings = runtime.block_on({
+    let settings = runtime.block_on({
         let store = store.settings();
-        async move { UiSettings::load(&store).await }
+        let argus_home = argus_home.clone();
+        async move {
+            ensure_default_review_rules(&argus_home).await;
+            Settings::load(&store).await
+        }
     });
+    let ui_settings = settings.ui;
+    let runs = RunManager::new(argus_home, settings.claude);
 
     argus_store::mark_ui_thread();
     gpui_platform::application().run(move |cx: &mut App| {
@@ -187,6 +211,7 @@ pub fn run_gpui_app(
             store.clone(),
             git.clone(),
             worktrees.clone(),
+            runs.clone(),
         ));
         cx.set_global(BackgroundJobs::default());
         // A provisional theme so views can render before the workspace

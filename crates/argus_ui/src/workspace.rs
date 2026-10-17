@@ -22,8 +22,10 @@ use gpui::{
 
 use crate::AppContext;
 use crate::branch_picker::{BranchPicker, PickerEvent};
+use crate::claude_settings::ClaudeSettingsForm;
 use crate::components::{
-    button, disabled_button, kbd, panel_header, placeholder, primary_button, toggle_button,
+    button, disabled_button, kbd, panel_header, placeholder, primary_button, section_header,
+    toggle_button,
 };
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
 use crate::file_tree::{FileTree, FileTreeEvent};
@@ -108,6 +110,8 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     settings: UiSettings,
     settings_dirty: bool,
+    /// The Claude section of the settings sheet; it owns the run defaults.
+    claude_settings: Entity<ClaudeSettingsForm>,
     fonts: InstalledFonts,
     session: Option<Entity<RepoSession>>,
     session_subscriptions: Vec<Subscription>,
@@ -159,6 +163,7 @@ impl Workspace {
             focus_handle,
             settings,
             settings_dirty: false,
+            claude_settings: cx.new(ClaudeSettingsForm::new),
             fonts: InstalledFonts::load(cx),
             session: None,
             session_subscriptions: Vec::new(),
@@ -1467,7 +1472,7 @@ impl Workspace {
                     .flex_col()
                     .w(px(match sheet {
                         Sheet::KeyboardShortcuts => 720.0,
-                        Sheet::Settings => 520.0,
+                        Sheet::Settings => 640.0,
                     }))
                     .max_h(px(600.0))
                     .rounded_lg()
@@ -1793,10 +1798,75 @@ impl Workspace {
                 .into_any_element()
         };
 
-        div()
+        let reset = |id: &'static str, reset: fn(&mut UiSettings)| {
+            button(id, "Reset to defaults", cx).on_click(
+                cx.listener(move |this, _, window, cx| this.update_settings(window, cx, reset)),
+            )
+        };
+
+        let diff = div()
             .flex()
             .flex_col()
             .gap_1()
+            .child(section_header(
+                "Diff",
+                reset("reset-diff-settings", UiSettings::reset_diff),
+                cx,
+            ))
+            .child(row("Layout", segmented(diff_mode_buttons)))
+            .child(row(
+                "Tab width",
+                stepper(
+                    "diff-tab-width",
+                    settings.diff_tab_width as f32,
+                    "cols",
+                    |settings, delta| {
+                        let width = settings.diff_tab_width as f32 + delta;
+                        settings.diff_tab_width = clamp_tab_width(width.max(0.0) as u32);
+                    },
+                ),
+            ))
+            .child(row(
+                "Horizontal scroll",
+                toggle_button(
+                    "diff-link-scroll-setting",
+                    if settings.diff_link_horizontal_scroll {
+                        "Linked"
+                    } else {
+                        "Per column"
+                    },
+                    settings.diff_link_horizontal_scroll,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.update_settings(window, cx, |settings| {
+                        settings.diff_link_horizontal_scroll =
+                            !settings.diff_link_horizontal_scroll;
+                    })
+                }))
+                .into_any_element(),
+            ))
+            .child(row(
+                "Soft wrap",
+                toggle_button(
+                    "diff-soft-wrap-setting",
+                    if settings.diff_soft_wrap { "On" } else { "Off" },
+                    settings.diff_soft_wrap,
+                    cx,
+                )
+                .on_click(|_, window, cx| window.dispatch_action(ToggleSoftWrap.boxed_clone(), cx))
+                .into_any_element(),
+            ));
+
+        let appearance = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(
+                "Appearance",
+                reset("reset-appearance-settings", UiSettings::reset_appearance),
+                cx,
+            ))
             .child(row("Theme", segmented(theme_buttons)))
             .child(row("Active theme", muted(theme.name.clone())))
             .child(row(
@@ -1822,52 +1892,18 @@ impl Workspace {
                     },
                 ),
             ))
-            .child(row(
-                "Diff tab width",
-                stepper(
-                    "diff-tab-width",
-                    settings.diff_tab_width as f32,
-                    "cols",
-                    |settings, delta| {
-                        let width = settings.diff_tab_width as f32 + delta;
-                        settings.diff_tab_width = clamp_tab_width(width.max(0.0) as u32);
-                    },
-                ),
-            ))
-            .child(row("Diff layout", segmented(diff_mode_buttons)))
-            .child(row(
-                "Diff horizontal scroll",
-                toggle_button(
-                    "diff-link-scroll-setting",
-                    if settings.diff_link_horizontal_scroll {
-                        "Linked"
-                    } else {
-                        "Per column"
-                    },
-                    settings.diff_link_horizontal_scroll,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.update_settings(window, cx, |settings| {
-                        settings.diff_link_horizontal_scroll =
-                            !settings.diff_link_horizontal_scroll;
-                    })
-                }))
-                .into_any_element(),
-            ))
-            .child(row(
-                "Diff soft wrap",
-                toggle_button(
-                    "diff-soft-wrap-setting",
-                    if settings.diff_soft_wrap { "On" } else { "Off" },
-                    settings.diff_soft_wrap,
-                    cx,
-                )
-                .on_click(|_, window, cx| window.dispatch_action(ToggleSoftWrap.boxed_clone(), cx))
-                .into_any_element(),
-            ))
             .child(row("UI font", muted(theme.fonts.ui_family.clone())))
-            .child(row("Code font", muted(theme.fonts.code_family.clone())))
+            .child(row("Code font", muted(theme.fonts.code_family.clone())));
+
+        let layout = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(
+                "Layout",
+                reset("reset-layout-settings", UiSettings::reset_layout),
+                cx,
+            ))
             .child(row(
                 "File tree",
                 visibility(
@@ -1896,7 +1932,16 @@ impl Workspace {
                         })
                     }))
                     .into_any_element(),
-            ))
+            ));
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.claude_settings.clone())
+            .child(diff)
+            .child(appearance)
+            .child(layout)
     }
 }
 
@@ -2024,7 +2069,7 @@ fn shortcut_text<A: Action>() -> String {
 }
 
 /// The path with the home directory shortened to `~`.
-fn display_path(path: &Path) -> String {
+pub(crate) fn display_path(path: &Path) -> String {
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
         && let Ok(rest) = path.strip_prefix(&home)
     {

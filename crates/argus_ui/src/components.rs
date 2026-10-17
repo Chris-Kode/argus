@@ -139,3 +139,27 @@ pub fn placeholder(text: impl Into<SharedString>, cx: &App) -> Div {
                 .child(text.into()),
         )
 }
+
+/// A settings-section title with a trailing control (e.g. "Reset to
+/// defaults").
+pub fn section_header(title: impl Into<SharedString>, trailing: impl IntoElement, cx: &App) -> Div {
+    let colors = &cx.theme().colors;
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_between()
+        .mt_2()
+        .mb_1()
+        .pb_1()
+        .border_b_1()
+        .border_color(colors.border_variant)
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(colors.text_muted)
+                .child(title.into().to_uppercase()),
+        )
+        .child(trailing)
+}
