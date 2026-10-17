@@ -19,8 +19,8 @@ cargo run -p argus
 
 This opens the Argus shell: open a repository (`cmd-o` / `ctrl-o`) or pick one
 from the recent list. `cmd-/` (`ctrl-/` on Linux) lists every keyboard shortcut,
-and `cmd-,` opens the settings (theme, font sizes, docks). User data lives in
-`~/.argus/`; set `ARGUS_HOME` to override it (used by tests and CI):
+and `cmd-,` opens the settings. User data lives in `~/.argus/`; set
+`ARGUS_HOME` to override it (used by tests and CI):
 
 ```sh
 ARGUS_HOME=/tmp/argus-dev cargo run -p argus
@@ -53,6 +53,24 @@ count. Debug builds add "Advance status (debug)" to the thread menu, to try
 the status chips before runs exist.
 
 ![Comment threads in the side-by-side diff](docs/screenshots/comments-light.png)
+
+The settings sheet (`cmd-,`) groups the Claude run defaults, the diff options,
+the appearance and the dock layout, each section with a "Reset to defaults"
+button. The Claude section covers:
+
+- the `claude` binary (empty means auto-detect on `PATH`);
+- the default model and effort, and the lists the Run menu offers;
+- the review rules file;
+- the commit-message timeout.
+
+Text fields apply on Enter. An invalid value, such as a Claude path that does
+not exist or is not executable, shows an inline error and is not saved. Valid
+changes apply to the next run without a restart. On first launch Argus writes
+default rules to `~/.argus/review-rules.md`. It never overwrites that file, and
+every run appends it to Claude's system prompt. "Open in editor" opens it with
+the system's default application.
+
+![Settings](docs/screenshots/settings-light.png)
 
 Code is syntax-highlighted with tree-sitter, Zed-style, for Rust,
 TypeScript/TSX, JavaScript/JSX, Python, Go, Java, Kotlin, Swift, C, C++, C#,

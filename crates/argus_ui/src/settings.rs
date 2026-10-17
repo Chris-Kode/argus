@@ -1,9 +1,16 @@
-//! UI settings persisted in the `settings` table under the [`UI_SETTINGS_KEY`]
-//! key: theme, fonts, dock sizes and visibility, and diff display options.
+//! Settings persisted in the `settings` table (spec §10).
+//!
+//! [`Settings`] bundles the two typed records: [`UiSettings`] under the
+//! [`UI_SETTINGS_KEY`] key (theme, fonts, dock sizes and visibility, diff
+//! display options) and [`ClaudeSettings`] under
+//! [`argus_runs::settings::CLAUDE_SETTINGS_KEY`] (the run defaults). Both
+//! default every missing field and ignore unknown ones, so records written by
+//! older or newer versions keep loading.
 //!
 //! Loading and saving go through [`argus_store::SettingsStore`] on the tokio
 //! runtime, never on the UI thread.
 
+use argus_runs::ClaudeSettings;
 use argus_store::SettingsStore;
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +43,26 @@ pub const DEFAULT_TAB_WIDTH: u32 = 4;
 pub const MIN_TAB_WIDTH: u32 = 1;
 /// Largest allowed tab width.
 pub const MAX_TAB_WIDTH: u32 = 16;
+
+/// Every persisted setting, as loaded at startup.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Settings {
+    /// Run defaults; live in [`argus_runs::RunManager`] once the app runs.
+    pub claude: ClaudeSettings,
+    /// Appearance, layout and diff display; owned by the workspace.
+    pub ui: UiSettings,
+}
+
+impl Settings {
+    /// Loads both records, each falling back to its defaults when missing or
+    /// unreadable. Must run on the tokio runtime.
+    pub async fn load(store: &SettingsStore) -> Self {
+        Self {
+            claude: ClaudeSettings::load(store).await,
+            ui: UiSettings::load(store).await,
+        }
+    }
+}
 
 /// Where the run panel is docked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +235,36 @@ impl UiSettings {
     /// Stores the settings. Must run on the tokio runtime.
     pub async fn save(&self, store: &SettingsStore) -> argus_store::Result<()> {
         store.set(UI_SETTINGS_KEY, self).await
+    }
+
+    /// Resets the Diff section: layout, tab width, soft wrap and scrolling.
+    pub fn reset_diff(&mut self) {
+        let defaults = Self::default();
+        self.diff_tab_width = defaults.diff_tab_width;
+        self.diff_soft_wrap = defaults.diff_soft_wrap;
+        self.diff_view_mode = defaults.diff_view_mode;
+        self.diff_link_horizontal_scroll = defaults.diff_link_horizontal_scroll;
+    }
+
+    /// Resets the Appearance section: theme and fonts.
+    pub fn reset_appearance(&mut self) {
+        let defaults = Self::default();
+        self.theme = defaults.theme;
+        self.ui_font_family = defaults.ui_font_family;
+        self.code_font_family = defaults.code_font_family;
+        self.ui_font_size = defaults.ui_font_size;
+        self.code_font_size = defaults.code_font_size;
+    }
+
+    /// Resets the Layout section: dock visibility, position and sizes. The
+    /// file tree's flat/tree mode is a view toggle and stays as is.
+    pub fn reset_layout(&mut self) {
+        let flat_list = self.file_tree.flat_list;
+        self.file_tree = FileTreeDock {
+            flat_list,
+            ..FileTreeDock::default()
+        };
+        self.run_panel = RunPanelDock::default();
     }
 
     /// Clamps values a hand-edited or corrupted record could put out of range.

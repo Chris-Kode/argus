@@ -269,6 +269,15 @@ dependencies = [
 [[package]]
 name = "argus_runs"
 version = "0.1.0"
+dependencies = [
+ "argus_diff",
+ "argus_store",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "argus_store"

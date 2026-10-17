@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use argus_diff::layout::ViewMode;
+use argus_runs::ClaudeStatus;
 use argus_store::{Repo, StorageService};
 use gpui::{
     Action, AnyElement, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable,
@@ -22,10 +23,13 @@ use gpui::{
 
 use crate::AppContext;
 use crate::branch_picker::{BranchPicker, PickerEvent};
+use crate::claude_settings::ClaudeSettingsForm;
+use crate::claude_status::observe_claude_status;
 use crate::comment_list::{CommentList, CommentListEvent};
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
-    button, disabled_button, kbd, panel_header, placeholder, primary_button, toggle_button,
+    button, disabled_button, kbd, panel_header, placeholder, primary_button, section_header,
+    toggle_button,
 };
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
 use crate::file_tree::{FileTree, FileTreeEvent};
@@ -121,6 +125,8 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     settings: UiSettings,
     settings_dirty: bool,
+    /// The Claude section of the settings sheet; it owns the run defaults.
+    claude_settings: Entity<ClaudeSettingsForm>,
     fonts: InstalledFonts,
     session: Option<Entity<RepoSession>>,
     session_subscriptions: Vec<Subscription>,
@@ -143,6 +149,11 @@ pub struct Workspace {
     recent: RecentRepos,
     sheet: Option<Sheet>,
     notice: Option<Notice>,
+    /// The detected `claude`; a blocker disables Run and shows a banner.
+    claude: ClaudeStatus,
+    /// The user closed the banner of the current status' warning.
+    claude_warning_dismissed: bool,
+    _claude_task: Task<()>,
     save_task: Option<Task<()>>,
     open_task: Option<Task<()>>,
     recent_task: Option<Task<()>>,
@@ -177,6 +188,7 @@ impl Workspace {
             focus_handle,
             settings,
             settings_dirty: false,
+            claude_settings: cx.new(ClaudeSettingsForm::new),
             fonts: InstalledFonts::load(cx),
             session: None,
             session_subscriptions: Vec::new(),
@@ -193,6 +205,14 @@ impl Workspace {
             recent: RecentRepos::Loading,
             sheet: None,
             notice: None,
+            claude: cx.global::<AppContext>().runs.claude_status(),
+            claude_warning_dismissed: false,
+            _claude_task: observe_claude_status(cx, |this: &mut Self, status, _| {
+                if this.claude != status {
+                    this.claude = status;
+                    this.claude_warning_dismissed = false;
+                }
+            }),
             save_task: None,
             open_task: None,
             recent_task: None,
@@ -922,6 +942,21 @@ impl Workspace {
         }
     }
 
+    /// Run is disabled while `claude` is missing, still being checked, or
+    /// lacks a required flag (spec Q4); the reason goes to the status bar.
+    /// Starting runs lands with the Run menu (#21).
+    fn run(&mut self, action: &Run, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(blocker) = self.claude.run_blocker() {
+            self.notice = Some(Notice {
+                message: blocker.into(),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        self.not_wired_yet(action, window, cx);
+    }
+
     /// Placeholder handler for review actions whose views land in later
     /// issues (runs #21, accept).
     fn not_wired_yet<A: Action>(&mut self, action: &A, _: &mut Window, _: &mut Context<Self>) {
@@ -1191,6 +1226,81 @@ impl Workspace {
                         .with_priority(1),
                 )
             })
+    }
+
+    /// The banner under the title bar when runs are disabled (`claude`
+    /// missing, unusable or lacking a required flag) or degraded (no
+    /// `--effort`). Nothing while detection is in progress.
+    fn render_claude_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (message, is_error) = match &self.claude {
+            ClaudeStatus::Detecting => return None,
+            status => match status.run_blocker() {
+                Some(blocker) => (format!("{blocker}. Run is disabled."), true),
+                None if self.claude_warning_dismissed => return None,
+                None => (status.warning()?, false),
+            },
+        };
+        let colors = cx.theme().colors.clone();
+        let tint = if is_error {
+            colors.error
+        } else {
+            colors.warning
+        };
+        let actions = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .child(
+                button("claude-banner-recheck", "Check again", cx)
+                    .h(px(20.0))
+                    .text_xs()
+                    .on_click(|_, _, cx| cx.global::<AppContext>().runs.recheck_claude()),
+            )
+            .child(
+                button("claude-banner-settings", "Settings", cx)
+                    .h(px(20.0))
+                    .text_xs()
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(OpenSettings.boxed_clone(), cx)
+                    }),
+            )
+            .when(!is_error, |actions| {
+                actions.child(
+                    button("claude-banner-dismiss", "Dismiss", cx)
+                        .h(px(20.0))
+                        .text_xs()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.claude_warning_dismissed = true;
+                            cx.notify();
+                        })),
+                )
+            });
+        Some(
+            div()
+                .id("claude-banner")
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .px_2()
+                .py_0p5()
+                .bg(tint.opacity(0.12))
+                .border_b_1()
+                .border_color(tint.opacity(0.4))
+                .text_xs()
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_color(tint)
+                        .child(message),
+                )
+                .child(actions)
+                .into_any_element(),
+        )
     }
 
     fn render_file_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1676,7 +1786,7 @@ impl Workspace {
                     .flex_col()
                     .w(px(match sheet {
                         Sheet::KeyboardShortcuts => 720.0,
-                        Sheet::Settings => 520.0,
+                        Sheet::Settings => 640.0,
                     }))
                     .max_h(px(600.0))
                     .rounded_lg()
@@ -2002,10 +2112,75 @@ impl Workspace {
                 .into_any_element()
         };
 
-        div()
+        let reset = |id: &'static str, reset: fn(&mut UiSettings)| {
+            button(id, "Reset to defaults", cx).on_click(
+                cx.listener(move |this, _, window, cx| this.update_settings(window, cx, reset)),
+            )
+        };
+
+        let diff = div()
             .flex()
             .flex_col()
             .gap_1()
+            .child(section_header(
+                "Diff",
+                reset("reset-diff-settings", UiSettings::reset_diff),
+                cx,
+            ))
+            .child(row("Layout", segmented(diff_mode_buttons)))
+            .child(row(
+                "Tab width",
+                stepper(
+                    "diff-tab-width",
+                    settings.diff_tab_width as f32,
+                    "cols",
+                    |settings, delta| {
+                        let width = settings.diff_tab_width as f32 + delta;
+                        settings.diff_tab_width = clamp_tab_width(width.max(0.0) as u32);
+                    },
+                ),
+            ))
+            .child(row(
+                "Horizontal scroll",
+                toggle_button(
+                    "diff-link-scroll-setting",
+                    if settings.diff_link_horizontal_scroll {
+                        "Linked"
+                    } else {
+                        "Per column"
+                    },
+                    settings.diff_link_horizontal_scroll,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.update_settings(window, cx, |settings| {
+                        settings.diff_link_horizontal_scroll =
+                            !settings.diff_link_horizontal_scroll;
+                    })
+                }))
+                .into_any_element(),
+            ))
+            .child(row(
+                "Soft wrap",
+                toggle_button(
+                    "diff-soft-wrap-setting",
+                    if settings.diff_soft_wrap { "On" } else { "Off" },
+                    settings.diff_soft_wrap,
+                    cx,
+                )
+                .on_click(|_, window, cx| window.dispatch_action(ToggleSoftWrap.boxed_clone(), cx))
+                .into_any_element(),
+            ));
+
+        let appearance = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(
+                "Appearance",
+                reset("reset-appearance-settings", UiSettings::reset_appearance),
+                cx,
+            ))
             .child(row("Theme", segmented(theme_buttons)))
             .child(row("Active theme", muted(theme.name.clone())))
             .child(row(
@@ -2031,52 +2206,18 @@ impl Workspace {
                     },
                 ),
             ))
-            .child(row(
-                "Diff tab width",
-                stepper(
-                    "diff-tab-width",
-                    settings.diff_tab_width as f32,
-                    "cols",
-                    |settings, delta| {
-                        let width = settings.diff_tab_width as f32 + delta;
-                        settings.diff_tab_width = clamp_tab_width(width.max(0.0) as u32);
-                    },
-                ),
-            ))
-            .child(row("Diff layout", segmented(diff_mode_buttons)))
-            .child(row(
-                "Diff horizontal scroll",
-                toggle_button(
-                    "diff-link-scroll-setting",
-                    if settings.diff_link_horizontal_scroll {
-                        "Linked"
-                    } else {
-                        "Per column"
-                    },
-                    settings.diff_link_horizontal_scroll,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.update_settings(window, cx, |settings| {
-                        settings.diff_link_horizontal_scroll =
-                            !settings.diff_link_horizontal_scroll;
-                    })
-                }))
-                .into_any_element(),
-            ))
-            .child(row(
-                "Diff soft wrap",
-                toggle_button(
-                    "diff-soft-wrap-setting",
-                    if settings.diff_soft_wrap { "On" } else { "Off" },
-                    settings.diff_soft_wrap,
-                    cx,
-                )
-                .on_click(|_, window, cx| window.dispatch_action(ToggleSoftWrap.boxed_clone(), cx))
-                .into_any_element(),
-            ))
             .child(row("UI font", muted(theme.fonts.ui_family.clone())))
-            .child(row("Code font", muted(theme.fonts.code_family.clone())))
+            .child(row("Code font", muted(theme.fonts.code_family.clone())));
+
+        let layout = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(
+                "Layout",
+                reset("reset-layout-settings", UiSettings::reset_layout),
+                cx,
+            ))
             .child(row(
                 "File tree",
                 visibility(
@@ -2105,7 +2246,16 @@ impl Workspace {
                         })
                     }))
                     .into_any_element(),
-            ))
+            ));
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.claude_settings.clone())
+            .child(diff)
+            .child(appearance)
+            .child(layout)
     }
 }
 
@@ -2204,9 +2354,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_all_comments))
             .on_action(cx.listener(Self::toggle_comment_list))
             .on_action(cx.listener(Self::advance_comment_status))
-            .on_action(cx.listener(Self::not_wired_yet::<Run>))
+            .on_action(cx.listener(Self::run))
             .on_action(cx.listener(Self::not_wired_yet::<Accept>))
             .child(self.render_title_bar(cx))
+            .children(self.render_claude_banner(cx))
             .child(body)
             .child(self.render_status_bar(cx))
             .when_some(self.sheet, |root, sheet| {
@@ -2238,7 +2389,7 @@ fn shortcut_text<A: Action>() -> String {
 }
 
 /// The path with the home directory shortened to `~`.
-fn display_path(path: &Path) -> String {
+pub(crate) fn display_path(path: &Path) -> String {
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
         && let Ok(rest) = path.strip_prefix(&home)
     {
