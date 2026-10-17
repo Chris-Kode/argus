@@ -2,7 +2,7 @@
 //!
 //! ```sh
 //! cargo xtask fixtures [--seed N] [--out DIR] [--only NAME]...
-//! cargo xtask bundle [--universal] [--out DIR]
+//! cargo xtask bundle [--universal] [--sign IDENTITY [--notarize PROFILE]] [--out DIR]
 //! ```
 //!
 //! `bundle` builds the release binary and packages it: `Argus.app`, a `.dmg`
@@ -32,11 +32,15 @@ const USAGE: &str = "\
 Usage: cargo xtask <command>
 
 Commands:
-  bundle [--universal] [--out DIR]
+  bundle [--universal] [--sign IDENTITY [--notarize PROFILE]] [--out DIR]
       Build the release binary and package it into DIR (default:
       target/bundle). macOS: Argus.app, a .dmg and a .zip, for this Mac's
       architecture or, with --universal, arm64 and x86_64 together. Linux:
       a .tar.gz with the binary, a .desktop entry and the icon.
+      macOS signs ad hoc unless --sign names a Developer ID Application
+      identity (or ARGUS_SIGN_IDENTITY does); --notarize (or
+      ARGUS_NOTARY_PROFILE) then notarizes with that notarytool keychain
+      profile and staples the ticket.
   fixtures [--seed N] [--out DIR] [--only NAME]...
       Generate the perf fixture repos (huge-files, huge-file, many-branches)
       into DIR (default: target/fixtures). Existing fixtures are replaced.
@@ -62,6 +66,8 @@ fn bundle_command(args: Vec<String>) -> anyhow::Result<()> {
     let mut options = bundle::Options {
         out: root.join("target").join("bundle"),
         universal: false,
+        sign: non_empty_env("ARGUS_SIGN_IDENTITY"),
+        notarize: non_empty_env("ARGUS_NOTARY_PROFILE"),
     };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -70,10 +76,22 @@ fn bundle_command(args: Vec<String>) -> anyhow::Result<()> {
             "--out" => {
                 options.out = PathBuf::from(args.next().context("`--out` needs a value")?);
             }
+            "--sign" => options.sign = Some(args.next().context("`--sign` needs an identity")?),
+            "--notarize" => {
+                options.notarize = Some(
+                    args.next()
+                        .context("`--notarize` needs a notarytool keychain profile")?,
+                );
+            }
             other => bail!("unknown option `{other}`\n\n{USAGE}"),
         }
     }
     bundle::run(&root, &options)
+}
+
+/// The variable's value, unless it is unset or empty.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 /// Parses the `fixtures` options and generates the selected fixtures.

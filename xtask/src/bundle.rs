@@ -5,10 +5,19 @@
 //! On Linux (best effort): a `.tar.gz` with the binary, a `.desktop` entry
 //! and the icon.
 //!
-//! Signing is ad hoc (`codesign --sign -`): enough for the app to launch on
-//! the machine that built it and, after the Gatekeeper prompt, on others.
-//! Developer ID signing and notarization need a certificate and are not done
-//! here.
+//! Signing, macOS:
+//!
+//! - by default ad hoc (`codesign --sign -`): enough for the app to launch on
+//!   the machine that built it and, after the Gatekeeper prompt, on others;
+//! - with `--sign <identity>` (or `ARGUS_SIGN_IDENTITY`), a Developer ID
+//!   Application certificate from the keychain, with the hardened runtime
+//!   and a secure timestamp, as notarization requires. The `.dmg` is signed
+//!   too;
+//! - with `--notarize <profile>` (or `ARGUS_NOTARY_PROFILE`) as well, the
+//!   `.dmg` is sent to Apple's notary service with `notarytool` (credentials
+//!   from a keychain profile made by `xcrun notarytool store-credentials`),
+//!   and the ticket is stapled to the `.dmg` and the app before the `.zip` is
+//!   made, so Gatekeeper accepts both offline.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,6 +50,12 @@ pub struct Options {
     pub out: PathBuf,
     /// macOS: build arm64 and x86_64 and merge them with `lipo`.
     pub universal: bool,
+    /// macOS: the Developer ID Application identity to sign with (a name
+    /// or SHA-1 `security find-identity` lists); `None` signs ad hoc.
+    pub sign: Option<String>,
+    /// macOS: the `notarytool` keychain profile to notarize with; needs
+    /// [`Options::sign`].
+    pub notarize: Option<String>,
 }
 
 /// Builds the release binary and packages it for the host platform.
@@ -51,8 +66,8 @@ pub fn run(root: &Path, options: &Options) -> anyhow::Result<()> {
     return macos(root, options);
     #[cfg(target_os = "linux")]
     {
-        if options.universal {
-            bail!("`--universal` is for macOS only");
+        if options.universal || options.sign.is_some() || options.notarize.is_some() {
+            bail!("`--universal`, `--sign` and `--notarize` are for macOS only");
         }
         linux(root, &options.out)
     }
@@ -65,6 +80,9 @@ pub fn run(root: &Path, options: &Options) -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn macos(root: &Path, options: &Options) -> anyhow::Result<()> {
+    if options.notarize.is_some() && options.sign.is_none() {
+        bail!("`--notarize` needs `--sign <Developer ID Application identity>`");
+    }
     let (binary, arch) = if options.universal {
         const TRIPLES: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
         check_targets_installed(&TRIPLES)?;
@@ -100,29 +118,33 @@ fn macos(root: &Path, options: &Options) -> anyhow::Result<()> {
     fs::write(contents.join("PkgInfo"), "APPL????")?;
     write_icns(&options.out, &resources.join(format!("{APP_NAME}.icns")))?;
 
-    // Ad hoc: seals the bundle (Info.plist and resources included) without a
-    // certificate.
+    match &options.sign {
+        Some(identity) => {
+            // The hardened runtime and a secure timestamp are what the notary
+            // service checks for. Argus needs no entitlements: it does not
+            // JIT, load plug-ins or use protected resources.
+            run_command(
+                Command::new("codesign")
+                    .args(["--force", "--options", "runtime", "--timestamp"])
+                    .args(["--sign", identity])
+                    .arg(&app),
+            )?;
+        }
+        // Ad hoc: seals the bundle (Info.plist and resources included)
+        // without a certificate.
+        None => run_command(
+            Command::new("codesign")
+                .args(["--force", "--sign", "-", "--timestamp=none"])
+                .arg(&app),
+        )?,
+    }
     run_command(
         Command::new("codesign")
-            .args(["--force", "--sign", "-", "--timestamp=none"])
-            .arg(&app),
-    )?;
-    run_command(
-        Command::new("codesign")
-            .args(["--verify", "--strict"])
+            .args(["--verify", "--strict", "--verbose=2"])
             .arg(&app),
     )?;
 
     let stem = format!("{APP_NAME}-{VERSION}-macos-{arch}");
-    let zip = options.out.join(format!("{stem}.zip"));
-    remove_if_exists(&zip)?;
-    run_command(
-        Command::new("ditto")
-            .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
-            .arg(&app)
-            .arg(&zip),
-    )?;
-
     let dmg = options.out.join(format!("{stem}.dmg"));
     let staging = options.out.join("dmg-staging");
     remove_if_exists(&staging)?;
@@ -143,11 +165,82 @@ fn macos(root: &Path, options: &Options) -> anyhow::Result<()> {
             .arg(&dmg),
     )?;
     fs::remove_dir_all(&staging)?;
+    if let Some(identity) = &options.sign {
+        run_command(
+            Command::new("codesign")
+                .args(["--force", "--timestamp", "--sign", identity])
+                .arg(&dmg),
+        )?;
+    }
+
+    if let Some(profile) = &options.notarize {
+        notarize(&dmg, profile)?;
+        // The ticket covers the app inside the disk image too; stapling it
+        // to the app as well lets the `.zip` open offline.
+        for path in [&dmg, &app] {
+            run_command(Command::new("xcrun").args(["stapler", "staple"]).arg(path))?;
+        }
+        run_command(
+            Command::new("spctl")
+                .args(["--assess", "--type", "execute", "--verbose=2"])
+                .arg(&app),
+        )?;
+    }
+
+    // Made last, from the stapled app when notarized.
+    let zip = options.out.join(format!("{stem}.zip"));
+    remove_if_exists(&zip)?;
+    run_command(
+        Command::new("ditto")
+            .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
+            .arg(&app)
+            .arg(&zip),
+    )?;
 
     eprintln!("\nBuilt:");
     for path in [&app, &dmg, &zip] {
         eprintln!("  {}", path.display());
     }
+    Ok(())
+}
+
+/// Sends `dmg` to the notary service and waits for its verdict.
+#[cfg(target_os = "macos")]
+fn notarize(dmg: &Path, profile: &str) -> anyhow::Result<()> {
+    eprintln!(
+        "Notarizing {} (this usually takes a few minutes)",
+        dmg.display()
+    );
+    let mut submit = Command::new("xcrun");
+    submit
+        .args([
+            "notarytool",
+            "submit",
+            "--wait",
+            "--keychain-profile",
+            profile,
+        ])
+        .args(["--output-format", "json"])
+        .arg(dmg);
+    eprintln!("$ xcrun notarytool submit --wait --keychain-profile {profile} ...");
+    let output = submit
+        .output()
+        .context("failed to start `xcrun notarytool`")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // `--wait` can exit successfully with a rejected submission; the status
+    // is in the JSON.
+    let compact: String = stdout.split_whitespace().collect();
+    let accepted = compact.contains(r#""status":"Accepted""#);
+    if !output.status.success() || !accepted {
+        bail!(
+            "notarization failed:\n{}{}\nSee why with:\n  xcrun notarytool log <submission id> \
+             --keychain-profile {profile}",
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+    eprintln!("Notarization accepted.");
     Ok(())
 }
 

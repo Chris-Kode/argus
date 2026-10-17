@@ -47,15 +47,43 @@ This writes to `target/bundle/`:
 `cargo xtask bundle --universal` builds one app for both Apple silicon and Intel
 (first `rustup target add aarch64-apple-darwin x86_64-apple-darwin`).
 
-The app is signed ad hoc, not with a Developer ID, and it is not notarized. On
-the Mac that built it, it opens normally. On another Mac, the first launch is
-blocked by Gatekeeper ("Apple could not verify…"): open **System Settings →
-Privacy & Security** and click **Open Anyway** next to the Argus message, or
-clear the download quarantine once:
+#### Signing and Gatekeeper
+
+By default the app is signed ad hoc, not with a Developer ID, and it is not
+notarized. On the Mac that built it, it opens normally. On another Mac, the
+first launch is blocked by Gatekeeper ("Apple could not verify…"): open
+**System Settings → Privacy & Security** and click **Open Anyway** next to the
+Argus message, or clear the download quarantine once:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/Argus.app
 ```
+
+To hand the app to other people, sign it with a Developer ID and notarize it
+(this needs an Apple Developer Program membership):
+
+1. Install a **Developer ID Application** certificate in your login keychain
+   and find its name with `security find-identity -v -p codesigning`.
+2. Store notary credentials in the keychain once, under a profile name of your
+   choice (an [app-specific password](https://support.apple.com/102654) works):
+
+   ```sh
+   xcrun notarytool store-credentials argus-notary --apple-id you@example.com --team-id TEAMID
+   ```
+
+3. Bundle with both:
+
+   ```sh
+   cargo xtask bundle --sign "Developer ID Application: Your Name (TEAMID)" --notarize argus-notary
+   ```
+
+`--sign` signs the app (hardened runtime, secure timestamp) and the `.dmg`.
+`--notarize` sends the `.dmg` to Apple, waits for the verdict (usually a few
+minutes) and staples the ticket to the `.dmg` and the app, so the `.zip` made
+afterwards carries it too. Gatekeeper then opens Argus without any prompt,
+even offline. `--sign` alone gives a Developer-ID-signed app that Gatekeeper
+still blocks until it is notarized. `ARGUS_SIGN_IDENTITY` and
+`ARGUS_NOTARY_PROFILE` can stand in for the two flags, e.g. in CI.
 
 ### Linux (best effort)
 
