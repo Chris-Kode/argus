@@ -38,6 +38,22 @@ side" title-bar button switches to the unified layout and back, keeping the
 line at the top of the viewport in place. The settings choose the default
 layout and whether both columns scroll horizontally together.
 
+Comment on any line, or a range, on either side: hover a line and click the
+gutter "+", or select lines (click, shift-click or drag the gutter) and press
+`c`. Removed lines are commented on the old side; added and context lines on the
+new side (in side-by-side mode, the column you pick decides). A range cannot
+cross a hunk header. The composer opens under the last line: write Markdown,
+save with `cmd-enter` (`ctrl-enter` on Linux), cancel with `esc`; unsaved
+drafts are kept while Argus runs. Threads show inline under their lines with a
+status chip (Open, Running, Proposed, Resolved, Dismissed), replies and a menu
+to edit, delete, dismiss or reopen. `]c` / `[c` jump between threads, `shift-c`
+folds them all, and the "Comments" tab of the left dock (`cmd-shift-c`) lists
+every thread by file, filterable by status. File-tree rows show a comment
+count. Debug builds add "Advance status (debug)" to the thread menu, to try
+the status chips before runs exist.
+
+![Comment threads in the side-by-side diff](docs/screenshots/comments-light.png)
+
 Code is syntax-highlighted with tree-sitter, Zed-style, for Rust,
 TypeScript/TSX, JavaScript/JSX, Python, Go, Java, Kotlin, Swift, C, C++, C#,
 Ruby, PHP, JSON, YAML, TOML, Markdown, HTML, CSS, SQL and Bash (detected from the

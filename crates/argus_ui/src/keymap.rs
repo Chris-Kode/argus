@@ -381,8 +381,8 @@ pub const SHORTCUTS: &[Shortcut] = &[
 pub const SHORTCUT_GROUPS: &[&str] = &[
     "Navigation",
     "File tree",
-    "Review",
     "Layout",
+    "Review",
     "Appearance",
     "Application",
 ];

@@ -18,6 +18,11 @@
 //! selection into a comment range with [`select_range`] /
 //! [`select_split_range`], and keeps the reading position across a mode
 //! toggle with [`row_key`] and [`find_row`].
+//!
+//! Comment threads become rows too: [`anchor_rows`] finds the row under
+//! which a comment's range ends, [`place_inline`] inserts [`Row::Inline`]
+//! blocks there (and [`strip_inline`] removes them again), and
+//! [`reveal_lines`] expands the context gaps that hide a commented line.
 
 use std::ops::Range;
 
