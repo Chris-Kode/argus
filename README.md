@@ -54,6 +54,24 @@ the status chips before runs exist.
 
 ![Comment threads in the side-by-side diff](docs/screenshots/comments-light.png)
 
+When a run finishes with a change, its comment turns Proposed. "View proposal"
+(on the thread, or in its menu) opens a proposal tab next to the diff tab. The
+tab shows only what Claude changed: the diff from the commit the run started at
+to its worktree, including new and deleted files, in the same viewer. Above the
+diff are the comment (its location links back to the thread), the model, effort,
+turns, cost and duration, and Claude's final summary. Files other than the
+commented one are listed first and badged "outside comment scope". A banner
+warns when the head branch moved after the run started. `a` accepts the
+proposal, `x` rejects it (press it again to confirm), and `r` opens the reply
+box. Reject deletes the run's worktree and sets the comment back to Open; the
+run stays in history as Rejected. "Open in editor" opens a changed file of the
+worktree in `$VISUAL` / `$EDITOR`, or with the system's default application.
+The proposal refreshes as soon as the file changes on disk. Accept (#24) and
+follow-up runs (#23) are not available yet: Accept shows a notice, and a reply
+is saved in the thread.
+
+![A proposal tab](docs/screenshots/proposal-light.png)
+
 The settings sheet (`cmd-,`) groups the Claude run defaults, the diff options,
 the appearance and the dock layout, each section with a "Reset to defaults"
 button. The Claude section covers:

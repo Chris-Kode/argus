@@ -41,6 +41,8 @@ gix = "0.89.0"
 # Process-group signals for Stop (`kill(-pgid, …)`).
 libc = "0.2.190"
 imara-diff = { package = "gix-imara-diff", version = "0.3.1" }
+# Watches a proposal's worktree for manual edits (CC0-1.0).
+notify = "8.2.0"
 # Markdown parsing of comment bodies (MIT). No default features: the HTML
 # renderer and its CLI are not needed.
 pulldown-cmark = { version = "0.13.4", default-features = false }

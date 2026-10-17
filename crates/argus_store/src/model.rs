@@ -197,6 +197,9 @@ text_enum!(
         Failed => "failed",
         /// Stopped by the user.
         Stopped => "stopped",
+        /// The user rejected the run's proposal; its worktree is deleted and
+        /// the run stays in history.
+        Rejected => "rejected",
     }
 );
 

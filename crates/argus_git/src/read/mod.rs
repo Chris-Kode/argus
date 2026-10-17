@@ -275,6 +275,13 @@ pub(crate) fn resolve_commit(repo: &gix::Repository, name: &str) -> Result<Objec
     Ok(id)
 }
 
+/// The commit `name` (a branch name or a SHA) points to now.
+pub async fn resolve(repo: &Repo, name: &str) -> Result<Sha> {
+    let repo = repo.clone();
+    let name = name.to_owned();
+    blocking(move |_| Ok(Sha(resolve_commit(&repo.local(), &name)?))).await
+}
+
 /// Best common ancestor of `base` and `head` (branch names or SHAs), as used
 /// for the three-dot diff.
 ///

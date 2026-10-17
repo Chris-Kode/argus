@@ -37,6 +37,15 @@ pub enum StoreError {
         supported: i64,
     },
 
+    /// A migration left the database inconsistent and was rolled back.
+    #[error("storage migration {version} failed: {message}")]
+    Migration {
+        /// Version the migration would have reached.
+        version: i64,
+        /// What was wrong.
+        message: String,
+    },
+
     /// A path stored in the database must be valid UTF-8.
     #[error("path is not valid UTF-8: {}", .0.display())]
     NonUtf8Path(PathBuf),

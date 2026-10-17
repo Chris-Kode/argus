@@ -1,7 +1,7 @@
 //! [`DiffSession`]: one three-dot diff with fixed commits, its file list,
 //! the streamed +/- counts and the lazily computed per-file diffs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -22,12 +22,16 @@ const STATS_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 /// ...or as soon as a worker has this many ready.
 const STATS_FLUSH_BATCH: usize = 256;
 
-/// The changed files of a session, sorted by path.
+/// The changed files of a session, sorted by path. A
+/// [scoped](DiffSession::scoped) session lists the files outside its scope
+/// first, each group by path.
 #[derive(Debug)]
 pub struct FileList {
     entries: Vec<FileEntry>,
     by_path: HashMap<String, usize>,
     renames_limited: bool,
+    /// By index; empty when the session has no scope.
+    out_of_scope: Vec<bool>,
 }
 
 impl FileList {
@@ -66,6 +70,17 @@ impl FileList {
     pub fn renames_limited(&self) -> bool {
         self.renames_limited
     }
+
+    /// Whether the entry at `index` is outside the session's scope (neither
+    /// its path nor its old path is in it). Always `false` without a scope.
+    pub fn is_out_of_scope(&self, index: usize) -> bool {
+        self.out_of_scope.get(index).copied().unwrap_or(false)
+    }
+
+    /// How many entries are outside the session's scope.
+    pub fn out_of_scope_count(&self) -> usize {
+        self.out_of_scope.iter().filter(|&&out| out).count()
+    }
 }
 
 /// An update of the +/- counts stream (see [`DiffSession::stats_updates`]).
@@ -92,6 +107,8 @@ pub struct DiffSession {
 struct Inner {
     repo: Repo,
     refs: Option<(String, String)>,
+    /// Paths in scope; the other files are listed first.
+    scope: Option<Arc<HashSet<String>>>,
     old: Sha,
     new: Sha,
     options: DiffOptions,
@@ -133,6 +150,7 @@ impl DiffSession {
         Ok(Self::build(
             repo,
             Some((base_ref.to_owned(), head_ref.to_owned())),
+            None,
             merge_base,
             head,
             options,
@@ -142,12 +160,28 @@ impl DiffSession {
     /// A two-dot diff between two known commits (e.g. a run's start commit
     /// and its result).
     pub fn between(repo: &Repo, old: Sha, new: Sha, options: DiffOptions) -> Self {
-        Self::build(repo, None, old, new, options)
+        Self::build(repo, None, None, old, new, options)
+    }
+
+    /// A two-dot diff between two commits or trees (e.g. a run's start
+    /// commit and the snapshot of its worktree) that lists the files outside
+    /// `scope` first, so they are noticed (spec §14). A file is in scope when
+    /// its path or its old path is.
+    pub fn scoped(
+        repo: &Repo,
+        old: Sha,
+        new: Sha,
+        options: DiffOptions,
+        scope: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let scope = Arc::new(scope.into_iter().collect());
+        Self::build(repo, None, Some(scope), old, new, options)
     }
 
     fn build(
         repo: &Repo,
         refs: Option<(String, String)>,
+        scope: Option<Arc<HashSet<String>>>,
         old: Sha,
         new: Sha,
         options: DiffOptions,
@@ -157,6 +191,7 @@ impl DiffSession {
             inner: Arc::new(Inner {
                 repo: repo.clone(),
                 refs,
+                scope,
                 old,
                 new,
                 options,
@@ -218,6 +253,7 @@ impl DiffSession {
                 let (old, new) = (inner.old, inner.new);
                 let renames = inner.options.renames;
                 let workers = inner.options.worker_count();
+                let scope = inner.scope.clone();
                 let guard = inner.cancel.child().drop_guard();
                 let token = guard.token().clone();
                 let started = Instant::now();
@@ -225,7 +261,7 @@ impl DiffSession {
                     let changes = objects::tree_diff_blocking(&repo, old, new, &token)?;
                     token.check()?;
                     let detected = renames::detect(&repo, changes, renames, workers, &token)?;
-                    Ok(build_list(detected))
+                    Ok(build_list(detected, scope.as_deref()))
                 })
                 .await?;
                 tracing::debug!(
@@ -330,10 +366,24 @@ where
     }
 }
 
-fn build_list(detected: renames::Detected) -> FileList {
+fn build_list(detected: renames::Detected, scope: Option<&HashSet<String>>) -> FileList {
+    let in_scope = |paired: &renames::Paired| {
+        scope.is_none_or(|scope| {
+            scope.contains(&paired.change.path)
+                || paired
+                    .old_path
+                    .as_ref()
+                    .is_some_and(|old| scope.contains(old))
+        })
+    };
     let mut changes = detected.changes;
-    // Renames moved to their new path; restore path order.
-    changes.sort_by(|a, b| a.change.path.cmp(&b.change.path));
+    // Renames moved to their new path; restore path order, with the files
+    // outside the scope first (`false` sorts before `true`).
+    changes.sort_by(|a, b| (in_scope(a), &a.change.path).cmp(&(in_scope(b), &b.change.path)));
+    let out_of_scope = match scope {
+        Some(_) => changes.iter().map(|paired| !in_scope(paired)).collect(),
+        None => Vec::new(),
+    };
     let entries: Vec<FileEntry> = changes
         .into_iter()
         .enumerate()
@@ -347,6 +397,7 @@ fn build_list(detected: renames::Detected) -> FileList {
         entries,
         by_path,
         renames_limited: detected.limited,
+        out_of_scope,
     }
 }
 
