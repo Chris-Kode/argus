@@ -4,6 +4,11 @@
 //! Filled in by issues #19 (prompt builder), #20 (run manager: spawn
 //! `claude -p`, parse `stream-json`, parallel runs, stop) and #21–#23 (run
 //! menu, proposal review, follow-up replies).
+//!
+//! [`prompt`] renders the versioned prompts of comment, follow-up and
+//! resolve runs.
+
+pub mod prompt;
 
 /// Handle to the run manager.
 ///
