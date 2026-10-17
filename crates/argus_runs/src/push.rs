@@ -29,25 +29,41 @@
 //!
 //! With [`PushMode::SetUpstream`] (the head has no upstream yet) the target
 //! is `<remote>/<head>` and the push carries `--set-upstream`.
+//!
+//! A rebase conflict can be resolved with Claude ([`crate::resolve`]).
+//! Accepting a resolution queues a continued Push
+//! ([`RunManager::continue_push`](crate::RunManager::continue_push)) on the
+//! same queue: `git add -A && git rebase --continue` in the resolve
+//! worktree, after checking that no conflict marker is left. The next
+//! conflicting commit ends it with [`PushOutcome::Conflict`] again (with
+//! [`PushConflict::resolve`] set, so the next resolve run continues the
+//! same rebase); a finished rebase moves the head branch with a
+//! compare-and-swap from the tip the rebase started at, and the Push goes
+//! on from step 1.
 
 use std::path::PathBuf;
 
 use argus_git::push::{self as git_push, FetchOutcome, PushResult, StepLog, Upstream};
 use argus_git::write::{self, RefUpdate};
-use argus_git::{GitError, RebaseOutcome, Repo, Sha};
-use argus_store::StoreError;
+use argus_git::{ConflictMarker, GitError, RebaseOutcome, RebaseStep, Repo, Sha};
+use argus_store::{RunId, StoreError};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::accept::{
     AcceptEnv, AcceptQueues, QueueJob, acknowledge_checked_out, checked_out_acknowledged,
     user_checkout_of,
 };
+use crate::resolve::{RebaseResolution, ResolveId};
+use crate::run::RunUpdate;
 
 /// The operation named in the conflict dialog when the rebase conflicts.
 pub const PULL_BEFORE_PUSH: &str = "Pull before push";
 
 /// Reflog message of the head branch update after the rebase.
 const REFLOG_REASON: &str = "argus: pull before push";
+
+/// Reflog message of the head branch update after a resolved rebase.
+const RESOLVED_REFLOG_REASON: &str = "argus: pull before push (resolved with Claude)";
 
 /// How many times the whole sequence runs when the remote keeps moving.
 const ATTEMPTS: u32 = 2;
@@ -94,6 +110,8 @@ pub enum PushStep {
     /// The remote moved (or the branch moved); starting again from the
     /// fetch.
     Retrying,
+    /// Checking an accepted resolution and continuing the rebase with it.
+    ContinuingRebase,
 }
 
 impl PushStep {
@@ -106,6 +124,7 @@ impl PushStep {
             Self::MovingBranch => "Moving the branch",
             Self::Pushing => "Pushing",
             Self::Retrying => "The remote moved; trying again",
+            Self::ContinuingRebase => "Continuing the rebase with the resolution",
         }
     }
 }
@@ -184,6 +203,10 @@ pub struct PushConflict {
     pub files: Vec<PathBuf>,
     /// What `git rebase` printed.
     pub detail: String,
+    /// A rebase resolved with Claude that stopped at its next conflicting
+    /// commit; the rebase waits in its resolve worktree. `None` for a
+    /// first conflict: that rebase was aborted.
+    pub resolve: Option<RebaseResolution>,
 }
 
 /// Why a Push failed. A conflict is not an error: it is
@@ -225,6 +248,18 @@ pub enum PushError {
     /// The repository's queue stopped.
     #[error("the accept queue stopped")]
     QueueClosed,
+    /// The resolution to continue with is no longer in progress.
+    #[error(
+        "this pull-before-push resolution is no longer in progress (cancelled, failed, or Argus \
+         restarted); Push again to start over"
+    )]
+    ResolveGone,
+    /// A resolve run (or its follow-up) is still working in the worktree.
+    #[error("the resolve run is still running; wait for it to finish before accepting")]
+    ResolutionRunning,
+    /// The resolution still has conflict markers; nothing was continued.
+    #[error("{}", crate::accept::markers_message(.0))]
+    MarkersRemain(Vec<ConflictMarker>),
 }
 
 impl PushError {
@@ -244,6 +279,8 @@ impl PushError {
 /// at its next step.
 #[derive(Debug)]
 pub struct PushTicket {
+    /// The Push (for a continued one, the Push its resolution belongs to).
+    pub request: PushRequest,
     /// Steps, git output and the question, in order.
     pub events: mpsc::UnboundedReceiver<PushEvent>,
     /// The outcome, sent once.
@@ -253,6 +290,9 @@ pub struct PushTicket {
 /// One Push waiting in a queue.
 pub(crate) struct PushJob {
     request: PushRequest,
+    /// Continue a resolved rebase (with the accepted run's proposal) before
+    /// pushing.
+    resolution: Option<(ResolveId, RunId)>,
     events: mpsc::UnboundedSender<PushEvent>,
     result: oneshot::Sender<Result<PushOutcome, PushError>>,
 }
@@ -269,21 +309,63 @@ pub(crate) fn submit(
     let _ = events_tx.send(PushEvent::Step(PushStep::Queued));
     let repo_id = request.repo.id().clone();
     let job = PushJob {
-        request,
+        request: request.clone(),
+        resolution: None,
         events: events_tx,
         result: result_tx,
     };
     queues
-        .enqueue(env, &repo_id, QueueJob::Push(job))
+        .enqueue(env, &repo_id, QueueJob::Push(Box::new(job)))
         .map_err(|_| PushError::QueueClosed)?;
     tracing::info!(repo = %repo_id, "push queued");
-    Ok(PushTicket { events, result })
+    Ok(PushTicket {
+        request,
+        events,
+        result,
+    })
+}
+
+/// Queues the continuation of a pull-before-push resolution with the
+/// proposal of `run_id`, then the Push, behind the repository's earlier
+/// accepts. Must run on the tokio runtime.
+pub(crate) fn submit_continue(
+    queues: &AcceptQueues,
+    env: &AcceptEnv,
+    run_id: RunId,
+    resolution: &RebaseResolution,
+) -> Result<PushTicket, PushError> {
+    let session = env
+        .services
+        .resolves
+        .get(resolution.id)
+        .ok_or(PushError::ResolveGone)?;
+    let (events_tx, events) = mpsc::unbounded_channel();
+    let (result_tx, result) = oneshot::channel();
+    let _ = events_tx.send(PushEvent::Step(PushStep::Queued));
+    let repo_id = session.request.repo.id().clone();
+    let job = PushJob {
+        request: session.request.clone(),
+        resolution: Some((resolution.id, run_id)),
+        events: events_tx,
+        result: result_tx,
+    };
+    queues
+        .enqueue(env, &repo_id, QueueJob::Push(Box::new(job)))
+        .map_err(|_| PushError::QueueClosed)?;
+    tracing::info!(repo = %repo_id, run = %run_id, resolve = %resolution.id, "continued push queued");
+    Ok(PushTicket {
+        request: session.request,
+        events,
+        result,
+    })
 }
 
 /// Runs one queued Push and sends its outcome.
 pub(crate) async fn run_job(env: &AcceptEnv, job: PushJob) {
     let result = if job.events.is_closed() {
         Ok(PushOutcome::Cancelled)
+    } else if let Some((id, run_id)) = job.resolution {
+        continue_push(env, id, run_id, &job.events).await
     } else {
         push(env, &job.request, &job.events).await
     };
@@ -391,6 +473,7 @@ async fn push(
                             upstream_tip: remote_tip,
                             files,
                             detail: rebase_log.output,
+                            resolve: None,
                         }));
                     }
                     RebaseOutcome::Failed => return Err(PushError::step(&rebase_log)),
@@ -504,4 +587,139 @@ async fn confirm_checked_out(
     }
     acknowledge_checked_out(services, request.repo_id).await?;
     Ok(true)
+}
+
+/// Continues a resolved rebase with the proposal of `run_id`, then pushes
+/// (see the module docs).
+async fn continue_push(
+    env: &AcceptEnv,
+    id: ResolveId,
+    run_id: RunId,
+    events: &mpsc::UnboundedSender<PushEvent>,
+) -> Result<PushOutcome, PushError> {
+    let services = &env.services;
+    let session = services.resolves.get(id).ok_or(PushError::ResolveGone)?;
+    let request = session.request.clone();
+    let head = request.head.as_str();
+    let worktree = &session.worktree;
+    let busy = crate::resolve::busy_worktree(services, worktree.path())
+        .await
+        .map_err(|error| PushError::Step {
+            command: "check the resolve runs".to_owned(),
+            output: error.to_string(),
+        })?;
+    if busy || services.is_active(run_id) {
+        return Err(PushError::ResolutionRunning);
+    }
+    step(events, PushStep::ContinuingRebase);
+    let markers = services
+        .worktrees
+        .conflict_markers(worktree, &session.stop.head, &session.stop.files)
+        .await?;
+    if !markers.is_empty() {
+        return Err(PushError::MarkersRemain(markers));
+    }
+    if events.is_closed() {
+        return Ok(PushOutcome::Cancelled);
+    }
+    let (outcome, continue_log) = services.worktrees.continue_rebase(worktree).await?;
+    log(events, &continue_log);
+    let new = match outcome {
+        RebaseStep::Stopped(next) => {
+            // The resolved commit is in; the next one conflicts.
+            resolved(env, run_id, &next.head, &session.stop.subject).await;
+            services.resolves.advance(id, next.clone());
+            let progress = services
+                .resolves
+                .get(id)
+                .map(|session| session.resolution(id))
+                .ok_or(PushError::ResolveGone)?;
+            return Ok(PushOutcome::Conflict(PushConflict {
+                operation: PULL_BEFORE_PUSH,
+                head: head.to_owned(),
+                upstream: session.upstream.clone(),
+                head_tip: session.expected_head,
+                upstream_tip: session.upstream_tip,
+                files: next.files,
+                detail: continue_log.output,
+                resolve: Some(progress),
+            }));
+        }
+        RebaseStep::Failed => return Err(PushError::step(&continue_log)),
+        RebaseStep::Finished(new) => new,
+    };
+
+    // The rebase is done: move the head branch, then push.
+    if !confirm_checked_out(env, &request, events).await? {
+        abandon(env, id).await;
+        return Ok(PushOutcome::Cancelled);
+    }
+    step(events, PushStep::MovingBranch);
+    let moved = write::update_branch(
+        &request.repo,
+        head,
+        &new,
+        &session.expected_head,
+        RESOLVED_REFLOG_REASON,
+    )
+    .await;
+    match moved {
+        Ok(RefUpdate::Moved) => {}
+        Ok(RefUpdate::Stale { current }) => {
+            abandon(env, id).await;
+            return Err(match current {
+                None => PushError::BranchGone(head.to_owned()),
+                Some(_) => PushError::BranchMoved {
+                    head: head.to_owned(),
+                },
+            });
+        }
+        Err(error) => return Err(error.into()),
+    }
+    resolved(env, run_id, &new, &session.stop.subject).await;
+    abandon(env, id).await;
+    tracing::info!(head, from = %session.expected_head, to = %new, "resolved rebase landed");
+
+    let outcome = push(env, &request, events).await?;
+    Ok(match outcome {
+        PushOutcome::Pushed(mut report) => {
+            report.rebased.get_or_insert((session.expected_head, new));
+            PushOutcome::Pushed(report)
+        }
+        PushOutcome::UpToDate(mut report) => {
+            report.rebased.get_or_insert((session.expected_head, new));
+            PushOutcome::UpToDate(report)
+        }
+        other => other,
+    })
+}
+
+/// Records the accepted resolution of `run_id` (the rebased commit it
+/// produced) and publishes it, so its proposal tab closes.
+async fn resolved(env: &AcceptEnv, run_id: RunId, commit: &Sha, subject: &str) {
+    let services = &env.services;
+    let message = format!("pull before push: resolved conflicts of \"{subject}\"");
+    if let Err(error) = services
+        .store
+        .accepts()
+        .record(run_id, commit.to_hex(), message)
+        .await
+    {
+        tracing::warn!(run = %run_id, %error, "cannot record the accepted resolution");
+    }
+    services.publish(RunUpdate::Accepted {
+        run_id,
+        comment_id: None,
+        commit: *commit,
+    });
+}
+
+/// Ends a pull-before-push resolution: its worktree is deleted.
+async fn abandon(env: &AcceptEnv, id: ResolveId) {
+    let services = &env.services;
+    if let Some(session) = services.resolves.remove(id)
+        && let Err(error) = services.worktrees.remove(&session.worktree).await
+    {
+        tracing::warn!(resolve = %id, %error, "cannot remove the resolve worktree");
+    }
 }

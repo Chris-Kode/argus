@@ -12,8 +12,12 @@
 //! - the "No upstream" confirmation, which pushes with `--set-upstream` to
 //!   a remote picked from the list;
 //! - the one-time notice when the rebase moves a head branch checked out in
-//!   one of the user's checkouts (shared with Accept);
-//! - the conflict dialog of a pull-before-push rebase that conflicts.
+//!   one of the user's checkouts (shared with Accept).
+//!
+//! A rebase conflict is handed to the workspace ([`PushFlowEvent::Conflict`]),
+//! which opens the conflict dialog ([`crate::conflict`]). Accepting a
+//! pull-before-push resolution follows the continued Push here too
+//! ([`PushFlow::continue_push`]).
 //!
 //! Dropping the entity (or Cancel) drops the ticket, which stops the Push at
 //! its next step.
@@ -25,6 +29,7 @@ use argus_runs::{
     PushConflict, PushError, PushEvent, PushMode, PushOutcome, PushReport, PushRequest, PushStep,
     PushTicket,
 };
+use argus_store::RunId;
 use gpui::{
     AnyElement, ClipboardItem, Context, EventEmitter, FontWeight, MouseButton, SharedString, Task,
     Window, div, prelude::*, px,
@@ -32,8 +37,8 @@ use gpui::{
 use tokio::sync::oneshot;
 
 use crate::AppContext;
-use crate::components::{button, disabled_button, primary_button, toggle_button};
-use crate::runtime::spawn_job;
+use crate::components::{button, primary_button, toggle_button};
+use crate::runtime::{RuntimeJob, spawn_job};
 use crate::theme::ActiveTheme;
 
 /// Where the popover hangs, below the title bar.
@@ -47,6 +52,13 @@ pub enum PushFlowEvent {
     Finished,
     /// The last dialog closed; the focus goes back to the shell.
     DialogsClosed,
+    /// The rebase conflicts: open the conflict dialog.
+    Conflict {
+        /// The Push it belongs to.
+        request: Box<PushRequest>,
+        /// The conflict.
+        conflict: Box<PushConflict>,
+    },
     /// A message for the status bar.
     Notice {
         /// Text to show.
@@ -123,8 +135,6 @@ enum Dialog {
         path: PathBuf,
         reply: oneshot::Sender<bool>,
     },
-    /// The pull-before-push rebase conflicts.
-    Conflict(PushConflict),
 }
 
 /// The Push of the window, its popover and its dialogs.
@@ -218,31 +228,66 @@ impl PushFlow {
         let head = request.head.clone();
         let runs = cx.global::<AppContext>().runs.clone();
         let submit = spawn_job(cx, async move { runs.push(request) });
+        self.follow(head, submit, cx);
+    }
+
+    /// Accepts the proposal of a pull-before-push resolution (run
+    /// `run_id`, on `head`): the rebase continues with it, then, once it is
+    /// done, the head branch moves and the Push goes on, all followed in
+    /// the popover. A next conflicting commit opens the conflict dialog
+    /// again.
+    pub fn continue_push(&mut self, run_id: RunId, head: String, cx: &mut Context<Self>) {
+        if self.is_running() {
+            self.popover_open = true;
+            cx.emit(PushFlowEvent::Notice {
+                message: "A push is already running; accept the resolution once it ends.".into(),
+                is_error: false,
+            });
+            cx.notify();
+            return;
+        }
+        let runs = cx.global::<AppContext>().runs.clone();
+        let submit = spawn_job(cx, async move { runs.continue_push(run_id).await });
+        self.follow(head, submit, cx);
+    }
+
+    /// Follows a submitted Push in the popover until it ends.
+    fn follow(
+        &mut self,
+        head: String,
+        submit: RuntimeJob<Result<PushTicket, PushError>>,
+        cx: &mut Context<Self>,
+    ) {
         let task = cx.spawn(async move |this, cx| {
             let ticket = match submit.await {
                 Ok(Ok(ticket)) => ticket,
                 Ok(Err(error)) => {
-                    this.update(cx, |this, cx| this.finished(Err(error), cx))
+                    this.update(cx, |this, cx| this.finished(Err(error), None, cx))
                         .ok();
                     return;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "push submission task failed");
                     this.update(cx, |this, cx| {
-                        this.finished(Err(PushError::QueueClosed), cx)
+                        this.finished(Err(PushError::QueueClosed), None, cx)
                     })
                     .ok();
                     return;
                 }
             };
-            let PushTicket { mut events, result } = ticket;
+            let PushTicket {
+                request,
+                mut events,
+                result,
+            } = ticket;
             while let Some(event) = events.recv().await {
                 if this.update(cx, |this, cx| this.event(event, cx)).is_err() {
                     return;
                 }
             }
             let outcome = result.await.unwrap_or(Err(PushError::QueueClosed));
-            this.update(cx, |this, cx| this.finished(outcome, cx)).ok();
+            this.update(cx, |this, cx| this.finished(outcome, Some(request), cx))
+                .ok();
         });
         self.task = Some(task);
         self.progress = Some(Progress {
@@ -295,7 +340,12 @@ impl PushFlow {
         cx.notify();
     }
 
-    fn finished(&mut self, outcome: Result<PushOutcome, PushError>, cx: &mut Context<Self>) {
+    fn finished(
+        &mut self,
+        outcome: Result<PushOutcome, PushError>,
+        request: Option<PushRequest>,
+        cx: &mut Context<Self>,
+    ) {
         self.task = None;
         if matches!(self.dialog, Some(Dialog::CheckedOut { .. })) {
             self.dialog = None;
@@ -319,11 +369,24 @@ impl PushFlow {
                 (Status::Done(summary.clone()), summary, false)
             }
             Ok(PushOutcome::Conflict(conflict)) => {
-                let notice = format!(
-                    "`{}` does not rebase cleanly on `{}`; nothing was pushed.",
-                    conflict.head, conflict.upstream
-                );
-                self.dialog = Some(Dialog::Conflict(conflict));
+                let notice = match &conflict.resolve {
+                    None => format!(
+                        "`{}` does not rebase cleanly on `{}`; nothing was pushed.",
+                        conflict.head, conflict.upstream
+                    ),
+                    Some(progress) => format!(
+                        "The rebase of `{}` stopped at the next conflicting commit ({}); nothing \
+                         was pushed yet.",
+                        conflict.head,
+                        progress.commit.short(8)
+                    ),
+                };
+                if let Some(request) = request {
+                    cx.emit(PushFlowEvent::Conflict {
+                        request: Box::new(request),
+                        conflict: Box::new(conflict),
+                    });
+                }
                 (Status::Conflict, notice, true)
             }
             Ok(PushOutcome::Cancelled) => (
@@ -376,7 +439,6 @@ impl PushFlow {
             Dialog::CheckedOut { reply, .. } => {
                 let _ = reply.send(confirm);
             }
-            Dialog::Conflict(_) => {}
         }
         cx.emit(PushFlowEvent::DialogsClosed);
         cx.notify();
@@ -488,7 +550,7 @@ impl PushFlow {
                 div()
                     .text_sm()
                     .text_color(colors.error)
-                    .child("The rebase conflicts; it was aborted and nothing was pushed.")
+                    .child("The rebase conflicts; nothing was pushed. See the conflict dialog.")
                     .into_any_element(),
             ),
             Status::Cancelled => Some(
@@ -733,66 +795,6 @@ impl PushFlow {
             cx,
         )
     }
-
-    fn render_conflict(&self, conflict: &PushConflict, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let colors = &theme.colors;
-        let files = div()
-            .flex()
-            .flex_col()
-            .gap_0p5()
-            .font_family(theme.fonts.code_family.clone())
-            .text_sm()
-            .children(conflict.files.iter().map(|file| {
-                div()
-                    .text_color(colors.warning)
-                    .child(format!("U  {}", file.display()))
-            }));
-        let content = vec![
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors.text_muted)
-                .child(format!("OPERATION: {}", conflict.operation.to_uppercase()))
-                .into_any_element(),
-            div()
-                .text_sm()
-                .text_color(colors.text_muted)
-                .child(format!(
-                    "`{}` is behind `{}` ({}), and its commits do not rebase cleanly on the \
-                     remote's. The rebase was aborted: `{}` did not move ({}) and nothing was \
-                     pushed.",
-                    conflict.upstream,
-                    conflict.upstream,
-                    conflict.upstream_tip.short(8),
-                    conflict.head,
-                    conflict.head_tip.short(8),
-                ))
-                .into_any_element(),
-            files.into_any_element(),
-            div()
-                .text_xs()
-                .text_color(colors.text_placeholder)
-                .child(
-                    "Resolve it in your own checkout (git pull --rebase), then Push again. \
-                     Resolving with Claude from here is coming next.",
-                )
-                .into_any_element(),
-        ];
-        let actions = vec![
-            disabled_button("push-conflict-resolve", "Resolve with Claude", cx).into_any_element(),
-            primary_button("push-conflict-close", "Close", cx)
-                .on_click(cx.listener(|this, _, _, cx| this.close_dialog(false, cx)))
-                .into_any_element(),
-        ];
-        self.frame(
-            "push-conflict-dialog",
-            "Pull before push conflicts".into(),
-            content,
-            actions,
-            cx,
-        )
-    }
 }
 
 /// `Pushed feature to origin/feature (abc12345)`, with the rebase and retry
@@ -836,10 +838,6 @@ impl Render for PushFlow {
             Some(Dialog::CheckedOut { head, path, .. }) => {
                 let (head, path) = (head.clone(), path.clone());
                 return self.render_checked_out(&head, &path, cx);
-            }
-            Some(Dialog::Conflict(conflict)) => {
-                let conflict = conflict.clone();
-                return self.render_conflict(&conflict, cx);
             }
             None => {}
         }

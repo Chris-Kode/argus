@@ -5,11 +5,14 @@
 //! detection and blob reads for the diff engine). Writes go through the
 //! [`cli`] wrapper: [`write`] creates tracking branches and [`worktrees`]
 //! manages the run and integration worktrees under `~/.argus/worktrees/`;
+//! [`conflicts`] rebuilds a conflicted Accept or rebase in a resolve
+//! worktree and finds the conflict markers left in it;
 //! [`push`] holds the fetch, count and push steps of the Push button.
 //! Nothing here ever reads or modifies a user's working checkout.
 
 mod cancel;
 pub mod cli;
+pub mod conflicts;
 mod error;
 pub mod objects;
 pub mod push;
@@ -23,6 +26,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 pub use cancel::{CancelGuard, CancelToken};
 pub use cli::{GitCli, GitOutput};
+pub use conflicts::{ConflictMarker, ConflictedApply, RebaseStep, RebaseStop};
 pub use error::{GitError, Result};
 pub use read::{Branch, BranchKind, Checkout, Repo, RepoId, Sha};
 pub use worktrees::{

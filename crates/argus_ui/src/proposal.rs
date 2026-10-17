@@ -24,6 +24,14 @@
 //! watcher on the worktree takes a new snapshot after manual
 //! edits, so the diff follows them. Every git call runs on the tokio
 //! runtime; this view only stores results.
+//!
+//! A conflict resolution (spec §6.6) shows what it resolves and the
+//! conflict markers still in its worktree, which block Accept. The
+//! resolution of an Accept conflict belongs to its comment and is
+//! accepted like any proposal; Reject keeps the comment's original
+//! proposal. The resolution of a pull-before-push rebase has no comment:
+//! Accept continues the rebase and the Push ([`ProposalEvent::ContinuePush`])
+//! and Reject cancels the rebase and abandons the Push.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -32,7 +40,7 @@ use std::time::Duration;
 
 use argus_diff::Side as DiffSide;
 use argus_diff::review::{CommentId, CommentStatus, ReplyAuthor};
-use argus_runs::{AcceptStage, Proposal, RunUpdate};
+use argus_runs::{AcceptStage, Proposal, Resolution, RunUpdate};
 use argus_store::{RunId, RunStatus};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, SharedString,
@@ -79,10 +87,21 @@ pub enum ProposalEvent {
     },
     /// Accept was asked for the run.
     AcceptRequested(RunId),
+    /// Accept was asked for a pull-before-push resolution: continue the
+    /// rebase with it, then the Push.
+    ContinuePush {
+        /// The run whose proposal is accepted.
+        run_id: RunId,
+        /// The head branch.
+        head: String,
+    },
+    /// The proposal was accepted (committed, or its rebase continued); the
+    /// tab closes.
+    Accepted(RunId),
     /// The user replied to the proposal; the reply is saved in the thread.
     Replied {
-        /// The comment.
-        comment_id: CommentId,
+        /// The comment; `None` for a pull-before-push resolution.
+        comment_id: Option<CommentId>,
         /// The follow-up run the reply started; `None` for a note only.
         followup: Option<RunId>,
     },
@@ -209,7 +228,11 @@ impl ProposalView {
         };
         match source {
             ProposalSource::Run(run_id) => loaded.proposal.run.id == run_id,
-            ProposalSource::Comment(id) => loaded.proposal.comment.id == id,
+            ProposalSource::Comment(id) => loaded
+                .proposal
+                .comment
+                .as_ref()
+                .is_some_and(|comment| comment.id == id),
         }
     }
 
@@ -217,13 +240,24 @@ impl ProposalView {
     pub fn title(&self) -> SharedString {
         match &self.state {
             State::Ready(loaded) => {
-                let anchor = &loaded.proposal.comment.anchor;
-                let name = anchor
-                    .file_path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&anchor.file_path);
-                format!("Proposal · {name}:{}", anchor.start_line).into()
+                let proposal = &loaded.proposal;
+                let kind = if proposal.resolution.is_some() {
+                    "Resolution"
+                } else {
+                    "Proposal"
+                };
+                match &proposal.comment {
+                    Some(comment) => {
+                        let anchor = &comment.anchor;
+                        let name = anchor
+                            .file_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&anchor.file_path);
+                        format!("{kind} · {name}:{}", anchor.start_line).into()
+                    }
+                    None => format!("{kind} · pull before push · {}", proposal.head).into(),
+                }
             }
             State::Failed(_) => "Proposal (error)".into(),
             State::Loading => "Proposal…".into(),
@@ -348,12 +382,10 @@ impl ProposalView {
             cx.notify();
             return;
         }
-        let body = proposal.comment.body_md.clone();
-        self.body_doc = Some(self.markdown.prepare(
-            &body,
-            |this: &mut Self| &mut this.markdown,
-            cx,
-        ));
+        self.body_doc = proposal.comment.as_ref().map(|comment| {
+            self.markdown
+                .prepare(&comment.body_md, |this: &mut Self| &mut this.markdown, cx)
+        });
         self.summary_doc = proposal.run.summary.as_deref().map(|summary| {
             self.markdown
                 .prepare(summary, |this: &mut Self| &mut this.markdown, cx)
@@ -478,11 +510,14 @@ impl ProposalView {
                 self.state = State::Accepted;
                 self.watch_task = None;
                 self.refresh_task = None;
+                cx.emit(ProposalEvent::Accepted(run_id));
                 cx.notify();
             }
             return;
         }
-        let comment_id = self.loaded().map(|loaded| loaded.proposal.comment.id);
+        let comment_id = self
+            .loaded()
+            .and_then(|loaded| loaded.proposal.comment.as_ref().map(|comment| comment.id));
         match update {
             RunUpdate::Rejected { run_id, .. } => {
                 let ours = self
@@ -506,7 +541,9 @@ impl ProposalView {
                 cx.notify();
             }
             RunUpdate::Finished(finished)
-                if finished.comment_id.is_some() && finished.comment_id == comment_id =>
+                if (finished.comment_id.is_some() && finished.comment_id == comment_id)
+                    || (finished.comment_id.is_none()
+                        && Some(finished.run_id) == self.followup_run) =>
             {
                 self.followup_run = None;
                 self.session_lost = finished.session_not_found;
@@ -519,6 +556,11 @@ impl ProposalView {
                 if let Some(id) = comment_id {
                     self.source = ProposalSource::Comment(id);
                     self.load(cx);
+                } else {
+                    if matches!(finished.status, RunStatus::Succeeded | RunStatus::Stopped) {
+                        self.source = ProposalSource::Run(finished.run_id);
+                    }
+                    self.load(cx);
                 }
                 cx.notify();
             }
@@ -529,9 +571,13 @@ impl ProposalView {
     /// Whether a follow-up is running in this proposal's worktree.
     fn followup_running(&self) -> bool {
         self.followup_run.is_some()
-            || self
-                .loaded()
-                .is_some_and(|loaded| loaded.proposal.comment.status == CommentStatus::Running)
+            || self.loaded().is_some_and(|loaded| {
+                loaded
+                    .proposal
+                    .comment
+                    .as_ref()
+                    .is_some_and(|comment| comment.status == CommentStatus::Running)
+            })
     }
 
     fn loaded(&self) -> Option<&Loaded> {
@@ -554,14 +600,31 @@ impl ProposalView {
         if self.accepting.is_some() || self.rejecting {
             return;
         }
-        let Some(run_id) = self.loaded().map(|loaded| loaded.proposal.run.id) else {
+        let Some(loaded) = self.loaded() else {
             return;
         };
+        let run_id = loaded.proposal.run.id;
+        let continue_push = loaded
+            .proposal
+            .is_rebase_resolution()
+            .then(|| loaded.proposal.head.clone());
+        let markers = markers_summary(&loaded.proposal);
         if self.followup_running() {
             self.notice("Wait for the follow-up run to finish.", false, cx);
             return;
         }
-        cx.emit(ProposalEvent::AcceptRequested(run_id));
+        if let Some(markers) = markers {
+            self.notice(
+                format!("Accept is blocked: conflict markers remain at {markers}."),
+                true,
+                cx,
+            );
+            return;
+        }
+        match continue_push {
+            Some(head) => cx.emit(ProposalEvent::ContinuePush { run_id, head }),
+            None => cx.emit(ProposalEvent::AcceptRequested(run_id)),
+        }
     }
 
     /// `x` / Reject: asks first; a second `x` (or the button) confirms.
@@ -694,8 +757,18 @@ impl ProposalView {
         if body.is_empty() {
             return;
         }
-        let comment_id = loaded.proposal.comment.id;
+        let comment_id = loaded.proposal.comment.as_ref().map(|comment| comment.id);
+        let run_id = loaded.proposal.run.id;
         let followup = !note_only;
+        if comment_id.is_none() && note_only {
+            self.notice(
+                "This resolution has no comment thread to add a note to; send the reply as a \
+                 follow-up run.",
+                false,
+                cx,
+            );
+            return;
+        }
         if followup && self.followup_running() {
             self.notice(
                 "A follow-up is already running; add the reply as a note, or wait.",
@@ -706,11 +779,15 @@ impl ProposalView {
         }
         let task: Task<Result<Option<RunId>, String>> = if followup {
             let choice = followup::current(cx);
-            let start =
-                followup::spawn_followup(comment_id, FollowupKind::Resume(body), choice, cx);
+            let start = match comment_id {
+                Some(comment_id) => {
+                    followup::spawn_followup(comment_id, FollowupKind::Resume(body), choice, cx)
+                }
+                None => followup::spawn_run_followup(run_id, body, choice, cx),
+            };
             cx.background_executor()
                 .spawn(async move { start.await.map(Some) })
-        } else {
+        } else if let Some(comment_id) = comment_id {
             let comments = cx.global::<AppContext>().store.comments();
             let handle = cx.global::<AppContext>().runtime.spawn(async move {
                 comments
@@ -724,6 +801,8 @@ impl ProposalView {
                     Err(error) => Err(error.to_string()),
                 }
             })
+        } else {
+            return;
         };
         self.sending_reply = true;
         self.action_task = Some(cx.spawn(async move |this, cx| {
@@ -767,7 +846,10 @@ impl ProposalView {
     /// Runs the follow-up fresh, with the thread as context, after a resume
     /// found no session.
     fn run_fresh(&mut self, cx: &mut Context<Self>) {
-        let Some(comment_id) = self.loaded().map(|loaded| loaded.proposal.comment.id) else {
+        let Some(comment_id) = self
+            .loaded()
+            .and_then(|loaded| loaded.proposal.comment.as_ref().map(|comment| comment.id))
+        else {
             return;
         };
         if self.followup_running() || self.sending_reply {
@@ -785,7 +867,7 @@ impl ProposalView {
                         this.followup_run = Some(run_id);
                         this.session_lost = false;
                         cx.emit(ProposalEvent::Replied {
-                            comment_id,
+                            comment_id: Some(comment_id),
                             followup: Some(run_id),
                         });
                     }
@@ -842,12 +924,27 @@ impl ProposalView {
     }
 
     /// Opens the commented file, or the first changed file when the
-    /// commented one is gone.
+    /// commented one is gone. A resolution without a comment opens the
+    /// shown file, or its first conflicted file.
     fn open_commented_file(&mut self, cx: &mut Context<Self>) {
         let Some(loaded) = self.loaded() else {
             return;
         };
-        let path = loaded.proposal.comment.anchor.file_path.clone();
+        let Some(comment) = loaded.proposal.comment.as_ref() else {
+            let first_conflicted = match &loaded.proposal.resolution {
+                Some(Resolution::Rebase(rebase)) => rebase
+                    .files
+                    .first()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                _ => None,
+            };
+            match loaded.view.read(cx).active_path().or(first_conflicted) {
+                Some(path) => self.open_in_editor(path, cx),
+                None => self.notice("Select a file of the proposal first.", false, cx),
+            }
+            return;
+        };
+        let path = comment.anchor.file_path.clone();
         let fallback = loaded
             .view
             .read(cx)
@@ -862,35 +959,110 @@ impl ProposalView {
         let theme = cx.theme().clone();
         let colors = &theme.colors;
         let proposal = &loaded.proposal;
-        let comment = &proposal.comment;
         let run = &proposal.run;
-        let comment_id = comment.id;
-        let anchor = &comment.anchor;
-        let lines = if anchor.end_line > anchor.start_line {
-            format!("lines {}–{}", anchor.start_line, anchor.end_line)
-        } else {
-            format!("line {}", anchor.start_line)
+        let label = |text: &'static str| {
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors.text_muted)
+                .child(text)
         };
-        let side = match anchor.side {
-            DiffSide::Old => "old side",
-            DiffSide::New => "new side",
+        let banner = |id: &'static str, text: String, tint: gpui::Hsla| {
+            div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(tint.opacity(0.4))
+                .bg(tint.opacity(0.1))
+                .text_xs()
+                .text_color(tint)
+                .child(text)
         };
-        let location = div()
-            .id("proposal-location")
-            .flex_none()
-            .max_w_full()
-            .overflow_hidden()
-            .text_ellipsis()
-            .whitespace_nowrap()
-            .cursor_pointer()
-            .font_family(theme.fonts.code_family.clone())
-            .text_xs()
-            .text_color(colors.accent)
-            .hover(|style| style.underline())
-            .on_click(cx.listener(move |_, _, _, cx| {
-                cx.emit(ProposalEvent::RevealComment(comment_id));
-            }))
-            .child(format!("{}  {lines} · {side}  ↗", anchor.file_path));
+
+        let comment_section = proposal.comment.as_ref().map(|comment| {
+            let comment_id = comment.id;
+            let anchor = &comment.anchor;
+            let lines = if anchor.end_line > anchor.start_line {
+                format!("lines {}–{}", anchor.start_line, anchor.end_line)
+            } else {
+                format!("line {}", anchor.start_line)
+            };
+            let side = match anchor.side {
+                DiffSide::Old => "old side",
+                DiffSide::New => "new side",
+            };
+            let location = div()
+                .id("proposal-location")
+                .flex_none()
+                .max_w_full()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .cursor_pointer()
+                .font_family(theme.fonts.code_family.clone())
+                .text_xs()
+                .text_color(colors.accent)
+                .hover(|style| style.underline())
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(ProposalEvent::RevealComment(comment_id));
+                }))
+                .child(format!("{}  {lines} · {side}  ↗", anchor.file_path));
+            let body = match &self.body_doc {
+                Some(doc) => markdown::render(doc, "proposal-comment".into(), cx),
+                None => div().child(comment.body_md.clone()).into_any_element(),
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .child(label("COMMENT"))
+                        .child(location),
+                )
+                .child(body)
+        });
+
+        let resolution = proposal.resolution.as_ref().map(|resolution| {
+            let text = match resolution {
+                Resolution::Accept => format!(
+                    "Conflict resolution: the comment's proposal conflicted with `{}`. This \
+                     proposal re-applies it on {} with the conflicts resolved. Accept commits \
+                     it with the comment's subject; Reject keeps the original proposal.",
+                    proposal.head,
+                    proposal.start_sha.short(8)
+                ),
+                Resolution::Rebase(rebase) => format!(
+                    "Pull before push: rebasing `{}` onto `{}` stopped at local commit {} \
+                     “{}” (commit {}). This proposal is its resolution, on top of the commits \
+                     replayed so far. Accept continues the rebase (`git rebase --continue`), \
+                     then the push; Reject cancels the rebase and abandons the push. Nothing \
+                     has moved yet.",
+                    rebase.head,
+                    rebase.upstream,
+                    rebase.commit.short(8),
+                    rebase.subject,
+                    rebase.resolved + 1
+                ),
+            };
+            banner("proposal-resolution", text, colors.accent)
+        });
+        let markers = markers_summary(proposal).map(|markers| {
+            banner(
+                "proposal-markers",
+                format!(
+                    "Conflict markers remain at {markers}. Accept is blocked until they are \
+                     resolved: reply to Claude, or open the file in your editor."
+                ),
+                colors.error,
+            )
+        });
 
         let mut meta = vec![run.model.clone()];
         if !run.effort.trim().is_empty() {
@@ -920,20 +1092,9 @@ impl ProposalView {
             .child(meta.join(" · "))
             .children(status_note);
 
-        let banner = |id: &'static str, text: String, tint: gpui::Hsla| {
-            div()
-                .id(id)
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .border_color(tint.opacity(0.4))
-                .bg(tint.opacity(0.1))
-                .text_xs()
-                .text_color(tint)
-                .child(text)
-        };
-        let moved = proposal.head_moved().then(|| {
+        // A rebase resolution starts from the rebased commits, never the
+        // head tip: the banner would always show.
+        let moved = (proposal.head_moved() && !proposal.is_rebase_resolution()).then(|| {
             banner(
                 "proposal-head-moved",
                 "The head branch has moved since this run started; Accept will try to apply on \
@@ -954,17 +1115,6 @@ impl ProposalView {
             )
         });
 
-        let label = |text: &'static str| {
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors.text_muted)
-                .child(text)
-        };
-        let body = match &self.body_doc {
-            Some(doc) => markdown::render(doc, "proposal-comment".into(), cx),
-            None => div().child(comment.body_md.clone()).into_any_element(),
-        };
         let summary = match (&self.summary_doc, &run.summary) {
             (Some(doc), _) => markdown::render(doc, "proposal-summary".into(), cx),
             (None, Some(text)) => div().child(text.clone()).into_any_element(),
@@ -988,22 +1138,9 @@ impl ProposalView {
             .border_color(colors.border_variant)
             .bg(colors.surface)
             .text_sm()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .min_w_0()
-                            .child(label("COMMENT"))
-                            .child(location),
-                    )
-                    .child(body),
-            )
+            .children(comment_section)
+            .children(resolution)
+            .children(markers)
             .child(meta_row)
             .children(moved)
             .children(scope)
@@ -1021,6 +1158,29 @@ impl ProposalView {
     fn render_actions(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let running = self.followup_running();
+        let proposal = self.loaded().map(|loaded| &loaded.proposal);
+        let has_comment = proposal.is_some_and(|proposal| proposal.comment.is_some());
+        let rebase = proposal.is_some_and(Proposal::is_rebase_resolution);
+        let blocked = proposal.is_some_and(|proposal| !proposal.markers.is_empty());
+        let reject_text = match proposal.and_then(|proposal| proposal.resolution.as_ref()) {
+            None => {
+                "Reject this proposal? Its worktree is deleted and the comment goes back to \
+                     Open."
+            }
+            Some(Resolution::Accept) => {
+                "Reject this resolution? Its worktree is deleted; the comment keeps its original \
+                 proposal."
+            }
+            Some(Resolution::Rebase(_)) => {
+                "Reject this resolution? The rebase is cancelled, its worktree deleted and the \
+                 push abandoned; nothing moved."
+            }
+        };
+        let accept_label = if rebase {
+            "Accept & continue push"
+        } else {
+            "Accept"
+        };
         let busy = self.rejecting || self.load_task.is_some() || running;
         let reject = if self.accepting.is_some() {
             disabled_button("proposal-reject", "Reject", cx).into_any_element()
@@ -1046,9 +1206,12 @@ impl ProposalView {
             )
             .into_any_element()
         } else if busy {
-            disabled_button("proposal-accept", "Accept", cx).into_any_element()
+            disabled_button("proposal-accept", accept_label, cx).into_any_element()
+        } else if blocked {
+            disabled_button("proposal-accept", "Accept (conflict markers remain)", cx)
+                .into_any_element()
         } else {
-            primary_button("proposal-accept", "Accept", cx)
+            primary_button("proposal-accept", accept_label, cx)
                 .h(px(24.0))
                 .gap_1()
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(Accept), cx))
@@ -1085,8 +1248,7 @@ impl ProposalView {
                         .min_w_0()
                         .text_color(colors.text)
                         .child(format!(
-                            "Reject this proposal? Its worktree is deleted and the comment goes \
-                             back to Open. Press {} again to confirm.",
+                            "{reject_text} Press {} again to confirm.",
                             shortcut_keys::<RejectProposal>()
                         )),
                 )
@@ -1172,7 +1334,7 @@ impl ProposalView {
                         .on_click(cx.listener(|this, _, _, cx| this.send_reply(cx)))
                         .into_any_element()
                 };
-                let note = if self.sending_reply {
+                let note = if self.sending_reply || !has_comment {
                     None
                 } else {
                     Some(
@@ -1374,4 +1536,24 @@ fn shortcut_keys<A: gpui::Action>() -> String {
         .find(|shortcut| shortcut.binding().action().as_any().is::<A>())
         .map(|shortcut| shortcut.display_keys())
         .unwrap_or_default()
+}
+
+/// The first conflict markers left in a resolution (`a.rs:3, b.rs:10 and 2
+/// more`), or `None` when there are none.
+fn markers_summary(proposal: &Proposal) -> Option<String> {
+    const LISTED: usize = 4;
+    let markers = &proposal.markers;
+    if markers.is_empty() {
+        return None;
+    }
+    let mut text = markers
+        .iter()
+        .take(LISTED)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if markers.len() > LISTED {
+        text.push_str(&format!(" and {} more", markers.len() - LISTED));
+    }
+    Some(text)
 }

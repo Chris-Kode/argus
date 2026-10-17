@@ -11,6 +11,7 @@ pub mod claude_status;
 pub mod comment_list;
 pub mod comments;
 pub mod components;
+pub mod conflict;
 pub mod diff_view;
 pub mod file_tree;
 pub mod followup;

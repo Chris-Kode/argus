@@ -9,18 +9,27 @@
 //! [`refresh`] takes a new snapshot after a manual edit, and [`watch`]
 //! reports such edits. [`reject`] deletes the worktree, records the run as
 //! `Rejected` and moves the comment back to `Open`.
+//!
+//! A conflict resolution ([`crate::resolve`]) is a proposal too. One for an
+//! Accept conflict belongs to the comment; rejecting it leaves the comment
+//! `Proposed` with its original proposal. One for a pull-before-push rebase
+//! has no comment: its repository and head branch come from the
+//! resolution in progress, and rejecting it cancels that resolution (the
+//! Push is abandoned). Either carries the conflict markers still in its
+//! worktree ([`Proposal::markers`]), which block its Accept.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use argus_diff::review::{Comment, CommentEvent, ReviewError, apply_event};
 use argus_diff::{DiffOptions, DiffSession};
-use argus_git::{GitError, Repo, Sha, Worktree, read};
+use argus_git::{ConflictMarker, GitError, Repo, Sha, Worktree, read};
 use argus_store::{CommentId, CommentStatus, Run, RunId, RunStatus, StoreError};
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecursiveMode, Watcher as _};
 use tokio::sync::mpsc;
 
+use crate::resolve::Resolution;
 use crate::run::{RunUpdate, Services};
 
 /// How often a worktree is polled when no file watcher can be installed.
@@ -55,6 +64,16 @@ pub enum ProposalError {
     /// The run's worktree was deleted.
     #[error("the worktree of run {0} no longer exists")]
     WorktreeGone(RunId),
+    /// The pull-before-push resolution of a comment-less run is no longer
+    /// in progress (cancelled, failed, or Argus restarted).
+    #[error(
+        "the pull before push this resolution belongs to is no longer in progress; Push again \
+         to start over"
+    )]
+    ResolveGone(RunId),
+    /// Cancelling a pull-before-push resolution failed.
+    #[error("{0}")]
+    Resolve(String),
     /// A git operation failed.
     #[error(transparent)]
     Git(#[from] GitError),
@@ -73,8 +92,16 @@ pub enum ProposalError {
 pub struct Proposal {
     /// The run, as stored when the proposal was opened.
     pub run: Run,
-    /// The comment the run worked on (without its replies).
-    pub comment: Comment,
+    /// The comment the run worked on (without its replies); `None` for the
+    /// resolution of a pull-before-push rebase.
+    pub comment: Option<Comment>,
+    /// The head branch the change lands on.
+    pub head: String,
+    /// What the proposal resolves, when it is a conflict resolution.
+    pub resolution: Option<Resolution>,
+    /// The conflict markers left in the worktree (resolutions only); while
+    /// there are any, Accept is refused.
+    pub markers: Vec<ConflictMarker>,
     /// The repository.
     pub repo: Repo,
     /// The run's worktree.
@@ -90,6 +117,17 @@ pub struct Proposal {
     pub session: DiffSession,
 }
 
+/// The run, its comment (if any), repository, worktree, head branch and
+/// resolution, checked for review.
+struct Parts {
+    run: Run,
+    comment: Option<Comment>,
+    repo: Repo,
+    worktree: Worktree,
+    head: String,
+    resolution: Option<Resolution>,
+}
+
 impl Proposal {
     /// Whether the head branch moved since the run started (e.g. another
     /// Accept landed); Accept then applies on top of the new tip.
@@ -98,9 +136,15 @@ impl Proposal {
     }
 
     /// The paths the comment covers: its file, and its old path for a
-    /// rename.
+    /// rename. Empty without a comment.
     pub fn scope(&self) -> Vec<String> {
-        scope_of(&self.comment)
+        self.comment.as_ref().map(scope_of).unwrap_or_default()
+    }
+
+    /// Whether this resolution resolves a pull-before-push rebase: its
+    /// Accept continues the rebase and the Push.
+    pub fn is_rebase_resolution(&self) -> bool {
+        matches!(self.resolution, Some(Resolution::Rebase(_)))
     }
 
     /// Absolute path of `path` (relative to the repository root) in the
@@ -179,10 +223,91 @@ pub(crate) async fn load_parts(
     ))
 }
 
+/// [`load_parts`] for any reviewable run, with or without a comment.
+async fn load_any(services: &Services, run_id: RunId) -> Result<Parts, ProposalError> {
+    let run = services
+        .store
+        .runs()
+        .get(run_id)
+        .await?
+        .ok_or(ProposalError::RunNotFound(run_id))?;
+    if run.comment_id.is_some() {
+        let (run, comment, repo, worktree) = load_parts(services, run_id).await?;
+        let resolution = crate::resolve::resolution_of(services, &run).await?;
+        return Ok(Parts {
+            head: comment.head_ref.clone(),
+            run,
+            comment: Some(comment),
+            repo,
+            worktree,
+            resolution,
+        });
+    }
+    if !reviewable(run.status) {
+        return Err(ProposalError::NotReviewable {
+            run_id,
+            status: run.status,
+        });
+    }
+    let (repo, head) = crate::resolve::rebase_target(services, &run.worktree_path)
+        .ok_or(ProposalError::ResolveGone(run_id))?;
+    let worktree = services
+        .worktrees
+        .worktree_at(&repo, run.worktree_path.clone())?;
+    let resolution = crate::resolve::resolution_of(services, &run).await?;
+    Ok(Parts {
+        run,
+        comment: None,
+        repo,
+        worktree,
+        head,
+        resolution,
+    })
+}
+
+/// The conflict markers left in a resolution's worktree; none for other
+/// proposals.
+async fn markers_of(
+    services: &Services,
+    worktree: &Worktree,
+    start_sha: &Sha,
+    resolution: Option<&Resolution>,
+) -> Result<Vec<ConflictMarker>, GitError> {
+    let scan = match resolution {
+        None => return Ok(Vec::new()),
+        Some(Resolution::Accept) => Vec::new(),
+        Some(Resolution::Rebase(rebase)) => rebase.files.clone(),
+    };
+    services
+        .worktrees
+        .conflict_markers(worktree, start_sha, &scan)
+        .await
+}
+
+fn diff_session(repo: &Repo, start_sha: Sha, tree: Sha, comment: Option<&Comment>) -> DiffSession {
+    match comment {
+        Some(comment) => DiffSession::scoped(
+            repo,
+            start_sha,
+            tree,
+            DiffOptions::default(),
+            scope_of(comment),
+        ),
+        None => DiffSession::between(repo, start_sha, tree, DiffOptions::default()),
+    }
+}
+
 /// Opens the proposal of `run_id`: snapshots its worktree and prepares the
 /// diff. Runs on the tokio runtime.
 pub(crate) async fn open(services: &Services, run_id: RunId) -> Result<Proposal, ProposalError> {
-    let (run, comment, repo, worktree) = load_parts(services, run_id).await?;
+    let Parts {
+        run,
+        comment,
+        repo,
+        worktree,
+        head,
+        resolution,
+    } = load_any(services, run_id).await?;
     if !worktree.path().is_dir() {
         return Err(ProposalError::WorktreeGone(run_id));
     }
@@ -191,18 +316,16 @@ pub(crate) async fn open(services: &Services, run_id: RunId) -> Result<Proposal,
         message: format!("not an object id: `{}`", run.start_sha),
     })?;
     let tree = services.worktrees.snapshot_tree(&worktree).await?;
-    let head_tip = head_tip(&repo, &comment.head_ref).await;
-    let session = DiffSession::scoped(
-        &repo,
-        start_sha,
-        tree,
-        DiffOptions::default(),
-        scope_of(&comment),
-    );
+    let markers = markers_of(services, &worktree, &start_sha, resolution.as_ref()).await?;
+    let head_tip = head_tip(&repo, &head).await;
+    let session = diff_session(&repo, start_sha, tree, comment.as_ref());
     tracing::debug!(run = %run_id, %start_sha, %tree, "opened proposal");
     Ok(Proposal {
         run,
         comment,
+        head,
+        resolution,
+        markers,
         repo,
         worktree,
         start_sha,
@@ -222,26 +345,34 @@ pub(crate) async fn refresh(
         return Err(ProposalError::WorktreeGone(proposal.run.id));
     }
     let tree = services.worktrees.snapshot_tree(&proposal.worktree).await?;
-    let head_tip = head_tip(&proposal.repo, &proposal.comment.head_ref).await;
+    let head_tip = head_tip(&proposal.repo, &proposal.head).await;
     if tree == proposal.tree && head_tip == proposal.head_tip {
         return Ok(None);
     }
-    let session = if tree == proposal.tree {
-        proposal.session.clone()
+    let (session, markers) = if tree == proposal.tree {
+        (proposal.session.clone(), proposal.markers.clone())
     } else {
         tracing::debug!(run = %proposal.run.id, %tree, "proposal changed on disk");
-        DiffSession::scoped(
+        let markers = markers_of(
+            services,
+            &proposal.worktree,
+            &proposal.start_sha,
+            proposal.resolution.as_ref(),
+        )
+        .await?;
+        let session = diff_session(
             &proposal.repo,
             proposal.start_sha,
             tree,
-            DiffOptions::default(),
-            proposal.scope(),
-        )
+            proposal.comment.as_ref(),
+        );
+        (session, markers)
     };
     Ok(Some(Proposal {
         tree,
         head_tip,
         session,
+        markers,
         ..proposal.clone()
     }))
 }
@@ -267,7 +398,25 @@ pub(crate) async fn reject(services: &Services, run_id: RunId) -> Result<(), Pro
             status: RunStatus::Running,
         });
     }
+    let stored = services
+        .store
+        .runs()
+        .get(run_id)
+        .await?
+        .ok_or(ProposalError::RunNotFound(run_id))?;
+    if stored.comment_id.is_none() {
+        // A pull-before-push resolution: rejecting it cancels the
+        // resolution and abandons the Push.
+        let (id, _) = services
+            .resolves
+            .find_by_worktree(&stored.worktree_path)
+            .ok_or(ProposalError::ResolveGone(run_id))?;
+        return crate::resolve::cancel_rebase(services, id)
+            .await
+            .map_err(|error| ProposalError::Resolve(error.to_string()));
+    }
     let (run, comment, _, worktree) = load_parts(services, run_id).await?;
+    let resolution = crate::resolve::resolution_of(services, &run).await?;
     // A follow-up may be editing the same worktree.
     if comment.status == CommentStatus::Running {
         return Err(ProposalError::NotReviewable {
@@ -294,7 +443,9 @@ pub(crate) async fn reject(services: &Services, run_id: RunId) -> Result<(), Pro
         }
     }
     let comments = services.store.comments();
-    if comment.status == CommentStatus::Proposed {
+    // A rejected resolution leaves the comment's original proposal (and the
+    // comment `Proposed`).
+    if comment.status == CommentStatus::Proposed && resolution.is_none() {
         apply_event(&comments, comment.id, CommentEvent::Rejected).await?;
     }
     tracing::info!(run = %run_id, comment = %comment.id, "rejected proposal");

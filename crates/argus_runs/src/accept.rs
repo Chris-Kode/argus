@@ -18,7 +18,10 @@
 //!    to continue; the answer is remembered per repository. That checkout is
 //!    never touched.
 //! 2. The proposal patch: `git add -A` + `git diff --cached --binary
-//!    <start_sha>` in the run's worktree.
+//!    <start_sha>` in the run's worktree. The proposal of a resolve run
+//!    ([`crate::resolve`]) must hold no conflict marker (`git diff --check`
+//!    and a scan of its files); otherwise the Accept fails with
+//!    [`AcceptError::MarkersRemain`].
 //! 3. The `_integration` worktree is reset to the head tip, and the patch
 //!    applied with `git apply --3way --index`. A conflict resets it again
 //!    and ends the Accept with [`AcceptOutcome::Conflict`]; nothing else
@@ -35,8 +38,10 @@
 //!    When the branch moved meanwhile, steps 3–7 run once more on the new
 //!    tip with the message already chosen, then the Accept fails.
 //! 8. The accept is recorded, the comment becomes `Resolved`, the run's
-//!    worktree is deleted and [`RunUpdate::Accepted`] is published, so the
-//!    views refresh the diff, re-anchor comments and update the Push counts.
+//!    worktree is deleted (with the comment's other proposal worktrees,
+//!    e.g. the original proposal of an accepted resolution) and
+//!    [`RunUpdate::Accepted`] is published, so the views refresh the diff,
+//!    re-anchor comments and update the Push counts.
 //!
 //! The user's checkout (files and index) is never read or written, and
 //! nothing is pushed.
@@ -49,8 +54,11 @@ use std::time::Duration;
 
 use argus_diff::review::{Comment, CommentEvent, ReviewError, apply_event};
 use argus_git::write::{self, RefUpdate};
-use argus_git::{ApplyOutcome, CommitOutcome, GitError, Repo, RepoId, Sha, Worktree, read};
-use argus_store::{CommentId, CommentStatus, RunId, StoreError};
+use argus_git::{
+    ApplyOutcome, ChangeKind, CommitOutcome, ConflictMarker, GitError, Repo, RepoId, Sha, Worktree,
+    read,
+};
+use argus_store::{CommentId, CommentStatus, RunId, RunStatus, StoreError};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -124,6 +132,30 @@ pub enum AcceptError {
     /// The accept queue of the repository stopped.
     #[error("the accept queue stopped")]
     QueueClosed,
+    /// The conflict resolution still has conflict markers; nothing was
+    /// committed.
+    #[error("{}", markers_message(.0))]
+    MarkersRemain(Vec<ConflictMarker>),
+}
+
+/// How many marker locations an error names before "and N more".
+const MARKERS_LISTED: usize = 5;
+
+/// "Conflict markers remain in a.rs:3, b.rs:10 …; resolve them first".
+pub(crate) fn markers_message(markers: &[ConflictMarker]) -> String {
+    let mut listed: Vec<String> = markers
+        .iter()
+        .take(MARKERS_LISTED)
+        .map(ToString::to_string)
+        .collect();
+    if markers.len() > MARKERS_LISTED {
+        listed.push(format!("and {} more", markers.len() - MARKERS_LISTED));
+    }
+    format!(
+        "Accept is blocked: conflict markers remain at {}. Reply to Claude or edit the files, \
+         then accept again.",
+        listed.join(", ")
+    )
 }
 
 /// Where an Accept is, for the "Accepting…" indicator.
@@ -268,6 +300,8 @@ pub struct AcceptConflict {
     pub run_id: RunId,
     /// Its comment.
     pub comment_id: CommentId,
+    /// The comment's first line, to name it in the conflict dialog.
+    pub comment_label: String,
     /// The head branch.
     pub head: String,
     /// The head tip the patch was applied on.
@@ -311,7 +345,7 @@ pub(crate) enum QueueJob {
     /// Commit a proposal.
     Accept(Job),
     /// Pull with rebase if needed, then push.
-    Push(crate::push::PushJob),
+    Push(Box<crate::push::PushJob>),
 }
 
 type Queues = HashMap<RepoId, mpsc::UnboundedSender<QueueJob>>;
@@ -423,7 +457,7 @@ async fn queue_loop(
         let job = match job {
             QueueJob::Accept(job) => job,
             QueueJob::Push(job) => {
-                crate::push::run_job(&env, job).await;
+                crate::push::run_job(&env, *job).await;
                 continue;
             }
         };
@@ -494,6 +528,24 @@ async fn accept(
         return Err(AcceptError::EmptyProposal);
     }
     let files: Vec<PathBuf> = patch.files.iter().map(|file| file.path.clone()).collect();
+    if crate::resolve::resolution_of(services, &run)
+        .await?
+        .is_some()
+    {
+        let scan: Vec<PathBuf> = patch
+            .files
+            .iter()
+            .filter(|file| file.kind != ChangeKind::Deleted)
+            .map(|file| file.path.clone())
+            .collect();
+        let markers = services
+            .worktrees
+            .conflict_markers(&run_worktree, &start_sha, &scan)
+            .await?;
+        if !markers.is_empty() {
+            return Err(AcceptError::MarkersRemain(markers));
+        }
+    }
 
     let mut chosen: Option<CommitInput> = None;
     let mut retried = false;
@@ -513,6 +565,13 @@ async fn accept(
             return Ok(AcceptOutcome::Conflict(AcceptConflict {
                 run_id,
                 comment_id: comment.id,
+                comment_label: comment
+                    .body_md
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("review comment")
+                    .to_owned(),
                 head,
                 head_tip: old,
                 files,
@@ -690,6 +749,35 @@ async fn finish(
     }
     if let Err(error) = services.worktrees.remove(run_worktree).await {
         warnings.push(format!("could not delete the run worktree: {error}"));
+    }
+    // The comment's other proposals (the original one of an accepted
+    // resolution, or one replaced by a resolution) are moot now.
+    match services.store.runs().list_for_comment(comment.id).await {
+        Ok(runs) => {
+            let mut removed: Vec<PathBuf> = vec![run_worktree.path().to_owned()];
+            for other in runs {
+                if other.id == run_id
+                    || !matches!(other.status, RunStatus::Succeeded | RunStatus::Stopped)
+                    || removed.contains(&other.worktree_path)
+                    || !other.worktree_path.is_dir()
+                {
+                    continue;
+                }
+                removed.push(other.worktree_path.clone());
+                let worktree = services
+                    .worktrees
+                    .worktree_at_dir(run_worktree.repo_dir(), other.worktree_path.clone());
+                if let Err(error) = match worktree {
+                    Ok(worktree) => services.worktrees.remove(&worktree).await,
+                    Err(error) => Err(error),
+                } {
+                    warnings.push(format!(
+                        "could not delete the earlier proposal worktree: {error}"
+                    ));
+                }
+            }
+        }
+        Err(error) => warnings.push(format!("could not list the comment's runs: {error}")),
     }
     for warning in &warnings {
         tracing::warn!(run = %run_id, %warning, "accept cleanup");

@@ -20,6 +20,10 @@
 //! - [`push`] sends the head branch to its upstream through the same queue,
 //!   pulling with rebase first when the remote is ahead
 //!   ([`RunManager::push`]).
+//! - [`resolve`] turns a conflict of an Accept or of the pull before push
+//!   into a resolve run whose result is reviewed like any proposal
+//!   ([`RunManager::resolve_accept`], [`RunManager::resolve_push`],
+//!   [`RunManager::continue_push`], [`RunManager::cancel_resolve`]).
 //! - The run defaults of the settings screen live in [`settings`]; the
 //!   review rules file in [`review_rules`].
 //!
@@ -33,6 +37,7 @@ pub mod log;
 pub mod prompt;
 pub mod proposal;
 pub mod push;
+pub mod resolve;
 pub mod review_rules;
 pub mod run;
 pub mod settings;
@@ -56,6 +61,7 @@ pub use push::{
     PULL_BEFORE_PUSH, PushConflict, PushError, PushEvent, PushMode, PushOutcome, PushReport,
     PushRequest, PushStep, PushTicket,
 };
+pub use resolve::{RebaseResolution, Resolution, ResolveId};
 pub use run::{
     FollowupMode, RunError, RunFinished, RunStreamEvent, RunUpdate, SESSION_NOT_FOUND, STOP_GRACE,
     is_session_not_found,
@@ -341,6 +347,165 @@ impl RunManager {
             claude: self.claude.subscribe(),
         };
         push::submit(&self.accepts, &env, request)
+    }
+
+    /// Starts a resolve run for an Accept that conflicted (spec §6.6): a new
+    /// worktree at the current head tip with the proposal's patch applied
+    /// by `git apply --3way` (markers in the files), and `claude -p` with
+    /// the resolve prompt, linked to the comment, with `model` and
+    /// `effort`. Its result is a proposal of the comment, accepted like any
+    /// other. Must run on the tokio runtime.
+    pub async fn resolve_accept(
+        &self,
+        conflict: AcceptConflict,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+    ) -> Result<RunId, RunError> {
+        let request = self.resolve_request(model.into(), effort.into())?;
+        let (model, effort) = (request.model.clone(), request.effort.clone());
+        let run_id = resolve::resolve_accept(self.services.clone(), conflict, request).await?;
+        self.remember_in_background(&model, &effort);
+        Ok(run_id)
+    }
+
+    /// Starts a resolve run for a pull before push that conflicted: for a
+    /// first conflict, a new worktree at the local head where `git rebase
+    /// <upstream>` stops at the conflicting commit; for the next stopped
+    /// commit of a resolution in progress ([`PushConflict::resolve`]), the
+    /// same worktree. The run has no comment; its proposal is accepted with
+    /// [`RunManager::continue_push`]. Must run on the tokio runtime.
+    pub async fn resolve_push(
+        &self,
+        push: PushRequest,
+        conflict: PushConflict,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+    ) -> Result<RunId, RunError> {
+        let request = self.resolve_request(model.into(), effort.into())?;
+        let (model, effort) = (request.model.clone(), request.effort.clone());
+        let run_id =
+            resolve::resolve_rebase(self.services.clone(), push, conflict, request).await?;
+        self.remember_in_background(&model, &effort);
+        Ok(run_id)
+    }
+
+    fn resolve_request(
+        &self,
+        model: String,
+        effort: String,
+    ) -> Result<resolve::ResolveRequest, RunError> {
+        Ok(resolve::ResolveRequest {
+            model,
+            effort,
+            capabilities: self.capabilities()?,
+            rules_path: self.review_rules_path(),
+        })
+    }
+
+    /// Accepts the proposal of a pull-before-push resolution: queues `git
+    /// add -A && git rebase --continue` in its worktree (refused while
+    /// conflict markers remain), then, once the rebase is done, the
+    /// compare-and-swap of the head branch and the Push. A next conflicting
+    /// commit ends the ticket with [`PushOutcome::Conflict`] again. Must run
+    /// on the tokio runtime.
+    pub async fn continue_push(&self, run_id: RunId) -> Result<PushTicket, PushError> {
+        let run = self
+            .services
+            .store
+            .runs()
+            .get(run_id)
+            .await?
+            .ok_or(PushError::ResolveGone)?;
+        let (id, session) = self
+            .services
+            .resolves
+            .find_by_worktree(&run.worktree_path)
+            .ok_or(PushError::ResolveGone)?;
+        let env = accept::AcceptEnv {
+            services: self.services.clone(),
+            settings: self.settings.subscribe(),
+            claude: self.claude.subscribe(),
+        };
+        push::submit_continue(&self.accepts, &env, run_id, &session.resolution(id))
+    }
+
+    /// Cancels a pull-before-push resolution in progress: deletes its
+    /// worktree (the stopped rebase with it) and abandons the Push. The head
+    /// branch, the remote and the user's checkout are unchanged.
+    pub async fn cancel_resolve(&self, id: ResolveId) -> Result<(), RunError> {
+        resolve::cancel_rebase(&self.services, id).await
+    }
+
+    /// Follows up on the proposal of `run_id` with `reply`. A run with a
+    /// comment continues its thread ([`RunManager::follow_up`]); a
+    /// pull-before-push resolution (no comment) resumes its session in its
+    /// worktree. Must run on the tokio runtime.
+    pub async fn follow_up_run(
+        &self,
+        run_id: RunId,
+        reply: impl Into<String>,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+    ) -> Result<RunId, RunError> {
+        let (reply, model, effort) = (reply.into(), model.into(), effort.into());
+        let run = self
+            .services
+            .store
+            .runs()
+            .get(run_id)
+            .await?
+            .ok_or(ProposalError::RunNotFound(run_id))?;
+        if let Some(comment_id) = run.comment_id {
+            return self.follow_up(comment_id, reply, model, effort).await;
+        }
+        let capabilities = self.capabilities()?;
+        let new_run = run::follow_up_run(
+            self.services.clone(),
+            run::RunFollowupRequest {
+                run_id,
+                reply,
+                model: model.clone(),
+                effort: effort.clone(),
+                capabilities,
+                rules_path: self.review_rules_path(),
+            },
+        )
+        .await?;
+        self.remember_in_background(&model, &effort);
+        Ok(new_run)
+    }
+
+    /// The conflicted content of `path`, with markers, for the dialog of
+    /// an Accept conflict. Reads objects and Argus worktrees only; scratch
+    /// files go to `<argus_home>/tmp`. Must run on the tokio runtime.
+    pub async fn preview_accept_conflict(
+        &self,
+        conflict: &AcceptConflict,
+        path: &Path,
+    ) -> Result<String, RunError> {
+        let scratch = resolve::scratch_dir(&self.argus_home);
+        resolve::preview_accept(&self.services, &scratch, conflict, path).await
+    }
+
+    /// The conflicted content of `path`, with markers, for the dialog of a
+    /// pull-before-push conflict. Must run on the tokio runtime.
+    pub async fn preview_push_conflict(
+        &self,
+        push: &PushRequest,
+        conflict: &PushConflict,
+        path: &Path,
+    ) -> Result<String, RunError> {
+        let scratch = resolve::scratch_dir(&self.argus_home);
+        resolve::preview_push(&self.services, &scratch, push, conflict, path).await
+    }
+
+    /// The runs of the pull-before-push resolutions in progress for a
+    /// repository (they have no comment), newest first.
+    pub async fn resolution_runs(
+        &self,
+        repo_id: argus_store::RepoId,
+    ) -> argus_store::Result<Vec<argus_store::RunListing>> {
+        resolve::listings(&self.services, repo_id).await
     }
 
     /// The runs queued for Accept or being accepted.

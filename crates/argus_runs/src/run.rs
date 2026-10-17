@@ -136,6 +136,26 @@ pub enum RunError {
     /// The stored session id of the thread is not a UUID.
     #[error("the Claude session of comment {0} is not a valid id: `{1}`")]
     InvalidSession(CommentId, String),
+    /// The run or proposal a resolve run starts from cannot be loaded.
+    #[error(transparent)]
+    Proposal(#[from] crate::proposal::ProposalError),
+    /// The conflict to resolve no longer happens (the head or the upstream
+    /// moved); nothing was started.
+    #[error("{0}")]
+    ConflictGone(String),
+    /// The pull-before-push resolution is no longer in progress: it was
+    /// cancelled, it failed, or Argus restarted.
+    #[error(
+        "this pull-before-push resolution is no longer in progress (cancelled, failed, or Argus \
+         restarted); Push again to start over"
+    )]
+    ResolveGone,
+    /// The run has no reviewable proposal to follow up on.
+    #[error("run {0} has no proposal to follow up on")]
+    RunNotReviewable(RunId),
+    /// A run is already working in the worktree.
+    #[error("a run is already working in this worktree; wait for it or stop it")]
+    RunBusy,
 }
 
 /// A run's lifecycle change, for views that show statuses.
@@ -208,6 +228,8 @@ pub(crate) struct Services {
     pub store: StorageService,
     pub git: GitService,
     pub worktrees: WorktreeManager,
+    /// Pull-before-push resolutions in progress.
+    pub resolves: crate::resolve::ResolveSessions,
     status: broadcast::Sender<RunUpdate>,
     events: broadcast::Sender<RunStreamEvent>,
     active: Mutex<HashMap<RunId, ActiveRun>>,
@@ -226,6 +248,7 @@ impl Services {
             store,
             git,
             worktrees,
+            resolves: crate::resolve::ResolveSessions::default(),
             status,
             events,
             active: Mutex::new(HashMap::new()),
@@ -304,13 +327,23 @@ pub(crate) struct FollowupRequest {
 }
 
 /// The stored comment with its repository, checked for a new run.
-struct Target {
-    stored: argus_store::Comment,
-    repo_name: String,
-    repo: Repo,
+pub(crate) struct Target {
+    pub stored: argus_store::Comment,
+    pub repo_name: String,
+    pub repo: Repo,
 }
 
 async fn load_target(services: &Services, comment_id: CommentId) -> Result<Target, RunError> {
+    load_comment_target(services, comment_id, false).await
+}
+
+/// The comment and its repository; `allow_outdated` lets an outdated
+/// comment through (a resolve run continues its existing proposal).
+pub(crate) async fn load_comment_target(
+    services: &Services,
+    comment_id: CommentId,
+    allow_outdated: bool,
+) -> Result<Target, RunError> {
     let store = &services.store;
     let stored = store
         .comments()
@@ -318,7 +351,7 @@ async fn load_target(services: &Services, comment_id: CommentId) -> Result<Targe
         .await?
         .ok_or(RunError::CommentNotFound(comment_id))?;
     // Refuse early, before any git work; `apply_event` checks again later.
-    if stored.outdated {
+    if stored.outdated && !allow_outdated {
         return Err(ReviewError::Outdated(comment_id).into());
     }
     let record = store
@@ -336,7 +369,7 @@ async fn load_target(services: &Services, comment_id: CommentId) -> Result<Targe
 
 /// The comment as the prompt shows it, from the current diff of its review,
 /// and the head tip that diff ends at.
-async fn comment_context(
+pub(crate) async fn comment_context(
     target: &Target,
 ) -> Result<(Sha, impl FnOnce() -> CommentContext + Send + 'static), RunError> {
     let stored = &target.stored;
@@ -367,7 +400,7 @@ async fn comment_context(
     Ok((head, build))
 }
 
-fn repo_context(target: &Target, start_sha: &str) -> RepoContext {
+pub(crate) fn repo_context(target: &Target, start_sha: &str) -> RepoContext {
     RepoContext {
         repo_name: target.repo_name.clone(),
         base_branch: target.stored.base_ref.clone(),
@@ -376,7 +409,7 @@ fn repo_context(target: &Target, start_sha: &str) -> RepoContext {
     }
 }
 
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, RunError> {
     tokio::task::spawn_blocking(work)
@@ -415,7 +448,7 @@ pub(crate) async fn start(
     let worktree_path = services.worktrees.run_path(target.repo.id(), run_id);
     let pending = PendingRun {
         run_id,
-        comment_id,
+        comment_id: Some(comment_id),
         kind: RunKind::Comment,
         start_sha,
         model,
@@ -545,7 +578,7 @@ pub(crate) async fn follow_up(
 
     let pending = PendingRun {
         run_id: RunId::new(),
-        comment_id,
+        comment_id: Some(comment_id),
         kind: RunKind::Followup,
         start_sha,
         model,
@@ -570,6 +603,77 @@ pub(crate) async fn follow_up(
     spawn(services, pending, worktree, prompt.text).await
 }
 
+/// What [`follow_up_run`] needs.
+pub(crate) struct RunFollowupRequest {
+    pub run_id: RunId,
+    pub reply: String,
+    pub model: String,
+    pub effort: String,
+    pub capabilities: ClaudeCapabilities,
+    pub rules_path: PathBuf,
+}
+
+/// Starts a follow-up on the proposal of a run without a comment (the
+/// resolution of a pull before push): resumes its Claude session in its
+/// worktree with the reply, as a new run (`kind = followup`, no comment).
+/// The reply is kept in the run's prompt; there is no thread to add it to.
+pub(crate) async fn follow_up_run(
+    services: Arc<Services>,
+    request: RunFollowupRequest,
+) -> Result<RunId, RunError> {
+    let RunFollowupRequest {
+        run_id,
+        reply,
+        model,
+        effort,
+        capabilities,
+        rules_path,
+    } = request;
+    let previous = services
+        .store
+        .runs()
+        .get(run_id)
+        .await?
+        .ok_or(crate::proposal::ProposalError::RunNotFound(run_id))?;
+    if !matches!(previous.status, RunStatus::Succeeded | RunStatus::Stopped)
+        || !previous.worktree_path.is_dir()
+    {
+        return Err(RunError::RunNotReviewable(run_id));
+    }
+    let (repo, _) = crate::resolve::rebase_target(&services, &previous.worktree_path)
+        .ok_or(RunError::ResolveGone)?;
+    if crate::resolve::busy_worktree(&services, &previous.worktree_path).await? {
+        return Err(RunError::RunBusy);
+    }
+    let start_sha = Sha::parse(&previous.start_sha).ok_or_else(|| GitError::Parse {
+        command: "runs.start_sha".to_owned(),
+        message: format!("not an object id: `{}`", previous.start_sha),
+    })?;
+    let session = Uuid::parse_str(previous.session_id.trim()).map_err(|_| {
+        RunError::Spawn(format!(
+            "the run's Claude session is not a valid id: `{}`",
+            previous.session_id
+        ))
+    })?;
+    let worktree = services
+        .worktrees
+        .worktree_at(&repo, previous.worktree_path.clone())?;
+    let prompt = crate::prompt::resolve_followup_prompt(&reply);
+    let pending = PendingRun {
+        run_id: RunId::new(),
+        comment_id: None,
+        kind: RunKind::Followup,
+        start_sha,
+        model,
+        effort,
+        session: SessionMode::Resume(session),
+        capabilities,
+        rules_path,
+    };
+    record_run(&services, &pending, previous.worktree_path.clone(), &prompt).await?;
+    spawn(services, pending, worktree, prompt.text).await
+}
+
 fn same_path(a: &Path, b: &Path) -> bool {
     a == b
         || std::fs::canonicalize(a)
@@ -579,16 +683,18 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 /// A run being started: everything [`spawn`] needs besides its worktree.
-struct PendingRun {
-    run_id: RunId,
-    comment_id: CommentId,
-    kind: RunKind,
-    start_sha: Sha,
-    model: String,
-    effort: String,
-    session: SessionMode,
-    capabilities: ClaudeCapabilities,
-    rules_path: PathBuf,
+pub(crate) struct PendingRun {
+    pub run_id: RunId,
+    /// `None` for a run on no comment (the resolve run of a pull before
+    /// push, and its follow-ups).
+    pub comment_id: Option<CommentId>,
+    pub kind: RunKind,
+    pub start_sha: Sha,
+    pub model: String,
+    pub effort: String,
+    pub session: SessionMode,
+    pub capabilities: ClaudeCapabilities,
+    pub rules_path: PathBuf,
 }
 
 impl PendingRun {
@@ -600,7 +706,7 @@ impl PendingRun {
 }
 
 /// Records the run row (`Queued`).
-async fn record_run(
+pub(crate) async fn record_run(
     services: &Services,
     run: &PendingRun,
     worktree_path: PathBuf,
@@ -612,7 +718,7 @@ async fn record_run(
         .create_with_id(
             run.run_id,
             NewRun {
-                comment_id: Some(run.comment_id),
+                comment_id: run.comment_id,
                 kind: run.kind,
                 session_id: run.session_id().hyphenated().to_string(),
                 model: run.model.clone(),
@@ -629,13 +735,16 @@ async fn record_run(
 /// Moves the comment to `Running` before any expensive work, so a second
 /// start of the same comment is refused by the compare-and-swap. On a
 /// refusal the unstarted run row is deleted.
-async fn claim_comment(
+pub(crate) async fn claim_comment(
     services: &Services,
     run: &PendingRun,
     event: CommentEvent,
 ) -> Result<(), RunError> {
+    let Some(comment_id) = run.comment_id else {
+        return Ok(());
+    };
     let store = &services.store;
-    if let Err(error) = apply_event(&store.comments(), run.comment_id, event).await {
+    if let Err(error) = apply_event(&store.comments(), comment_id, event).await {
         if let Err(delete_error) = store.runs().delete(run.run_id).await {
             tracing::warn!(run = %run.run_id, error = %delete_error, "cannot delete unstarted run");
         }
@@ -647,7 +756,7 @@ async fn claim_comment(
 /// Records a run that failed before its process ran, and moves its comment
 /// on (a follow-up's comment back to `Proposed` when `worktree` still holds
 /// a change).
-async fn fail_unstarted(
+pub(crate) async fn fail_unstarted(
     services: &Services,
     run: &PendingRun,
     worktree: Option<&Worktree>,
@@ -659,13 +768,15 @@ async fn fail_unstarted(
         Some(worktree) if run.kind == RunKind::Followup => {
             followup_event(services, worktree, &run.start_sha, RunStatus::Failed).await
         }
+        // The comment's earlier proposal is still there.
+        _ if run.kind == RunKind::Resolve => Some(CommentEvent::RunSucceeded),
         _ => CommentEvent::from_run_status(RunStatus::Failed),
     };
     record_finish(
         services,
         Finish {
             run_id: run.run_id,
-            comment_id: Some(run.comment_id),
+            comment_id: run.comment_id,
             kind: run.kind,
             comment_event,
             session_not_found: false,
@@ -676,7 +787,7 @@ async fn fail_unstarted(
 }
 
 /// Spawns `claude` for `run` in `worktree` and hands it to [`supervise`].
-async fn spawn(
+pub(crate) async fn spawn(
     services: Arc<Services>,
     run: PendingRun,
     worktree: Worktree,
@@ -726,17 +837,14 @@ async fn spawn(
         .insert(run_id, ActiveRun { stop: stop_tx });
     tracing::info!(
         run = %run_id,
-        comment = %comment_id,
+        comment = ?comment_id,
         kind = %run.kind,
         session = ?run.session,
         worktree = %worktree.path().display(),
         start_sha = %run.start_sha,
         "started run"
     );
-    services.publish(RunUpdate::Started {
-        run_id,
-        comment_id: Some(comment_id),
-    });
+    services.publish(RunUpdate::Started { run_id, comment_id });
     tokio::spawn(supervise(
         services.clone(),
         LiveRun {
@@ -756,7 +864,7 @@ async fn spawn(
 /// A spawned run, as its supervisor sees it.
 struct LiveRun {
     run_id: RunId,
-    comment_id: CommentId,
+    comment_id: Option<CommentId>,
     kind: RunKind,
     /// Started with `--resume`.
     resumed: bool,
@@ -855,16 +963,27 @@ async fn supervise(
             (outcome, false)
         }
     };
-    let comment_event = if run.kind == RunKind::Followup {
-        followup_event(&services, &run.worktree, &run.start_sha, outcome.status).await
-    } else {
-        CommentEvent::from_run_status(outcome.status)
+    let comment_event = match run.kind {
+        RunKind::Followup => {
+            followup_event(&services, &run.worktree, &run.start_sha, outcome.status).await
+        }
+        // However the resolution went, the comment's earlier proposal (or
+        // this one) is there to review.
+        RunKind::Resolve => Some(CommentEvent::RunSucceeded),
+        RunKind::Comment => CommentEvent::from_run_status(outcome.status),
     };
+    if run.kind == RunKind::Resolve
+        && !matches!(outcome.status, RunStatus::Succeeded | RunStatus::Stopped)
+    {
+        // A resolution with nothing to review: its conflicted worktree is
+        // of no use, and a pull before push it belonged to is abandoned.
+        crate::resolve::discard_failed(&services, &run.worktree).await;
+    }
     record_finish(
         &services,
         Finish {
             run_id,
-            comment_id: Some(run.comment_id),
+            comment_id: run.comment_id,
             kind: run.kind,
             comment_event,
             session_not_found,
@@ -997,11 +1116,17 @@ async fn complete(
         });
         return (outcome, missing);
     }
+    // A pull-before-push resolution may rightly leave the stopped commit
+    // empty (the upstream already has its change): still a proposal.
+    let empty_is_proposal = run.kind == RunKind::Resolve && run.comment_id.is_none();
     match services
         .worktrees
         .diff_against_start(&run.worktree, &run.start_sha)
         .await
     {
+        Ok(patch) if patch.is_empty() && empty_is_proposal => {
+            outcome.status = RunStatus::Succeeded;
+        }
         Ok(patch) if patch.is_empty() => outcome.status = RunStatus::NoChanges,
         Ok(patch) => {
             tracing::info!(run = %run.run_id, files = patch.files.len(), "run proposed a change");

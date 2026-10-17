@@ -15,7 +15,10 @@
 //! bar's Push button goes through the [`PushFlow`] (#25): it is disabled
 //! while an Accept is in flight, offers `git push -u` when the head has no
 //! upstream, and the head's upstream is fetched in the background every
-//! minute (a setting) so its counts stay current. Settings, the
+//! minute (a setting) so its counts stay current. A conflict of an Accept
+//! or of the pull before Push opens the [`ConflictDialog`] (#26); its
+//! resolve run's proposal opens in a tab when the run ends, and accepting
+//! a pull-before-push resolution continues the Push. Settings, the
 //! repository list and git are read and written on the tokio runtime; this
 //! view only receives the results.
 
@@ -44,6 +47,7 @@ use crate::components::{
     button, disabled_button, kbd, panel_header, placeholder, primary_button, section_header,
     text_tooltip, toggle_button,
 };
+use crate::conflict::{ConflictDialog, ConflictDialogEvent, ConflictSource};
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::fonts::InstalledFonts;
@@ -172,6 +176,10 @@ pub struct Workspace {
     accept_flow: Entity<AcceptFlow>,
     /// The Push in flight, its progress popover and its dialogs.
     push_flow: Entity<PushFlow>,
+    /// The conflict dialog, while one is open.
+    conflict: Option<(Entity<ConflictDialog>, Subscription)>,
+    /// Resolve runs whose proposal opens when they end.
+    resolve_watches: HashMap<argus_store::RunId, Task<()>>,
     /// Fetches the head's upstream every minute, when the setting is on.
     _background_fetch: Task<()>,
     /// Focus the workspace at the next render (e.g. after leaving a tab).
@@ -268,6 +276,8 @@ impl Workspace {
             active_proposal: None,
             accept_flow,
             push_flow,
+            conflict: None,
+            resolve_watches: HashMap::new(),
             _background_fetch: background_fetch,
             focus_requested: false,
             viewed_stash: None,
@@ -852,12 +862,39 @@ impl Workspace {
                 self.accept_flow
                     .update(cx, |flow, cx| flow.accept(run_id, cx));
             }
+            ProposalEvent::ContinuePush { run_id, head } => {
+                let (run_id, head) = (*run_id, head.clone());
+                tracing::debug!(run = %run_id, "resolution accepted; continuing the push");
+                if self.accept_flow.read(cx).is_busy() {
+                    self.notice = Some(Notice {
+                        message: "Wait for the accepts in flight, then accept the resolution."
+                            .into(),
+                        is_error: false,
+                    });
+                    cx.notify();
+                    return;
+                }
+                self.push_flow
+                    .update(cx, |flow, cx| flow.continue_push(run_id, head, cx));
+            }
+            ProposalEvent::Accepted(run_id) => {
+                let run_id = *run_id;
+                while let Some(index) = self
+                    .proposals
+                    .iter()
+                    .position(|tab| tab.view.read(cx).run_id() == Some(run_id))
+                {
+                    self.close_proposal(index, cx);
+                }
+            }
             ProposalEvent::Replied {
                 comment_id,
                 followup,
             } => {
-                tracing::debug!(comment = %comment_id, run = ?followup, "proposal reply sent");
-                if let Some(session) = self.session.clone() {
+                tracing::debug!(comment = ?comment_id, run = ?followup, "proposal reply sent");
+                if comment_id.is_some()
+                    && let Some(session) = self.session.clone()
+                {
                     let comments = session.read(cx).comments().clone();
                     comments.update(cx, |comments, cx| comments.reload(cx));
                 }
@@ -935,6 +972,9 @@ impl Workspace {
                 });
                 cx.notify();
             }
+            AcceptFlowEvent::Conflict(conflict) => {
+                self.open_conflict(ConflictSource::Accept(conflict.clone()), cx);
+            }
             AcceptFlowEvent::DialogsClosed => self.activate_tab(self.active_proposal, cx),
             AcceptFlowEvent::Notice { message, is_error } => {
                 self.notice = Some(Notice {
@@ -961,6 +1001,15 @@ impl Workspace {
                 }
             }
             PushFlowEvent::DialogsClosed => self.activate_tab(self.active_proposal, cx),
+            PushFlowEvent::Conflict { request, conflict } => {
+                self.open_conflict(
+                    ConflictSource::Push {
+                        request: request.clone(),
+                        conflict: conflict.clone(),
+                    },
+                    cx,
+                );
+            }
             PushFlowEvent::Notice { message, is_error } => {
                 self.notice = Some(Notice {
                     message: message.clone(),
@@ -969,6 +1018,128 @@ impl Workspace {
                 cx.notify();
             }
         }
+    }
+
+    // ---- conflicts ----------------------------------------------------------
+
+    /// Opens the conflict dialog for `source`, over any earlier one.
+    fn open_conflict(&mut self, source: ConflictSource, cx: &mut Context<Self>) {
+        let dialog = cx.new(|cx| ConflictDialog::new(source, cx));
+        let subscription = cx.subscribe(&dialog, Self::conflict_event);
+        self.conflict = Some((dialog, subscription));
+        cx.notify();
+    }
+
+    fn conflict_event(
+        &mut self,
+        dialog: Entity<ConflictDialog>,
+        event: &ConflictDialogEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ConflictDialogEvent::ResolveStarted(run_id) => {
+                let run_id = *run_id;
+                if !self.settings.run_panel.visible {
+                    self.settings.run_panel.visible = true;
+                    self.schedule_save(cx);
+                }
+                self.watch_resolve(run_id, cx);
+                self.notice = Some(Notice {
+                    message: "Resolve run started: its proposal opens when it finishes (see the \
+                              run panel)."
+                        .into(),
+                    is_error: false,
+                });
+            }
+            ConflictDialogEvent::Closed => {
+                if self
+                    .conflict
+                    .as_ref()
+                    .is_some_and(|(open, _)| *open == dialog)
+                {
+                    self.conflict = None;
+                    self.activate_tab(self.active_proposal, cx);
+                }
+                // A cancelled rebase or a resolution changes the counts.
+                if let Some(session) = self.session.clone() {
+                    session.update(cx, |session, cx| session.reload_after_push(cx));
+                }
+            }
+            ConflictDialogEvent::Notice { message, is_error } => {
+                self.notice = Some(Notice {
+                    message: message.clone(),
+                    is_error: *is_error,
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Opens the proposal of resolve run `run_id` once it ends with
+    /// something to review, or reports its failure.
+    fn watch_resolve(&mut self, run_id: argus_store::RunId, cx: &mut Context<Self>) {
+        let runs = cx.global::<AppContext>().runs.clone();
+        let mut updates = runs.subscribe_runs();
+        let store = cx.global::<AppContext>().store.clone();
+        // The run may have ended before the subscription: check it once.
+        let stored = crate::runtime::spawn_job(cx, async move { store.runs().get(run_id).await });
+        let task = cx.spawn(async move |this, cx| {
+            use argus_runs::RunUpdate;
+            use tokio::sync::broadcast::error::RecvError;
+            let mut ended = match stored.await {
+                Ok(Ok(Some(run))) if !run.status.is_active() => Some((run.status, run.error)),
+                _ => None,
+            };
+            while ended.is_none() {
+                match updates.recv().await {
+                    Ok(RunUpdate::Finished(finished)) if finished.run_id == run_id => {
+                        ended = Some((finished.status, finished.error));
+                    }
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                }
+            }
+            let Some((status, error)) = ended else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.resolve_watches.remove(&run_id);
+                this.resolve_finished(run_id, status, error, cx);
+            })
+            .ok();
+        });
+        self.resolve_watches.insert(run_id, task);
+    }
+
+    fn resolve_finished(
+        &mut self,
+        run_id: argus_store::RunId,
+        status: argus_store::RunStatus,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        use argus_store::RunStatus;
+        match status {
+            RunStatus::Succeeded | RunStatus::Stopped => {
+                self.open_proposal(ProposalSource::Run(run_id), cx);
+            }
+            _ => {
+                let reason = error
+                    .as_deref()
+                    .and_then(|error| error.lines().next())
+                    .unwrap_or("it changed nothing")
+                    .to_owned();
+                self.notice = Some(Notice {
+                    message: format!(
+                        "The resolve run ended without a resolution ({status}: {reason}). Nothing \
+                         was committed or rebased; its worktree is deleted."
+                    )
+                    .into(),
+                    is_error: true,
+                });
+            }
+        }
+        cx.notify();
     }
 
     /// The title bar's Push button was clicked: push to the upstream, or
@@ -1245,6 +1416,10 @@ impl Workspace {
             .session
             .as_ref()
             .is_some_and(|session| session.read(cx).tracking_prompt().is_some());
+        if let Some(dialog) = self.conflict.as_ref().map(|(dialog, _)| dialog.clone()) {
+            dialog.update(cx, |dialog, cx| dialog.cancel(cx));
+            return;
+        }
         if self.push_flow.read(cx).is_visible() {
             self.push_flow.update(cx, |flow, cx| flow.dismiss(cx));
             return;
@@ -3017,6 +3192,10 @@ impl Render for Workspace {
             .when(self.push_flow.read(cx).is_visible(), |root| {
                 root.child(self.push_flow.clone())
             })
+            .when_some(
+                self.conflict.as_ref().map(|(dialog, _)| dialog.clone()),
+                |root, dialog| root.child(dialog),
+            )
     }
 }
 
