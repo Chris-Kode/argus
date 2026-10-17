@@ -257,8 +257,9 @@ async fn head_tip(repo: &Repo, head_ref: &str) -> Option<Sha> {
 }
 
 /// Rejects the proposal of `run_id`: `git worktree remove --force` + `git
-/// worktree prune`, the run becomes `Rejected` (it stays in history), and a
-/// `Proposed` comment goes back to `Open`.
+/// worktree prune`, the run becomes `Rejected` (it stays in history), as do
+/// the earlier runs of the thread that shared the worktree, and a `Proposed`
+/// comment goes back to `Open`. Refused while a follow-up is running.
 pub(crate) async fn reject(services: &Services, run_id: RunId) -> Result<(), ProposalError> {
     if services.is_active(run_id) {
         return Err(ProposalError::NotReviewable {
@@ -267,6 +268,13 @@ pub(crate) async fn reject(services: &Services, run_id: RunId) -> Result<(), Pro
         });
     }
     let (run, comment, _, worktree) = load_parts(services, run_id).await?;
+    // A follow-up may be editing the same worktree.
+    if comment.status == CommentStatus::Running {
+        return Err(ProposalError::NotReviewable {
+            run_id,
+            status: RunStatus::Running,
+        });
+    }
     // The worktree goes first: a failed removal leaves the proposal intact.
     services.worktrees.remove(&worktree).await?;
     let runs = services.store.runs();
@@ -276,6 +284,14 @@ pub(crate) async fn reject(services: &Services, run_id: RunId) -> Result<(), Pro
     {
         let status = runs.get(run_id).await?.map_or(run.status, |run| run.status);
         return Err(ProposalError::NotReviewable { run_id, status });
+    }
+    // Earlier runs of the thread (follow-ups) share the deleted worktree:
+    // none of them has a proposal any more.
+    for other in runs.find_by_worktree(&run.worktree_path).await? {
+        if other.id != run_id && reviewable(other.status) {
+            runs.set_status_if(other.id, other.status, RunStatus::Rejected)
+                .await?;
+        }
     }
     let comments = services.store.comments();
     if comment.status == CommentStatus::Proposed {

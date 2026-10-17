@@ -12,6 +12,7 @@ pub mod comments;
 pub mod components;
 pub mod diff_view;
 pub mod file_tree;
+pub mod followup;
 mod fonts;
 pub mod fuzzy;
 pub mod jobs;
