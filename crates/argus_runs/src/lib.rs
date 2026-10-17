@@ -12,6 +12,7 @@
 //!   Claude session and worktree (`--resume`); when the session is gone,
 //!   [`RunManager::follow_up_fresh`] starts a new one with the thread as
 //!   context.
+//! - [`log`] folds a run's events into the rows of the run panel's live log.
 //! - [`proposal`] shows what a finished run changed (`start_sha → worktree`)
 //!   and rejects it ([`RunManager::open_proposal`], [`RunManager::reject`]).
 //! - The run defaults of the settings screen live in [`settings`]; the
@@ -22,6 +23,7 @@
 //! of the new session starts.
 
 pub mod claude;
+pub mod log;
 pub mod prompt;
 pub mod proposal;
 pub mod review_rules;
@@ -34,9 +36,10 @@ use std::sync::Arc;
 
 use argus_git::{GitService, WorktreeManager};
 use argus_store::{CommentId, RunId, StorageService};
-use tokio::sync::{Notify, broadcast, watch};
+use tokio::sync::{Mutex, Notify, broadcast, watch};
 
 pub use claude::{ClaudeCapabilities, ClaudeCommand, ClaudeStatus, SessionMode};
+pub use log::{LogChange, LogEntry, RunLog, ToolCall};
 pub use proposal::{Proposal, ProposalError, WorktreeWatch};
 pub use run::{
     FollowupMode, RunError, RunFinished, RunStreamEvent, RunUpdate, SESSION_NOT_FOUND, STOP_GRACE,
@@ -67,6 +70,9 @@ pub struct RunManager {
     settings: Arc<watch::Sender<ClaudeSettings>>,
     claude: Arc<watch::Sender<ClaudeStatus>>,
     recheck: Arc<Notify>,
+    /// Serializes settings writes, so the stored record ends up as the
+    /// newest live settings.
+    save_lock: Arc<Mutex<()>>,
     services: Arc<run::Services>,
 }
 
@@ -87,6 +93,7 @@ impl RunManager {
             settings: Arc::new(sender),
             claude: Arc::new(claude),
             recheck: Arc::new(Notify::new()),
+            save_lock: Arc::new(Mutex::new(())),
             services: Arc::new(run::Services::new(store, git, worktrees)),
         }
     }
@@ -99,6 +106,9 @@ impl RunManager {
     /// moves the comment to `Running` and spawns `claude`. Returns once the
     /// process runs; an independent task streams it to completion. Must run
     /// on the tokio runtime, never on the UI thread.
+    ///
+    /// Once the run is started, `model` and `effort` become the defaults of
+    /// the Run menu (spec §6.2) and are saved in the background.
     pub async fn start(
         &self,
         comment_id: CommentId,
@@ -106,17 +116,61 @@ impl RunManager {
         effort: impl Into<String>,
     ) -> Result<RunId, RunError> {
         let capabilities = self.capabilities()?;
-        run::start(
+        let (model, effort) = (model.into(), effort.into());
+        let run_id = run::start(
             self.services.clone(),
             run::StartRequest {
                 comment_id,
-                model: model.into(),
-                effort: effort.into(),
+                model: model.clone(),
+                effort: effort.clone(),
                 capabilities,
                 rules_path: self.review_rules_path(),
             },
         )
-        .await
+        .await?;
+        self.remember_in_background(&model, &effort);
+        Ok(run_id)
+    }
+
+    /// [`RunManager::remember_choice`], saved in the background on a change.
+    fn remember_in_background(&self, model: &str, effort: &str) {
+        if self.remember_choice(model, effort) {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = manager.save_settings().await {
+                    tracing::warn!(%error, "cannot save the Run menu defaults");
+                }
+            });
+        }
+    }
+
+    /// Makes `model` and `effort` the Run menu defaults when they are
+    /// listed in the settings (an empty effort is not remembered). Returns
+    /// whether the live settings changed; save them with
+    /// [`RunManager::save_settings`].
+    pub fn remember_choice(&self, model: &str, effort: &str) -> bool {
+        self.settings.send_if_modified(|settings| {
+            let mut changed = false;
+            if settings.default_model != model && settings.models.iter().any(|m| m == model) {
+                settings.default_model = model.to_owned();
+                changed = true;
+            }
+            if settings.default_effort != effort && settings.efforts.iter().any(|e| e == effort) {
+                settings.default_effort = effort.to_owned();
+                changed = true;
+            }
+            changed
+        })
+    }
+
+    /// Writes the current live settings to the `settings` table. Writes are
+    /// serialized and each one stores the newest snapshot, so concurrent
+    /// savers never leave an older record behind. Must run on the tokio
+    /// runtime.
+    pub async fn save_settings(&self) -> argus_store::Result<()> {
+        let _guard = self.save_lock.lock().await;
+        let snapshot = self.settings();
+        snapshot.save(&self.services.store.settings()).await
     }
 
     /// Starts a follow-up of a `Proposed` comment: saves `reply` in the
@@ -125,7 +179,8 @@ impl RunManager {
     /// current proposal, as a new run (`kind = followup`). The comment moves
     /// `Proposed → Running`, and back to `Proposed` with the combined
     /// proposal (`start_sha → worktree`). `model` and `effort` may differ
-    /// from the earlier runs; the session is the same.
+    /// from the earlier runs; the session is the same. Like
+    /// [`RunManager::start`], they become the Run menu defaults.
     ///
     /// Fails with [`RunError::FollowupUnavailable`] when the proposal's
     /// worktree is gone (e.g. rejected): a new run is needed then. A resume
@@ -172,18 +227,20 @@ impl RunManager {
         effort: String,
     ) -> Result<RunId, RunError> {
         let capabilities = self.capabilities()?;
-        run::follow_up(
+        let run_id = run::follow_up(
             self.services.clone(),
             run::FollowupRequest {
                 comment_id,
                 mode,
-                model,
-                effort,
+                model: model.clone(),
+                effort: effort.clone(),
                 capabilities,
                 rules_path: self.review_rules_path(),
             },
         )
-        .await
+        .await?;
+        self.remember_in_background(&model, &effort);
+        Ok(run_id)
     }
 
     /// The detected CLI, or why runs are blocked.

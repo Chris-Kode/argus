@@ -271,17 +271,18 @@ impl ReviewComments {
         self.session_lost.contains(&id)
     }
 
-    /// Starts a follow-up run of a `Proposed` comment (the reply is saved in
-    /// the thread by the run manager), or a fresh one with the thread as
-    /// context. The task resolves to whether the run started; a failure is
+    /// Starts a follow-up run of a `Proposed` comment with `choice` (model,
+    /// effort) (the reply is saved in the thread by the run manager), or a
+    /// fresh one with the thread as context. The task resolves to whether the run started; a failure is
     /// reported as an error event.
     pub fn follow_up(
         &mut self,
         id: CommentId,
         kind: FollowupKind,
+        choice: (String, String),
         cx: &mut Context<Self>,
     ) -> Task<bool> {
-        let start = followup::spawn_followup(id, kind, cx);
+        let start = followup::spawn_followup(id, kind, choice, cx);
         cx.spawn(async move |this, cx| {
             let result = start.await;
             this.update(cx, |this, cx| match result {

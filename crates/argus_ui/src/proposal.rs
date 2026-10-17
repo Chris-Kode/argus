@@ -650,7 +650,9 @@ impl ProposalView {
             return;
         }
         let task: Task<Result<Option<RunId>, String>> = if followup {
-            let start = followup::spawn_followup(comment_id, FollowupKind::Resume(body), cx);
+            let choice = followup::current(cx);
+            let start =
+                followup::spawn_followup(comment_id, FollowupKind::Resume(body), choice, cx);
             cx.background_executor()
                 .spawn(async move { start.await.map(Some) })
         } else {
@@ -716,7 +718,8 @@ impl ProposalView {
         if self.followup_running() || self.sending_reply {
             return;
         }
-        let start = followup::spawn_followup(comment_id, FollowupKind::Fresh, cx);
+        let choice = followup::current(cx);
+        let start = followup::spawn_followup(comment_id, FollowupKind::Fresh, choice, cx);
         self.sending_reply = true;
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = start.await;

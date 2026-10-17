@@ -49,8 +49,8 @@ status chip (Open, Running, Proposed, Resolved, Dismissed), replies and a menu
 to edit, delete, dismiss or reopen. `]c` / `[c` jump between threads, `shift-c`
 folds them all, and the "Comments" tab of the left dock (`cmd-shift-c`) lists
 every thread by file, filterable by status. File-tree rows show a comment
-count. Debug builds add "Advance status (debug)" to the thread menu, to try
-the status chips before runs exist.
+count. Debug builds add "Advance status (debug)" to the thread menu, to walk
+the status chips by hand.
 
 Comments follow their code. Every time the diff is refreshed (branch change,
 Fetch, Accept), each comment looks for its lines and their context in the new
@@ -65,6 +65,26 @@ example after a revert) is no longer outdated. Resolved comments are moved
 too, but are never flagged outdated.
 
 ![Comment threads in the side-by-side diff](docs/screenshots/comments-light.png)
+
+Run a comment with Claude from its thread: the "Run · sonnet · medium ▾"
+split button runs with the shown model and effort, and its arrow opens the Run
+menu with the models and efforts from the settings. `r` runs the focused
+thread. The last choice becomes the default for the next run and survives a
+restart. Run is disabled for outdated comments and while Claude Code is
+missing or too old. Each run gets its own worktree, and runs go in parallel.
+
+The run panel (`cmd-j`, docked right or bottom with `cmd-shift-j`) lists the
+repository's active runs first, then recent ones. Each row shows the comment,
+`file:line`, model and effort, status, elapsed time, turns, cost and a Stop
+button, and the header totals the active runs and their cost. Clicking a row
+jumps to its comment and shows the run's live log: assistant text as
+Markdown, tool calls as compact rows (`Edit src/foo.rs (+3 −1)`,
+`Bash git diff`) that expand to their input and output, errors in red, and the
+final summary. The log follows new output until you scroll up. "View prompt"
+shows what Claude was sent, and "Finder"/"Files" and "Terminal" open the run's
+worktree. The status bar shows how many runs are active.
+
+![A live run in the run panel](docs/screenshots/runs-light.png)
 
 When a run finishes with a change, its comment turns Proposed. "View proposal"
 (on the thread, or in its menu) opens a proposal tab next to the diff tab. The
@@ -85,9 +105,11 @@ A reply on a Proposed comment, in the proposal tab or in the thread, has two
 send options. **Send as follow-up run** (the default, also on Enter) starts a
 follow-up: it resumes the comment's Claude session (`--resume <session>`) in
 the same worktree, so Claude continues from its earlier edits. **Add note
-only** just saves the reply. The model and effort buttons next to them pick
-what the follow-up uses (the settings defaults until changed). The model and
-effort can change between follow-ups; the session stays the same. While the
+only** just saves the reply. A follow-up uses the Run menu's model and effort.
+On a Proposed thread the Run split button reads "Follow up · model · effort",
+and its menu picks them. In the proposal tab, the model and effort buttons of
+the reply box change the Run menu defaults. The model and effort can change
+between follow-ups; the session stays the same. While the
 follow-up runs, the comment is Running and the proposal's diff follows its
 edits. When it finishes, the comment is Proposed again, with the combined
 change of every run since the first one. Claude's final message of each run

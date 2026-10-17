@@ -71,6 +71,8 @@ struct FieldState {
 pub struct ClaudeSettingsForm {
     settings: ClaudeSettings,
     fields: Vec<FieldState>,
+    /// Follows changes of the live settings made elsewhere.
+    _settings_task: Task<()>,
     /// The run manager's detection of the installed `claude`.
     claude: ClaudeStatus,
     _claude_task: Task<()>,
@@ -119,9 +121,25 @@ impl ClaudeSettingsForm {
             }
         }));
 
+        // Others change the live settings too (the Run menu remembers the
+        // last model and effort); show their values instead of overwriting
+        // them with a stale copy.
+        let mut changes = runs(cx).subscribe();
+        changes.borrow_and_update();
+        let settings_task = cx.spawn(async move |this, cx| {
+            while changes.changed().await.is_ok() {
+                let latest = changes.borrow_and_update().clone();
+                let alive = this.update(cx, |this, cx| this.adopt(latest, cx)).is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        });
+
         Self {
             settings,
             fields,
+            _settings_task: settings_task,
             claude: runs(cx).claude_status(),
             _claude_task: observe_claude_status(cx, |this: &mut Self, status, _| {
                 this.claude = status;
@@ -246,6 +264,21 @@ impl ClaudeSettingsForm {
         cx.notify();
     }
 
+    /// Takes over live settings changed elsewhere, refreshing only the
+    /// fields whose value changed.
+    fn adopt(&mut self, latest: ClaudeSettings, cx: &mut Context<Self>) {
+        if latest == self.settings {
+            return;
+        }
+        let before = std::mem::replace(&mut self.settings, latest);
+        for field in Field::ALL {
+            if field_text(&before, field) != field_text(&self.settings, field) {
+                self.sync_field(field, cx);
+            }
+        }
+        cx.notify();
+    }
+
     /// Shows the applied value in the field and clears its error.
     fn sync_field(&mut self, field: Field, cx: &mut Context<Self>) {
         let text = field_text(&self.settings, field);
@@ -263,17 +296,19 @@ impl ClaudeSettingsForm {
         }
     }
 
+    /// Saves the run manager's live settings, which `apply` just updated.
+    /// The manager serializes writes, so the newest settings always win,
+    /// including defaults the Run menu changed.
     fn save(&mut self, cx: &mut Context<Self>) {
-        let settings = self.settings.clone();
         let app = cx.global::<AppContext>();
-        let (store, runtime) = (app.store.settings(), app.runtime.clone());
+        let (manager, runtime) = (app.runs.clone(), app.runtime.clone());
         let previous = self.save_task.take();
         self.save_task = Some(cx.background_executor().spawn(async move {
             if let Some(previous) = previous {
                 previous.await;
             }
             // Not aborted when the form goes away: a started write finishes.
-            let job = runtime.spawn(async move { settings.save(&store).await });
+            let job = runtime.spawn(async move { manager.save_settings().await });
             match job.await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::warn!(%error, "failed to save Claude settings"),

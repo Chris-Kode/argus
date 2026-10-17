@@ -5,11 +5,12 @@
 //! the title bar hosts its branch pickers, swap and Fetch buttons. Each
 //! resolved comparison gets a [`DiffView`] in the center. The left dock has
 //! two tabs: the file tree (#8), with comment-count badges, and the comment
-//! list (#14); runs (#21) plug into the right or bottom dock. "View proposal"
-//! on a `Proposed` comment opens a [`ProposalView`] tab next to the main diff
-//! tab (#22); the navigation keys follow the active tab. Settings, the
-//! repository list and git are read and written on the tokio runtime; this
-//! view only receives the results.
+//! list (#14). The run panel (#21) lives in the right or bottom dock: the
+//! diff's Run menu and `r` start runs through it, and its rows jump back to
+//! their comments. "View proposal" on a `Proposed` comment opens a
+//! [`ProposalView`] tab next to the main diff tab (#22); the navigation keys
+//! follow the active tab. Settings, the repository list and git are read and
+//! written on the tokio runtime; this view only receives the results.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -48,6 +49,7 @@ use crate::keymap::{
     WORKSPACE_CONTEXT,
 };
 use crate::proposal::{ProposalEvent, ProposalSource, ProposalView};
+use crate::run_panel::{RunPanel, RunPanelEvent};
 use crate::runtime::spawn_job;
 use crate::session::{
     BranchList, Comparison, DiffTarget, RepoSession, SessionEvent, Side, open_repository,
@@ -149,6 +151,9 @@ pub struct Workspace {
     /// The outdated comments listed in the file tree, in its order.
     outdated_comments: Vec<argus_diff::review::CommentId>,
     diff_view: Option<Entity<DiffView>>,
+    /// The runs of the open repository and their live logs (right or
+    /// bottom dock).
+    run_panel: Entity<RunPanel>,
     diff_subscription: Option<Subscription>,
     /// Proposal tabs, after the main diff tab.
     proposals: Vec<ProposalTab>,
@@ -184,7 +189,14 @@ impl Workspace {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
+        let run_panel = cx.new(RunPanel::new);
+        let bottom = settings.run_panel.position == RunPanelPosition::Bottom;
+        run_panel.update(cx, |panel, cx| panel.set_horizontal(bottom, cx));
         let subscriptions = vec![
+            cx.observe(&run_panel, |_, _, cx| cx.notify()),
+            cx.subscribe(&run_panel, |this, _, event: &RunPanelEvent, cx| {
+                this.run_panel_event(event, cx)
+            }),
             cx.observe_window_appearance(window, |this, window, cx| {
                 if this.settings.theme == ThemeMode::System {
                     this.apply_theme(window, cx);
@@ -214,6 +226,7 @@ impl Workspace {
             left_tab: LeftTab::default(),
             outdated_comments: Vec::new(),
             diff_view: None,
+            run_panel,
             diff_subscription: None,
             proposals: Vec::new(),
             active_proposal: None,
@@ -284,6 +297,9 @@ impl Workspace {
             self.apply_theme(window, cx);
         }
         self.sync_diff_options(cx);
+        let bottom = self.settings.run_panel.position == RunPanelPosition::Bottom;
+        self.run_panel
+            .update(cx, |panel, cx| panel.set_horizontal(bottom, cx));
         self.schedule_save(cx);
         cx.notify();
     }
@@ -428,6 +444,9 @@ impl Workspace {
         self.proposals.clear();
         self.active_proposal = None;
         self.viewed_stash = None;
+        let repo_id = record.id;
+        self.run_panel
+            .update(cx, |panel, cx| panel.set_repo(Some(repo_id), cx));
         let session = cx.new(|cx| RepoSession::new(record, repo, cx));
         let flat = self.settings.file_tree.flat_list;
         let file_tree = cx.new(|cx| FileTree::new(flat, cx));
@@ -618,6 +637,16 @@ impl Workspace {
                     }
                     DiffViewEvent::SelectionRejected(hint) => {
                         tracing::debug!(%hint, "selection rejected");
+                    }
+                    DiffViewEvent::RunRequested {
+                        comment_id,
+                        model,
+                        effort,
+                    } => {
+                        let (comment_id, model, effort) =
+                            (*comment_id, model.clone(), effort.clone());
+                        this.run_panel
+                            .update(cx, |panel, cx| panel.start(comment_id, model, effort, cx));
                     }
                     DiffViewEvent::ViewProposal(id) => {
                         this.open_proposal(ProposalSource::Comment(*id), cx);
@@ -1178,10 +1207,10 @@ impl Workspace {
         }
     }
 
-    /// Run is disabled while `claude` is missing, still being checked, or
-    /// lacks a required flag (spec Q4); the reason goes to the status bar.
-    /// Starting runs lands with the Run menu (#21).
-    fn run(&mut self, action: &Run, window: &mut Window, cx: &mut Context<Self>) {
+    /// `r`: runs the focused comment thread with its Run menu choice. Run
+    /// is disabled while `claude` is missing, still being checked, or lacks
+    /// a required flag (spec Q4); the reason goes to the status bar.
+    fn run(&mut self, _: &Run, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(blocker) = self.claude.run_blocker() {
             self.notice = Some(Notice {
                 message: blocker.into(),
@@ -1190,13 +1219,48 @@ impl Workspace {
             cx.notify();
             return;
         }
-        self.not_wired_yet(action, window, cx);
+        // In a proposal tab `r` replies to the proposal; it never gets here.
+        if self.diff_view.is_none() || self.active_proposal.is_some() {
+            self.notice = Some(Notice {
+                message: "Open the diff and click a comment thread to run it.".into(),
+                is_error: false,
+            });
+            cx.notify();
+            return;
+        }
+        self.update_main_diff(cx, |view, cx| view.run_focused_comment(cx));
     }
 
-    /// Placeholder handler for review actions whose views land in later
-    /// issues (runs #21).
-    fn not_wired_yet<A: Action>(&mut self, action: &A, _: &mut Window, _: &mut Context<Self>) {
-        tracing::debug!(action = action.name(), "action not wired yet");
+    /// Reacts to the run panel: shows it when a run starts, jumps to a
+    /// run's comment, relays notices to the status bar.
+    fn run_panel_event(&mut self, event: &RunPanelEvent, cx: &mut Context<Self>) {
+        match event {
+            RunPanelEvent::Started(run_id) => {
+                tracing::debug!(run = %run_id, "run started from the UI");
+                if !self.settings.run_panel.visible {
+                    self.settings.run_panel.visible = true;
+                    self.schedule_save(cx);
+                }
+            }
+            RunPanelEvent::OpenComment(id) => {
+                let id = *id;
+                self.activate_tab(None, cx);
+                self.update_main_diff(cx, |view, cx| view.reveal_comment(id, cx));
+                if let Some(list) = self.comment_list.clone() {
+                    list.update(cx, |list, cx| list.select(id, cx));
+                }
+            }
+            RunPanelEvent::ViewProposal(run_id) => {
+                self.open_proposal(ProposalSource::Run(*run_id), cx);
+            }
+            RunPanelEvent::Notice { message, is_error } => {
+                self.notice = Some(Notice {
+                    message: message.clone(),
+                    is_error: *is_error,
+                });
+            }
+        }
+        cx.notify();
     }
 
     // ---- dock resizing ------------------------------------------------------
@@ -1667,11 +1731,7 @@ impl Workspace {
             .flex_none()
             .bg(colors.surface)
             .border_color(colors.border)
-            .child(panel_header("Runs", cx))
-            .child(placeholder(
-                "No runs yet. Comment on a line and run it with Claude.",
-                cx,
-            ))
+            .child(self.run_panel.clone())
             .child(self.resize_handle(DockResize::RunPanel, bottom, cx));
         if bottom {
             panel

@@ -2,16 +2,17 @@
 //!
 //! A reply on a `Proposed` comment can be sent as a follow-up run, which
 //! resumes the thread's Claude session in the proposal's worktree, or added
-//! as a note only. [`FollowupChoice`] holds the model and effort the next
-//! follow-up uses: the run defaults of the settings until the user picks
-//! others with [`choice_buttons`], so they can change between follow-ups
-//! while the session stays the same. [`spawn_followup`] starts the run on
-//! the tokio runtime; the UI thread only waits for the outcome.
+//! as a note only. A follow-up uses the Run menu's model and effort: the
+//! thread's Run menu pick, or the Run menu defaults (the last choice),
+//! which the proposal tab's [`choice_buttons`] change. They can change
+//! between follow-ups while the session stays the same. [`spawn_followup`]
+//! starts the run on the tokio runtime; the UI thread only waits for the
+//! outcome.
 
 use argus_diff::review::CommentId;
 use argus_runs::RunError;
 use argus_store::RunId;
-use gpui::{App, Context, Div, Global, SharedString, Task, prelude::*};
+use gpui::{App, Context, Div, SharedString, Task, prelude::*};
 
 use crate::AppContext;
 use crate::components::button;
@@ -27,29 +28,10 @@ pub enum FollowupKind {
     Fresh,
 }
 
-/// The model and effort picked for follow-ups in this session of the app.
-/// `None` follows the settings' defaults.
-#[derive(Clone, Debug, Default)]
-pub struct FollowupChoice {
-    model: Option<String>,
-    effort: Option<String>,
-}
-
-impl Global for FollowupChoice {}
-
-/// The model and effort of the next follow-up.
+/// The Run menu defaults: the model and effort of the last run.
 pub fn current(cx: &App) -> (String, String) {
     let settings = cx.global::<AppContext>().runs.settings();
-    let choice = cx.try_global::<FollowupChoice>();
-    let model = choice
-        .and_then(|choice| choice.model.clone())
-        .filter(|model| settings.models.contains(model))
-        .unwrap_or(settings.default_model);
-    let effort = choice
-        .and_then(|choice| choice.effort.clone())
-        .filter(|effort| settings.efforts.contains(effort))
-        .unwrap_or(settings.default_effort);
-    (model, effort)
+    (settings.default_model, settings.default_effort)
 }
 
 /// `model · effort`, as the reply box shows it.
@@ -61,20 +43,33 @@ pub fn label(model: &str, effort: &str) -> String {
     }
 }
 
-/// Picks the next model of the settings' list.
+/// Makes the next model of the settings' list the Run menu default.
 pub fn cycle_model(cx: &mut App) {
-    let models = cx.global::<AppContext>().runs.settings().models;
-    let (model, _) = current(cx);
-    let next = next_in(&models, &model);
-    cx.default_global::<FollowupChoice>().model = next;
+    let settings = cx.global::<AppContext>().runs.settings();
+    if let Some(model) = next_in(&settings.models, &settings.default_model) {
+        remember(model, settings.default_effort, cx);
+    }
 }
 
-/// Picks the next effort of the settings' list.
+/// Makes the next effort of the settings' list the Run menu default.
 pub fn cycle_effort(cx: &mut App) {
-    let efforts = cx.global::<AppContext>().runs.settings().efforts;
-    let (_, effort) = current(cx);
-    let next = next_in(&efforts, &effort);
-    cx.default_global::<FollowupChoice>().effort = next;
+    let settings = cx.global::<AppContext>().runs.settings();
+    if let Some(effort) = next_in(&settings.efforts, &settings.default_effort) {
+        remember(settings.default_model, effort, cx);
+    }
+}
+
+/// Stores a new Run menu default; the settings are saved off the UI thread.
+fn remember(model: String, effort: String, cx: &mut App) {
+    let app = cx.global::<AppContext>();
+    let runs = app.runs.clone();
+    if runs.remember_choice(&model, &effort) {
+        app.runtime.spawn(async move {
+            if let Err(error) = runs.save_settings().await {
+                tracing::warn!(%error, "cannot save the Run menu defaults");
+            }
+        });
+    }
 }
 
 fn next_in(list: &[String], current: &str) -> Option<String> {
@@ -83,8 +78,8 @@ fn next_in(list: &[String], current: &str) -> Option<String> {
     list.get(next).cloned()
 }
 
-/// The model and effort buttons of a reply box; a click picks the next
-/// entry of the settings' list.
+/// The model and effort buttons of a reply box (the Run menu defaults); a
+/// click picks the next entry of the settings' list.
 pub fn choice_buttons<V: 'static>(id: &str, cx: &mut Context<V>) -> Div {
     let (model, effort) = current(cx);
     let colors = cx.theme().colors.clone();
@@ -115,16 +110,15 @@ pub fn choice_buttons<V: 'static>(id: &str, cx: &mut Context<V>) -> Div {
         .children(effort_button)
 }
 
-/// Starts a follow-up of `comment_id` with the current model and effort.
-/// The run is started on the tokio runtime and is not cut short when the
-/// view goes away; the task resolves once its process runs (or it failed
-/// to start).
+/// Starts a follow-up of `comment_id` with `model` and `effort`. The run
+/// is started on the tokio runtime and is not cut short when the view goes
+/// away; the task resolves once its process runs (or it failed to start).
 pub fn spawn_followup(
     comment_id: CommentId,
     kind: FollowupKind,
+    (model, effort): (String, String),
     cx: &mut App,
 ) -> Task<Result<RunId, String>> {
-    let (model, effort) = current(cx);
     let runs = cx.global::<AppContext>().runs.clone();
     let handle = cx.global::<AppContext>().runtime.spawn(async move {
         match kind {
