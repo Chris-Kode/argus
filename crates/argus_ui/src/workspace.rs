@@ -2551,6 +2551,15 @@ impl Workspace {
                     .gap_2()
                     .child(job_indicator)
                     .child(
+                        button("status-settings", "Settings", cx)
+                            .h(px(20.0))
+                            .text_xs()
+                            .text_color(colors.text_muted)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(OpenSettings.boxed_clone(), cx)
+                            }),
+                    )
+                    .child(
                         button("status-shortcuts", "Shortcuts", cx)
                             .h(px(20.0))
                             .text_xs()
