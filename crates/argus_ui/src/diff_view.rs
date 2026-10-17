@@ -67,8 +67,20 @@
 //! [`DiffViewEvent::LinesSelected`], or rejected with a hint (e.g. when it
 //! crosses a hunk header). In side-by-side mode each column has its own
 //! gutter: the left one selects old lines, the right one new lines. The
-//! gutter "+" emits
-//! [`DiffViewEvent::CommentRequested`]; comments (#14) subscribe to both.
+//! gutter "+" (or `c`) opens a comment composer under the selection and
+//! emits [`DiffViewEvent::CommentRequested`].
+//!
+//! # Comment threads
+//!
+//! Threads and composers are blocks of rows inside the virtual list
+//! ([`Row::Inline`], placed by [`layout::place_inline`] under the last line
+//! of their range), so hundreds of comments cost nothing until they scroll
+//! into view. A block is drawn whole from its first visible row and
+//! measured as it paints; when its height in rows changes the file is
+//! re-placed, keeping the reading position. Lines a comment covers that
+//! sit in collapsed context are revealed ([`layout::reveal_lines`]), so a
+//! thread made on expanded context comes back at its line after a restart.
+//! See [`threads`].
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
@@ -87,19 +99,25 @@ use argus_highlight::{
     JobControl, Language, Outcome, Priority, Span,
 };
 use gpui::{
-    AnyElement, Context, DispatchPhase, EventEmitter, FontWeight, HighlightStyle, Hsla,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent,
-    SharedString, StyledText, Task, UniformListScrollHandle, Window, canvas, div, point,
-    prelude::*, px, uniform_list,
+    AnyElement, Context, DispatchPhase, Entity, EventEmitter, FocusHandle, FontWeight,
+    HighlightStyle, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    ScrollWheelEvent, SharedString, StyledText, Subscription, Task, UniformListScrollHandle,
+    Window, canvas, div, point, prelude::*, px, uniform_list,
 };
 
 use crate::AppContext;
+use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{button, placeholder, toggle_button};
 use crate::jobs::BackgroundJobs;
 use crate::keymap::ToggleSoftWrap;
 use crate::runtime::spawn_job;
 use crate::session::DiffTarget;
 use crate::theme::{ActiveTheme, SyntaxTheme};
+
+mod threads;
+
+pub use threads::{CommentDrafts, DraftKey};
+use threads::{FileThreads, Threads};
 
 /// Files within this many screens above and below the viewport are loaded.
 const PREFETCH_SCREENS: usize = 2;
@@ -287,6 +305,8 @@ struct FileSlot {
     words_task: Option<Task<()>>,
     /// Syntax highlights of the loaded diff.
     syntax: FileSyntax,
+    /// Comment threads and composers placed in the loaded rows.
+    threads: FileThreads,
 }
 
 impl FileSlot {
@@ -302,6 +322,7 @@ impl FileSlot {
             last_used: 0,
             words_task: None,
             syntax: FileSyntax::default(),
+            threads: FileThreads::default(),
         }
     }
 
@@ -441,6 +462,19 @@ pub struct DiffView {
     layout_anchor: Option<(usize, RowKey)>,
     list_task: Option<Task<()>>,
     stats_task: Option<Task<()>>,
+    /// File-list index by path (head path, and old path of renames).
+    path_index: HashMap<String, usize>,
+    /// The comments of the review this diff belongs to.
+    comments: Entity<ReviewComments>,
+    _comments_subscription: Subscription,
+    /// Comment threads, composers and their editors.
+    threads: Threads,
+    /// The first row the virtual list is drawing this frame; a comment block
+    /// that starts above it is drawn from there.
+    render_start: usize,
+    /// Focus target after an editor closes, so the shortcuts keep working.
+    focus_handle: FocusHandle,
+    focus_requested: bool,
 }
 
 impl EventEmitter<DiffViewEvent> for DiffView {}
@@ -454,8 +488,15 @@ impl DiffView {
         target: DiffTarget,
         options: DisplayOptions,
         viewed: HashSet<String>,
+        comments: Entity<ReviewComments>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let comments_subscription =
+            cx.subscribe(&comments, |this, _, event: &ReviewCommentsEvent, cx| {
+                if let ReviewCommentsEvent::Changed(_) = event {
+                    this.comments_changed(cx);
+                }
+            });
         let mut this = Self {
             session,
             target,
@@ -489,7 +530,15 @@ impl DiffView {
             layout_anchor: None,
             list_task: None,
             stats_task: None,
+            path_index: HashMap::new(),
+            comments,
+            _comments_subscription: comments_subscription,
+            threads: Threads::default(),
+            render_start: 0,
+            focus_handle: cx.focus_handle(),
+            focus_requested: false,
         };
+        this.comments_changed(cx);
         this.load_list(cx);
         // A view dropped mid-highlight must not leave the status bar busy.
         cx.on_release(|this, cx| {
@@ -586,6 +635,15 @@ impl DiffView {
                 )
             })
             .collect();
+        self.path_index = list
+            .entries()
+            .iter()
+            .enumerate()
+            .flat_map(|(index, entry)| {
+                std::iter::once((entry.path.clone(), index))
+                    .chain(entry.old_path.clone().map(|old| (old, index)))
+            })
+            .collect();
         self.status = ListStatus::Ready(list);
         self.rebuild_starts();
         self.recount_totals();
@@ -650,20 +708,30 @@ impl DiffView {
             return;
         };
         let session = self.session.clone();
-        let (mode, expansions, layout) =
+        let (mode, mut expansions, layout) =
             (slot.mode, slot.expansions.clone(), self.layout_options());
+        let commented = self.commented_ranges(file);
         let job = spawn_job(cx, async move {
             let diff = session
                 .file_diff_at(file, mode)
                 .await
                 .map_err(|error| error.to_string())?;
-            let rows = {
+            let (rows, expansions) = {
                 let diff = diff.clone();
-                tokio::task::spawn_blocking(move || layout::build_rows(&diff, &expansions, layout))
-                    .await
-                    .map_err(|error| error.to_string())?
+                tokio::task::spawn_blocking(move || {
+                    // Commented lines in collapsed context are shown.
+                    if let Some(text) = diff.text() {
+                        let gaps = layout::gaps(text);
+                        for (side, start, end) in commented {
+                            layout::reveal_lines(&gaps, &mut expansions, side, start, end);
+                        }
+                    }
+                    (layout::build_rows(&diff, &expansions, layout), expansions)
+                })
+                .await
+                .map_err(|error| error.to_string())?
             };
-            Ok::<_, String>((diff, rows))
+            Ok::<_, String>((diff, rows, expansions))
         });
         let task = cx.spawn(async move |this, cx| {
             let result = job.await.unwrap_or_else(|error| Err(error.to_string()));
@@ -677,7 +745,7 @@ impl DiffView {
         &mut self,
         file: usize,
         layout_used: LayoutOptions,
-        result: Result<(Arc<FileDiff>, FileRows), String>,
+        result: Result<(Arc<FileDiff>, FileRows, Vec<GapExpansion>), String>,
         cx: &mut Context<Self>,
     ) {
         self.loads.remove(&file);
@@ -685,7 +753,8 @@ impl DiffView {
             return;
         }
         match result {
-            Ok((diff, rows)) => {
+            Ok((diff, rows, expansions)) => {
+                self.files[file].expansions = expansions;
                 let layout = self.layout_options();
                 let rows = if layout_used == layout {
                     rows
@@ -706,7 +775,9 @@ impl DiffView {
                     }
                     slot.state = FileState::Loaded(Box::new(loaded));
                     slot.syntax.reset();
+                    this.place_threads(file);
                 });
+                self.reveal_pending(cx);
                 self.compute_words(file, diff, cx);
                 if !self.files[file].collapsed {
                     let priority = self.priority_of(file);
@@ -1036,6 +1107,7 @@ impl DiffView {
                 self.held_bytes = self.held_bytes.saturating_sub(loaded.bytes);
             }
             slot.words_task = None;
+            slot.threads = FileThreads::default();
             // The service keeps the results cached; a reload reuses them.
             slot.syntax.reset();
             self.highlights.remove(&victim);
@@ -1074,6 +1146,11 @@ impl DiffView {
                 let rows = layout::build_rows(&loaded.diff, &slot.expansions, layout);
                 **loaded = LoadedFile::new(loaded.diff.clone(), rows, layout);
                 slot.full_len = loaded.rows.rows.len();
+            }
+            for file in 0..this.files.len() {
+                if this.files[file].loaded().is_some() {
+                    this.place_threads(file);
+                }
             }
             this.selection = None;
         });
@@ -1459,6 +1536,7 @@ impl DiffView {
             **loaded = LoadedFile::new(loaded.diff.clone(), rows, layout);
             held += loaded.bytes;
             slot.full_len = loaded.rows.rows.len();
+            this.place_threads(file);
             if this
                 .selection
                 .is_some_and(|selection| selection.file == file)
@@ -1535,6 +1613,8 @@ impl DiffView {
                 // Stay within the file; headers and expanders in between are
                 // caught when the selection is resolved.
                 let head = row.clamp(start + 1, start + len.saturating_sub(1).max(1)) - start;
+                // Over a comment block, the line it hangs under.
+                let head = self.line_row_at_or_above(selection.file, head);
                 if head != selection.head {
                     self.selection = Some(Selection { head, ..selection });
                     cx.notify();
@@ -1619,6 +1699,7 @@ impl DiffView {
             });
         }
         if let Some(selection) = self.resolve_selection(cx) {
+            self.open_composer(file, selection.clone(), cx);
             cx.emit(DiffViewEvent::CommentRequested(selection));
         }
         cx.notify();
@@ -1721,11 +1802,28 @@ impl DiffView {
         };
         let list = list.clone();
         let columns = self.columns();
+        self.render_start = range.start;
         range
             .map(|row| {
                 let file = self.file_at(row);
                 let local = row - self.starts[file];
                 let entry = &list.entries()[file];
+                if let Some(Row::Inline { item, part }) = self.files[file]
+                    .loaded()
+                    .and_then(|loaded| loaded.rows.rows.get(local).copied())
+                {
+                    // A comment block overflows its row; it is drawn once,
+                    // from its first visible row.
+                    let first_visible = part == 0 || row == self.render_start;
+                    return div()
+                        .relative()
+                        .h(self.metrics.row_height)
+                        .w_full()
+                        .when(first_visible, |wrapper| {
+                            wrapper.child(self.render_inline_block(file, item as usize, part, cx))
+                        })
+                        .into_any_element();
+                }
                 let element = if local == 0 {
                     self.render_file_header(file, entry, false, cx)
                 } else {
@@ -1794,7 +1892,9 @@ impl DiffView {
                 Some(&line_row @ (Row::Line { .. } | Row::Context { .. })) => {
                     self.render_line(file, loaded, line_row, local, row, columns, cx)
                 }
-                Some(Row::FileHeader | Row::Placeholder) | None => div().into_any_element(),
+                Some(Row::FileHeader | Row::Placeholder | Row::Inline { .. }) | None => {
+                    div().into_any_element()
+                }
             },
             FileState::Failed(_) if local == 1 => {
                 self.render_notice(file, entry, slot, columns, cx)
@@ -1878,15 +1978,22 @@ impl DiffView {
             .size_full()
             .bg(style.background)
             .child(gutter)
-            .child(self.comment_column(
-                ("diff-comment", row),
-                LINE_GROUP,
-                first_segment,
-                file,
-                local,
-                None,
-                cx,
-            ))
+            .child(
+                self.comment_column(
+                    ("diff-comment", row),
+                    LINE_GROUP,
+                    first_segment,
+                    file,
+                    local,
+                    None,
+                    cx,
+                )
+                .when(
+                    self.in_comment_range(file, DiffSide::Old, line.old_line)
+                        || self.in_comment_range(file, DiffSide::New, line.new_line),
+                    |column| column.bg(colors.warning.opacity(0.35)),
+                ),
+            )
             .child(
                 div()
                     .flex_none()
@@ -2025,15 +2132,20 @@ impl DiffView {
         half.group(group)
             .bg(style.background)
             .child(gutter)
-            .child(self.comment_column(
-                (comment_id, row),
-                group,
-                first_segment,
-                file,
-                local,
-                Some(side),
-                cx,
-            ))
+            .child(
+                self.comment_column(
+                    (comment_id, row),
+                    group,
+                    first_segment,
+                    file,
+                    local,
+                    Some(side),
+                    cx,
+                )
+                .when(self.in_comment_range(file, side, number), |column| {
+                    column.bg(colors.warning.opacity(0.35))
+                }),
+            )
             .child(
                 div()
                     .flex_none()
@@ -2523,19 +2635,33 @@ impl DiffView {
                     })),
             )
             .child(
-                toggle_button("diff-soft-wrap", "Soft wrap", self.options.soft_wrap, cx)
-                    .text_xs()
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSoftWrap), cx)),
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .children(self.render_comments_toolbar(cx))
+                    .child(
+                        toggle_button("diff-soft-wrap", "Soft wrap", self.options.soft_wrap, cx)
+                            .text_xs()
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(ToggleSoftWrap), cx)
+                            }),
+                    ),
             )
     }
 }
 
 impl Render for DiffView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.focus_requested) {
+            window.focus(&self.focus_handle, cx);
+        }
         let theme = cx.theme().clone();
         let colors = &theme.colors;
         let toolbar = self.render_toolbar(cx).into_any_element();
         let root = div()
+            .track_focus(&self.focus_handle)
             .flex()
             .flex_col()
             .flex_1()

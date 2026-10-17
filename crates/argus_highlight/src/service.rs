@@ -34,6 +34,20 @@ pub struct HighlightKey {
     pub language: Language,
 }
 
+impl HighlightKey {
+    /// A key for text that is not a git blob, such as a fenced code block in
+    /// a comment: the "blob" id is a 128-bit hash of the text (zero-padded
+    /// to an object id), so equal snippets share one cached result. A
+    /// collision with a real blob id is astronomically unlikely, and would
+    /// only show wrong colors. `None` only if the padded hash failed to
+    /// parse as an object id.
+    pub fn for_text(text: &str, language: Language) -> Option<Self> {
+        let hash = xxhash_rust::xxh3::xxh3_128(text.as_bytes());
+        let blob = Sha::parse(&format!("{hash:032x}00000000"))?;
+        Some(Self { blob, language })
+    }
+}
+
 /// How urgently a job is wanted. Higher runs first; among equals, the
 /// oldest request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -119,6 +119,8 @@ pub struct ThemeColors {
     pub warning: Hsla,
     /// Errors (failed runs, failed operations).
     pub error: Hsla,
+    /// The "Proposed" comment status chip (a change is waiting for review).
+    pub status_proposed: Hsla,
 }
 
 fn color(hex: u32) -> Hsla {
@@ -153,6 +155,7 @@ impl ThemeColors {
             diff_removed_text: color(0xd07277ff),
             warning: color(0xdec184ff),
             error: color(0xd07277ff),
+            status_proposed: color(0xb477cfff),
         }
     }
 
@@ -182,6 +185,7 @@ impl ThemeColors {
             diff_removed_text: color(0xd36151ff),
             warning: color(0xa48819ff),
             error: color(0xd36151ff),
+            status_proposed: color(0xa449abff),
         }
     }
 }

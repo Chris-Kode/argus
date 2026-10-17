@@ -153,66 +153,80 @@ impl ReviewComments {
         }));
     }
 
-    /// Creates a comment on the loaded review.
-    pub fn create(&mut self, anchor: CommentAnchor, body_md: String, cx: &mut Context<Self>) {
+    /// Creates a comment on the loaded review. The task resolves to whether
+    /// it was saved (a failure is also reported as an error event); detach
+    /// it when the outcome does not matter.
+    pub fn create(
+        &mut self,
+        anchor: CommentAnchor,
+        body_md: String,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
         let service = self.service.clone();
         self.run(cx, "create the comment", async move {
             service.create(anchor, body_md).await.map(drop)
-        });
+        })
     }
 
     /// Replaces a comment's body.
-    pub fn edit(&mut self, id: CommentId, body_md: String, cx: &mut Context<Self>) {
+    pub fn edit(&mut self, id: CommentId, body_md: String, cx: &mut Context<Self>) -> Task<bool> {
         let service = self.service.clone();
         self.run(cx, "edit the comment", async move {
             service.edit(id, body_md).await
-        });
+        })
     }
 
     /// Adds a reviewer reply to a thread.
-    pub fn reply(&mut self, id: CommentId, body_md: String, cx: &mut Context<Self>) {
+    pub fn reply(&mut self, id: CommentId, body_md: String, cx: &mut Context<Self>) -> Task<bool> {
         let service = self.service.clone();
         self.run(cx, "reply", async move {
             service
                 .reply(id, ReplyAuthor::User, body_md)
                 .await
                 .map(drop)
-        });
+        })
     }
 
     /// Deletes a thread with its replies.
-    pub fn delete(&mut self, id: CommentId, cx: &mut Context<Self>) {
+    pub fn delete(&mut self, id: CommentId, cx: &mut Context<Self>) -> Task<bool> {
         let service = self.service.clone();
         self.run(
             cx,
             "delete the comment",
             async move { service.delete(id).await },
-        );
+        )
     }
 
     /// Applies a status event (e.g. Dismiss, Reopen).
-    pub fn apply(&mut self, id: CommentId, event: CommentEvent, cx: &mut Context<Self>) {
+    pub fn apply(
+        &mut self,
+        id: CommentId,
+        event: CommentEvent,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
         let service = self.service.clone();
         self.run(cx, "update the comment", async move {
             service.apply(id, event).await.map(drop)
-        });
+        })
     }
 
     /// Runs a write on the tokio runtime to completion (a write must not be
-    /// cut short by the view going away) and reports its failure.
+    /// cut short by the view going away) and reports its failure. The task
+    /// resolves to whether the write succeeded; dropping it only skips the
+    /// report.
     fn run(
         &mut self,
         cx: &mut Context<Self>,
         what: &'static str,
         future: impl Future<Output = Result<(), ReviewError>> + Send + 'static,
-    ) {
+    ) -> Task<bool> {
         let handle = cx.global::<AppContext>().runtime.spawn(future);
         cx.spawn(async move |this, cx| {
-            let result = handle.await;
-            this.update(cx, |_, cx| report(flatten(result), what, cx))
-                .ok();
+            let result = flatten(handle.await);
+            let ok = result.is_ok();
+            this.update(cx, |_, cx| report(result, what, cx)).ok();
+            ok
         })
-        .detach();
     }
 }
 

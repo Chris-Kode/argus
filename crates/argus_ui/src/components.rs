@@ -1,8 +1,9 @@
 //! Small styled building blocks shared by the shell views.
 
-use gpui::{App, Div, ElementId, SharedString, Stateful, div, prelude::*, px};
+use argus_diff::review::CommentStatus;
+use gpui::{App, Div, ElementId, FontWeight, Hsla, SharedString, Stateful, div, prelude::*, px};
 
-use crate::theme::ActiveTheme;
+use crate::theme::{ActiveTheme, ThemeColors};
 
 /// A borderless, Zed-style ghost button. Callers attach `on_click`.
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, cx: &App) -> Stateful<Div> {
@@ -138,6 +139,38 @@ pub fn placeholder(text: impl Into<SharedString>, cx: &App) -> Div {
                 .text_color(cx.theme().colors.text_placeholder)
                 .child(text.into()),
         )
+}
+
+/// The label and color of a status (spec §7.2).
+pub fn status_style(status: CommentStatus, colors: &ThemeColors) -> (&'static str, Hsla) {
+    match status {
+        CommentStatus::Open => ("Open", colors.accent),
+        CommentStatus::Running => ("Running", colors.warning),
+        CommentStatus::Proposed => ("Proposed", colors.status_proposed),
+        CommentStatus::Resolved => ("Resolved", colors.diff_added_text),
+        CommentStatus::Dismissed => ("Dismissed", colors.text_placeholder),
+    }
+}
+
+/// A coloured status chip.
+pub fn status_chip(status: CommentStatus, colors: &ThemeColors) -> Div {
+    let (label, color) = status_style(status, colors);
+    chip(label, color)
+}
+
+/// A small rounded label.
+pub fn chip(label: &'static str, color: Hsla) -> Div {
+    div()
+        .flex_none()
+        .px_1p5()
+        .rounded_full()
+        .border_1()
+        .border_color(color.opacity(0.6))
+        .bg(color.opacity(0.15))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(color)
+        .child(label)
 }
 
 /// A settings-section title with a trailing control (e.g. "Reset to
