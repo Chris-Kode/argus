@@ -38,6 +38,7 @@ use crate::keymap::{
     CollapseEntry, Dismiss, ExpandEntry, FILE_TREE_CONTEXT, OpenEntry, SelectNextEntry,
     SelectPreviousEntry, TEXT_INPUT_CONTEXT,
 };
+use crate::perf;
 use crate::runtime::spawn_job;
 use crate::session::DiffTarget;
 use crate::theme::{ActiveTheme, ThemeColors};
@@ -283,6 +284,7 @@ impl FileTree {
         let selected_path = self.selection_path();
         let Loaded { list, index } = loaded;
         tracing::debug!(files = list.len(), "file tree loaded");
+        perf::file_list_computed(list.len(), cx);
         self.stats = vec![None; list.len()];
         self.index = index;
         self.list = Some(list.clone());
@@ -721,6 +723,9 @@ impl FileTree {
         range: std::ops::Range<usize>,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        if !range.is_empty() {
+            perf::mark_painted(perf::Milestone::FileTreePainted, cx);
+        }
         let colors = cx.theme().colors.clone();
         let mut elements = Vec::with_capacity(range.len());
         for row_index in range {

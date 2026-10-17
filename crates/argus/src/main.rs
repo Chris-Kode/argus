@@ -3,12 +3,21 @@
 //! Keep this crate thin: services live in the library crates so they can be
 //! exercised without a window (spec §4.1). This crate only wires them up.
 
+mod cli;
 mod logging;
 mod paths;
 
 use anyhow::Context as _;
 
 fn main() -> anyhow::Result<()> {
+    let launched = std::time::Instant::now();
+    let launch = match cli::parse(std::env::args_os(), launched)? {
+        cli::Command::Run(launch) => launch,
+        cli::Command::Print(text) => {
+            println!("{text}");
+            return Ok(());
+        }
+    };
     let argus_home = paths::argus_home();
     logging::init(&argus_home).with_context(|| {
         format!(
@@ -46,7 +55,13 @@ fn main() -> anyhow::Result<()> {
         .block_on(argus_ui::open_worktrees(&argus_home, &store))
         .context("failed to prepare the worktrees directory")?;
 
-    argus_ui::run_gpui_app(runtime.handle().clone(), store, worktrees, argus_home);
+    argus_ui::run_gpui_app(
+        runtime.handle().clone(),
+        store,
+        worktrees,
+        argus_home,
+        launch,
+    );
 
     tracing::info!("Argus exited");
     Ok(())

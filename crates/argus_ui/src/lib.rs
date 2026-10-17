@@ -20,6 +20,7 @@ pub mod fuzzy;
 pub mod jobs;
 pub mod keymap;
 pub mod markdown;
+pub mod perf;
 pub mod proposal;
 pub mod push;
 pub mod run_panel;
@@ -32,6 +33,7 @@ pub mod theme;
 mod workspace;
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use argus_git::{GitService, WorktreeManager};
 use argus_highlight::HighlightService;
@@ -49,6 +51,7 @@ pub use diff_view::{
 };
 pub use file_tree::{FileTree, FileTreeEvent};
 pub use jobs::BackgroundJobs;
+pub use perf::PerfOptions;
 pub use proposal::{ProposalEvent, ProposalSource, ProposalView};
 pub use run_panel::{RunPanel, RunPanelEvent};
 pub use session::{Comparison, DiffTarget, RepoSession, SessionEvent, Side};
@@ -98,6 +101,29 @@ impl AppContext {
             runtime,
         }
     }
+}
+
+/// A repository to open at launch instead of the most recent one, from the
+/// command line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenRequest {
+    /// Any path inside the repository.
+    pub repo: PathBuf,
+    /// Base branch; `None` keeps the remembered or default one.
+    pub base: Option<String>,
+    /// Head branch; `None` keeps the remembered or default one.
+    pub head: Option<String>,
+}
+
+/// What the command line and the environment ask of the app.
+#[derive(Clone, Debug)]
+pub struct LaunchOptions {
+    /// Open this repository at launch.
+    pub open: Option<OpenRequest>,
+    /// The `ARGUS_PERF` timing mode.
+    pub perf: Option<PerfOptions>,
+    /// Process start, for the perf report.
+    pub launched: Instant,
 }
 
 /// Opens the worktrees root under `argus_home` and marks the runs a previous
@@ -196,11 +222,15 @@ async fn ensure_default_review_rules(argus_home: &Path) {
 /// rules created, on the tokio runtime before the event loop starts; then the
 /// thread is marked as the UI thread, so debug builds panic on any storage call
 /// made from it.
+///
+/// `launch` carries the command line: a repository to open instead of the
+/// most recent one, and the `ARGUS_PERF` timing mode (see [`perf`]).
 pub fn run_gpui_app(
     runtime: tokio::runtime::Handle,
     store: StorageService,
     worktrees: WorktreeManager,
     argus_home: PathBuf,
+    launch: LaunchOptions,
 ) {
     let git = GitService::new();
     runtime.spawn(reconcile_worktrees(
@@ -239,6 +269,9 @@ pub fn run_gpui_app(
             runs.clone(),
         ));
         cx.set_global(BackgroundJobs::default());
+        if let Some(options) = launch.perf {
+            perf::install(options, launch.launched, cx);
+        }
         // A provisional theme so views can render before the workspace
         // resolves fonts and the window appearance.
         cx.set_global(Theme::new(Appearance::Dark, ThemeFonts::default()));
@@ -275,7 +308,8 @@ pub fn run_gpui_app(
             },
             |window, cx| {
                 let settings = ui_settings.clone();
-                cx.new(|cx| Workspace::new(settings, window, cx))
+                let open = launch.open.clone();
+                cx.new(|cx| Workspace::new(settings, open, window, cx))
             },
         );
         if let Err(error) = window {

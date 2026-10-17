@@ -36,7 +36,6 @@ use gpui::{
     WindowControlArea, deferred, div, prelude::*, px,
 };
 
-use crate::AppContext;
 use crate::accept::{AcceptFlow, AcceptFlowEvent};
 use crate::branch_picker::{BranchPicker, PickerEvent};
 use crate::claude_settings::ClaudeSettingsForm;
@@ -60,6 +59,7 @@ use crate::keymap::{
     ToggleKeyboardShortcuts, ToggleRunPanel, ToggleRunPanelPosition, ToggleSoftWrap,
     WORKSPACE_CONTEXT,
 };
+use crate::perf;
 use crate::proposal::{ProposalEvent, ProposalSource, ProposalView};
 use crate::push::{PushFlow, PushFlowEvent};
 use crate::run_panel::{RunPanel, RunPanelEvent};
@@ -73,6 +73,7 @@ use crate::settings::{
     MIN_DOCK_SIZE, RunPanelPosition, UiSettings, clamp_font_size, clamp_tab_width,
 };
 use crate::theme::{ActiveTheme, Theme, ThemeFonts, ThemeMode};
+use crate::{AppContext, OpenRequest};
 
 /// Height of the title bar.
 const TITLE_BAR_HEIGHT: Pixels = px(36.0);
@@ -191,6 +192,9 @@ pub struct Workspace {
     picker_closed: Option<(Side, Instant)>,
     /// Reopen the most recent repository once the list first loads.
     restore_last_repo: bool,
+    /// Base and head asked for on the command line, applied to the next
+    /// repository that opens.
+    launch_branches: Option<(Option<String>, Option<String>)>,
     recent: RecentRepos,
     sheet: Option<Sheet>,
     notice: Option<Notice>,
@@ -207,8 +211,14 @@ pub struct Workspace {
 
 impl Workspace {
     /// Builds the shell with the settings loaded at startup, installs the
-    /// theme and starts loading the recent repositories.
-    pub fn new(settings: UiSettings, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// theme and starts loading the recent repositories. `open` (from the
+    /// command line) opens a repository instead of the most recent one.
+    pub fn new(
+        settings: UiSettings,
+        open: Option<OpenRequest>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
@@ -283,7 +293,8 @@ impl Workspace {
             viewed_stash: None,
             picker: None,
             picker_closed: None,
-            restore_last_repo: true,
+            restore_last_repo: open.is_none(),
+            launch_branches: None,
             recent: RecentRepos::Loading,
             sheet: None,
             notice: None,
@@ -302,6 +313,10 @@ impl Workspace {
         };
         this.apply_theme(window, cx);
         this.reload_recent(cx);
+        if let Some(open) = open {
+            this.launch_branches = Some((open.base, open.head));
+            this.open_path(open.repo, cx);
+        }
         this
     }
 
@@ -452,6 +467,7 @@ impl Workspace {
     /// Opens the repository containing `path`, records it in `repos` and
     /// starts a session for it.
     fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        perf::repo_opening(cx);
         let app = cx.global::<AppContext>();
         let (git, store) = (app.git.clone(), app.store.clone());
         let job = spawn_job(cx, open_repository(git, store, path));
@@ -459,8 +475,15 @@ impl Workspace {
             let result = job.await.unwrap_or_else(|error| Err(error.to_string()));
             this.update(cx, |this, cx| {
                 this.open_task = None;
+                let branches = this.launch_branches.take();
                 match result {
-                    Ok((record, repo)) => {
+                    Ok((mut record, repo)) => {
+                        // Command-line branches win over the remembered ones;
+                        // names that do not exist fall back as usual.
+                        if let Some((base, head)) = branches {
+                            record.last_base = base.or(record.last_base);
+                            record.last_head = head.or(record.last_head);
+                        }
                         tracing::info!(path = %record.path.display(), "opened repository");
                         this.notice = None;
                         this.start_session(record, repo, cx);
@@ -668,6 +691,7 @@ impl Workspace {
             return;
         };
         let view = cx.new(|cx| DiffView::new(session, target, display, viewed, comments, cx));
+        perf::watch_diff(view.downgrade(), cx);
         self.diff_subscription =
             Some(
                 cx.subscribe(&view, |this, _, event: &DiffViewEvent, cx| match event {
@@ -3086,6 +3110,7 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        perf::frame_started(cx);
         if std::mem::take(&mut self.focus_requested) {
             window.focus(&self.focus_handle, cx);
         }
@@ -3196,6 +3221,8 @@ impl Render for Workspace {
                 self.conflict.as_ref().map(|(dialog, _)| dialog.clone()),
                 |root, dialog| root.child(dialog),
             )
+            // Last, so its paint ends the `ARGUS_PERF` frame measurement.
+            .children(perf::frame_marker(cx))
     }
 }
 

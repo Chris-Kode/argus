@@ -63,6 +63,8 @@ ARGUS_HOME=/tmp/argus-dev cargo run -p argus
 | Format | `cargo fmt` |
 | Lint | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Tests | `cargo test --workspace` (expected to run 0 tests) |
+| Perf fixtures | `cargo xtask fixtures` (into `target/fixtures/`) |
+| Perf report | `ARGUS_PERF=1 cargo run --release -- --repo target/fixtures/huge-files --base base --head head --auto-scroll` |
 
 Clippy must be clean with `-D warnings`.
 
@@ -77,6 +79,7 @@ Clippy must be clean with `-D warnings`.
 | `crates/argus_highlight` | Tree-sitter grammars and the background highlighter |
 | `crates/argus_runs` | Prompt builder, run manager, `stream-json` parser |
 | `crates/argus_store` | SQLite schema, migrations, repositories |
+| `xtask` | Dev tasks (`cargo xtask fixtures`); not part of the app |
 
 `AppContext` (in `argus_ui`) is the GPUI global holding the git, store and run
 service handles plus the tokio runtime handle.
