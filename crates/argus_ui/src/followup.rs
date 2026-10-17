@@ -135,6 +135,29 @@ pub fn spawn_followup(
     })
 }
 
+/// Starts a follow-up on the proposal of `run_id` (a pull-before-push
+/// resolution, which has no comment) with `reply`, `model` and `effort`;
+/// like [`spawn_followup`], it is not cut short when the view goes away.
+pub fn spawn_run_followup(
+    run_id: RunId,
+    reply: String,
+    (model, effort): (String, String),
+    cx: &mut App,
+) -> Task<Result<RunId, String>> {
+    let runs = cx.global::<AppContext>().runs.clone();
+    let handle = cx
+        .global::<AppContext>()
+        .runtime
+        .spawn(async move { runs.follow_up_run(run_id, reply, model, effort).await });
+    cx.background_executor().spawn(async move {
+        match handle.await {
+            Ok(Ok(run_id)) => Ok(run_id),
+            Ok(Err(error)) => Err(describe(&error)),
+            Err(error) => Err(error.to_string()),
+        }
+    })
+}
+
 /// A start error as the status bar shows it.
 fn describe(error: &RunError) -> String {
     match error {

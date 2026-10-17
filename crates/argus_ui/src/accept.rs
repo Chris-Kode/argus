@@ -9,8 +9,10 @@
 //! - the one-time notice when the head branch is checked out in one of the
 //!   user's checkouts (Continue is remembered per repository);
 //! - the commit dialog: subject and body (editable), the `Argus-Comment`
-//!   trailer, and the output of a failed `git commit` (hook) to retry;
-//! - the conflict dialog listing the conflicted files.
+//!   trailer, and the output of a failed `git commit` (hook) to retry.
+//!
+//! A conflict is handed to the workspace ([`AcceptFlowEvent::Conflict`]),
+//! which opens the conflict dialog ([`crate::conflict`]).
 //!
 //! Questions of later accepts wait their turn: the queue only asks for the
 //! Accept it is working on. Dropping the entity cancels every pending Accept.
@@ -30,7 +32,7 @@ use gpui::{
 use tokio::sync::oneshot;
 
 use crate::AppContext;
-use crate::components::{button, disabled_button, kbd, primary_button};
+use crate::components::{button, kbd, primary_button};
 use crate::runtime::spawn_job;
 use crate::text_editor::{TextEditor, TextEditorEvent};
 use crate::theme::ActiveTheme;
@@ -48,6 +50,8 @@ pub enum AcceptFlowEvent {
     /// The commit landed on the head branch: refresh the diff, re-anchor
     /// the comments, update the Push counts and close the proposal.
     Committed(Accepted),
+    /// The patch conflicts with the head tip: open the conflict dialog.
+    Conflict(AcceptConflict),
     /// The last dialog closed; the focus goes back to the shell.
     DialogsClosed,
     /// A message for the status bar.
@@ -70,8 +74,6 @@ enum Dialog {
     },
     /// The commit message editor.
     Commit(Box<CommitDialog>),
-    /// The patch conflicts with the head tip.
-    Conflict(AcceptConflict),
 }
 
 impl Dialog {
@@ -79,7 +81,6 @@ impl Dialog {
         match self {
             Self::CheckedOut { run_id, .. } => *run_id,
             Self::Commit(dialog) => dialog.run_id,
-            Self::Conflict(conflict) => conflict.run_id,
         }
     }
 }
@@ -269,8 +270,7 @@ impl AcceptFlow {
         self.jobs.remove(&run_id);
         let had_dialogs = !self.dialogs.is_empty();
         // A question the queue stopped waiting for is moot.
-        self.dialogs
-            .retain(|dialog| matches!(dialog, Dialog::Conflict(_)) || dialog.run_id() != run_id);
+        self.dialogs.retain(|dialog| dialog.run_id() != run_id);
         match outcome {
             Ok(AcceptOutcome::Committed(accepted)) => {
                 for warning in &accepted.warnings {
@@ -287,7 +287,7 @@ impl AcceptFlow {
                     true,
                     cx,
                 );
-                self.dialogs.push_back(Dialog::Conflict(conflict));
+                cx.emit(AcceptFlowEvent::Conflict(conflict));
             }
             Ok(AcceptOutcome::Cancelled) => {
                 self.notice("Accept cancelled; the proposal stays open.", false, cx);
@@ -338,7 +338,6 @@ impl AcceptFlow {
                     let _ = dialog.reply.send(Some(CommitInput { subject, body }));
                 }
             }
-            Dialog::Conflict(_) => {}
         }
         self.focus_front(cx);
         cx.notify();
@@ -603,57 +602,6 @@ impl AcceptFlow {
             cx,
         )
     }
-
-    fn render_conflict(&self, conflict: &AcceptConflict, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let colors = &theme.colors;
-        let files = div()
-            .flex()
-            .flex_col()
-            .gap_0p5()
-            .font_family(theme.fonts.code_family.clone())
-            .text_sm()
-            .children(conflict.files.iter().map(|file| {
-                div()
-                    .text_color(colors.warning)
-                    .child(format!("U  {}", file.display()))
-            }));
-        let content = vec![
-            div()
-                .text_sm()
-                .text_color(colors.text_muted)
-                .child(format!(
-                    "The proposal does not apply cleanly on the tip of `{}` ({}). Nothing was \
-                     committed, the head branch did not move, and the proposal stays open.",
-                    conflict.head,
-                    conflict.head_tip.short(8)
-                ))
-                .into_any_element(),
-            files.into_any_element(),
-            div()
-                .text_xs()
-                .text_color(colors.text_placeholder)
-                .child(
-                    "Reject the proposal and run the comment again on the new code, or reply to \
-                     it. Resolving with Claude from here is coming next.",
-                )
-                .into_any_element(),
-        ];
-        let actions = vec![
-            disabled_button("accept-conflict-resolve", "Resolve with Claude", cx)
-                .into_any_element(),
-            primary_button("accept-conflict-close", "Close", cx)
-                .on_click(cx.listener(|this, _, _, cx| this.answer_front(false, cx)))
-                .into_any_element(),
-        ];
-        self.frame(
-            "accept-conflict-dialog",
-            "Accept conflicts".into(),
-            content,
-            actions,
-            cx,
-        )
-    }
 }
 
 impl Render for AcceptFlow {
@@ -664,7 +612,6 @@ impl Render for AcceptFlow {
             None => div().into_any_element(),
             Some(Dialog::CheckedOut { head, path, .. }) => self.render_checked_out(head, path, cx),
             Some(Dialog::Commit(dialog)) => self.render_commit(dialog, cx),
-            Some(Dialog::Conflict(conflict)) => self.render_conflict(conflict, cx),
         }
     }
 }

@@ -309,11 +309,17 @@ impl RunPanel {
             return;
         };
         let store = cx.global::<AppContext>().store.clone();
+        let manager = cx.global::<AppContext>().runs.clone();
         let job = spawn_job(cx, async move {
-            store
+            let mut runs = store
                 .runs()
                 .list_recent_for_repo(repo_id, RECENT_RUNS)
-                .await
+                .await?;
+            // Pull-before-push resolutions have no comment to list them by.
+            let mut resolutions = manager.resolution_runs(repo_id).await?;
+            resolutions.append(&mut runs);
+            resolutions.sort_by_key(|listing| std::cmp::Reverse(listing.run.created_at));
+            Ok::<_, argus_store::StoreError>(resolutions)
         });
         self.list_task = Some(cx.spawn(async move |this, cx| {
             let result = job.await;
@@ -578,8 +584,13 @@ impl RunPanel {
                     .find(|line| !line.trim().is_empty())
                     .unwrap_or_default()
                     .to_owned();
+                let location = if comment_id.is_some() {
+                    format!("{}:{}", listing.file_path, listing.start_line)
+                } else {
+                    listing.file_path.clone()
+                };
                 let mut meta = vec![
-                    format!("{}:{}", listing.file_path, listing.start_line),
+                    location,
                     if run.effort.is_empty() {
                         run.model.clone()
                     } else {

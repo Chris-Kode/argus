@@ -18,7 +18,9 @@
 //! - [`fresh_followup_prompt`]: a follow-up in a new session, when the
 //!   comment's session cannot be resumed; it carries the comment and the
 //!   whole thread ([`ThreadMessage`]) instead.
-//! - [`resolve_prompt`]: a conflict-resolution run ([`ResolveContext`]).
+//! - [`resolve_prompt`]: a conflict-resolution run ([`ResolveContext`]);
+//!   [`resolve_followup_prompt`]: a reply to the resolution of a pull before
+//!   push, which has no comment.
 
 mod excerpt;
 
@@ -238,6 +240,36 @@ pub fn followup_prompt(reply: &str) -> Prompt {
     out.push_str("\n## Reply (verbatim)\n\n");
     fenced(&mut out, "markdown", reply);
     rules(&mut out, &[SCOPE_RULE, NO_COMMIT_RULE, SUMMARY_RULE]);
+    Prompt {
+        kind: RunKind::Followup,
+        version: PROMPT_VERSION,
+        text: out,
+    }
+}
+
+/// Renders the prompt of a follow-up on a conflict resolution that belongs
+/// to no comment (a pull-before-push rebase): the reviewer's reply to the
+/// resolution already in the worktree. The run resumes the resolve run's
+/// session.
+pub fn resolve_followup_prompt(reply: &str) -> Prompt {
+    let mut out = String::new();
+    marker(&mut out, RunKind::Followup);
+    out.push_str(
+        "Your conflict resolution is already applied in this working directory. The reviewer \
+         read it and replied. Your task is to update the resolution as the reply asks, \
+         starting from the current state of the files.\n",
+    );
+    out.push_str("\n## Reply (verbatim)\n\n");
+    fenced(&mut out, "markdown", reply);
+    rules(
+        &mut out,
+        &[
+            RESOLVE_RULE,
+            "Leave no conflict marker in any file.",
+            NO_COMMIT_RULE,
+            SUMMARY_RULE,
+        ],
+    );
     Prompt {
         kind: RunKind::Followup,
         version: PROMPT_VERSION,

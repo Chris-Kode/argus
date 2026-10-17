@@ -235,6 +235,17 @@ impl WorktreeManager {
         })
     }
 
+    /// Like [`Self::worktree_at`], for a repository known by its working
+    /// directory.
+    pub fn worktree_at_dir(&self, repo_dir: &Path, path: impl Into<PathBuf>) -> Result<Worktree> {
+        let path = path.into();
+        self.guard(&path)?;
+        Ok(Worktree {
+            path,
+            repo_dir: repo_dir.to_owned(),
+        })
+    }
+
     /// `git worktree add --detach <root>/<repo-id>/<run-id> <head-sha>`.
     ///
     /// Detached, so it works while the head branch is checked out in the
@@ -393,18 +404,7 @@ impl WorktreeManager {
         if output.success() {
             return Ok(ApplyOutcome::Applied);
         }
-        let unmerged = cli
-            .run(["diff", "--name-only", "--diff-filter=U", "-z"])
-            .await?
-            .stdout;
-        let mut files = Vec::new();
-        for path in unmerged.split(|&b| b == 0).filter(|path| !path.is_empty()) {
-            let path = gix::path::from_byte_slice(path).map_err(|err| GitError::Parse {
-                command: "git diff --name-only --diff-filter=U -z".to_owned(),
-                message: format!("invalid path: {err}"),
-            })?;
-            files.push(path.to_owned());
-        }
+        let mut files = unmerged_paths(&cli).await?;
         if files.is_empty() {
             // Paths git refused outright (no 3-way fallback possible, e.g. a
             // new file that already exists) are only named in its errors.
@@ -513,18 +513,7 @@ impl WorktreeManager {
             tracing::info!(path = %worktree.path.display(), %onto, %sha, "rebased in worktree");
             return Ok((RebaseOutcome::Rebased(sha), log));
         }
-        let unmerged = cli
-            .run_unchecked(["diff", "--name-only", "--diff-filter=U", "-z"])
-            .await?
-            .stdout;
-        let mut files = Vec::new();
-        for path in unmerged.split(|&b| b == 0).filter(|path| !path.is_empty()) {
-            let path = gix::path::from_byte_slice(path).map_err(|err| GitError::Parse {
-                command: "git diff --name-only --diff-filter=U -z".to_owned(),
-                message: format!("invalid path: {err}"),
-            })?;
-            files.push(path.to_owned());
-        }
+        let files = unmerged_paths(&cli).await?;
         cli.run_unchecked(["rebase", "--abort"]).await?;
         self.reset(worktree, &start_sha).await?;
         tracing::info!(
@@ -560,7 +549,8 @@ impl WorktreeManager {
     /// Compares the worktrees under `<root>/<repo-id>/` (on disk and in
     /// `git worktree list`) with the `runs` table and deletes orphans: no
     /// run row, or no run that is still active or holds a pending proposal
-    /// (`Succeeded` with its comment neither resolved nor dismissed). The
+    /// (`Succeeded` with its comment neither resolved nor dismissed; a
+    /// comment-less resolve run of a previous session never is). The
     /// `_integration` worktree and worktrees created after the manager was
     /// opened are left alone. Run [`Self::mark_interrupted_runs`] first.
     pub async fn reconcile(&self, repo: &Repo, store: &StorageService) -> Result<ReconcileReport> {
@@ -635,8 +625,11 @@ impl WorktreeManager {
             if run.status != RunStatus::Succeeded {
                 continue;
             }
+            // A run without a comment resolves a pull-before-push rebase;
+            // that state lives in memory only, so after a restart its
+            // worktree is an orphan.
             let Some(comment_id) = run.comment_id else {
-                return Ok(true);
+                continue;
             };
             let closed = store.comments().get(comment_id).await?.is_some_and(|c| {
                 matches!(c.status, CommentStatus::Resolved | CommentStatus::Dismissed)
@@ -689,7 +682,27 @@ impl WorktreeManager {
     }
 }
 
-fn io_error(path: &Path, source: std::io::Error) -> GitError {
+/// The unmerged (conflicted) paths of the worktree `cli` runs in:
+/// `git diff --name-only --diff-filter=U -z`.
+pub(crate) async fn unmerged_paths(cli: &GitCli) -> Result<Vec<PathBuf>> {
+    let unmerged = cli
+        .run_unchecked(["diff", "--name-only", "--diff-filter=U", "-z"])
+        .await?
+        .stdout;
+    let mut files = Vec::new();
+    for path in unmerged.split(|&b| b == 0).filter(|path| !path.is_empty()) {
+        let path = gix::path::from_byte_slice(path).map_err(|err| GitError::Parse {
+            command: "git diff --name-only --diff-filter=U -z".to_owned(),
+            message: format!("invalid path: {err}"),
+        })?;
+        if !files.iter().any(|known: &PathBuf| known.as_path() == path) {
+            files.push(path.to_owned());
+        }
+    }
+    Ok(files)
+}
+
+pub(crate) fn io_error(path: &Path, source: std::io::Error) -> GitError {
     GitError::Io {
         path: path.to_owned(),
         source,
