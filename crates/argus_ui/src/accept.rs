@@ -8,8 +8,8 @@
 //!
 //! - the one-time notice when the head branch is checked out in one of the
 //!   user's checkouts (Continue is remembered per repository);
-//! - the commit dialog: subject and body (editable), the `Argus-Comment`
-//!   trailer, and the output of a failed `git commit` (hook) to retry.
+//! - the commit dialog: subject and body (editable), and the output of a
+//!   failed `git commit` (hook) to retry.
 //!
 //! A conflict is handed to the workspace ([`AcceptFlowEvent::Conflict`]),
 //! which opens the conflict dialog ([`crate::conflict`]).
@@ -526,19 +526,6 @@ impl AcceptFlow {
                         "{note}; write the body yourself or leave it empty."
                     )))
                 })
-                .into_any_element(),
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(label("TRAILER"))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(colors.text_muted)
-                        .font_family(theme.fonts.code_family.clone())
-                        .child(draft.trailer.clone()),
-                )
                 .into_any_element(),
         ];
         if let Some(error) = &draft.commit_error {

@@ -26,11 +26,11 @@
 //!    applied with `git apply --3way --index`. A conflict resets it again
 //!    and ends the Accept with [`AcceptOutcome::Conflict`]; nothing else
 //!    changes.
-//! 4. Haiku writes the commit body from `git diff --cached` (spec §6.4),
-//!    bounded by the commit-message timeout setting; on a failure or a
-//!    timeout the body is empty.
-//! 5. [`AcceptEvent::CommitMessage`] shows the prefilled subject, the body
-//!    and the `Argus-Comment` trailer. Cancel leaves the proposal as it is.
+//! 4. Haiku writes the commit subject and body from `git diff --cached`
+//!    (spec §6.4), bounded by the commit-message timeout setting; on a
+//!    failure or a timeout the subject is generic and the body empty.
+//! 5. [`AcceptEvent::CommitMessage`] shows the prefilled subject and body.
+//!    Cancel leaves the proposal as it is.
 //! 6. `git commit -F -` in the integration worktree, with the user's
 //!    identity, signing config and hooks. A failing hook re-asks step 5
 //!    with its output.
@@ -67,11 +67,8 @@ use crate::proposal::{ProposalError, load_parts};
 use crate::run::{RunUpdate, Services};
 use crate::settings::ClaudeSettings;
 
-/// Trailer linking a commit to its comment (spec §6.4).
-pub const COMMENT_TRAILER: &str = "Argus-Comment";
-
-/// Longest comment excerpt in a commit subject, in characters.
-pub const SUBJECT_EXCERPT_CHARS: usize = 60;
+/// Commit subject when Haiku wrote none.
+pub const FALLBACK_SUBJECT: &str = "Apply review comment";
 
 /// Settings key prefix remembering, per repository, that the user agreed to
 /// move a head branch checked out in their own checkout.
@@ -202,14 +199,12 @@ pub struct CommitDraft {
     pub comment_id: CommentId,
     /// The head branch the commit lands on.
     pub head: String,
-    /// Subject line: `argus: <comment excerpt> (#c<short-id>)`, or the
+    /// Subject line: Haiku's, [`FALLBACK_SUBJECT`] when it failed, or the
     /// user's text when re-asked.
     pub subject: String,
     /// Body: Haiku's text, empty when it failed, or the user's text when
     /// re-asked.
     pub body: String,
-    /// The trailer appended to every message: `Argus-Comment: <uuid>`.
-    pub trailer: String,
     /// Why the body is empty (Haiku failed or timed out), when it is.
     pub body_note: Option<String>,
     /// The output of the last `git commit` attempt, when it failed (e.g. a
@@ -220,9 +215,9 @@ pub struct CommitDraft {
 }
 
 impl CommitDraft {
-    /// The full commit message for `subject` and `body`, with the trailer.
+    /// The full commit message for `subject` and `body`.
     pub fn message(&self, subject: &str, body: &str) -> String {
-        compose_message(subject, body, &self.trailer)
+        compose_message(subject, body)
     }
 }
 
@@ -595,16 +590,21 @@ async fn accept(
             }
             None => {
                 stage(events, AcceptStage::WritingMessage);
-                let body = tokio::select! {
-                    body = commit_body(env, integration.path(), staged, &comment.body_md) => body,
+                let text = tokio::select! {
+                    text = commit_text(env, integration.path(), staged, &comment.body_md) => text,
                     () = events.closed() => {
                         services.worktrees.reset(&integration, &old).await?;
                         return Ok(AcceptOutcome::Cancelled);
                     }
                 };
                 let mut draft = base_draft(&comment, &head, files.clone());
-                match body {
-                    Ok(body) => draft.body = body,
+                match text {
+                    Ok((subject, body)) => {
+                        if !subject.is_empty() {
+                            draft.subject = subject;
+                        }
+                        draft.body = body;
+                    }
                     Err(note) => draft.body_note = Some(note),
                 }
                 draft
@@ -617,7 +617,7 @@ async fn accept(
             services.worktrees.reset(&integration, &old).await?;
             return Ok(AcceptOutcome::Cancelled);
         };
-        let message = compose_message(&input.subject, &input.body, &trailer(comment.id));
+        let message = compose_message(&input.subject, &input.body);
 
         // 7. Compare-and-swap the head branch.
         stage(events, AcceptStage::MovingBranch);
@@ -864,50 +864,21 @@ pub(crate) async fn user_checkout_of(
         .map(|checkout| checkout.path))
 }
 
-/// The dialog's prefilled content, without a body.
+/// The dialog's prefilled content: the fallback subject, no body.
 fn base_draft(comment: &Comment, head: &str, files: Vec<PathBuf>) -> CommitDraft {
     CommitDraft {
         comment_id: comment.id,
         head: head.to_owned(),
-        subject: subject_for(&comment.body_md, comment.id),
+        subject: FALLBACK_SUBJECT.to_owned(),
         body: String::new(),
-        trailer: trailer(comment.id),
         body_note: None,
         commit_error: None,
         files,
     }
 }
 
-/// `argus: <first line of the comment, ≤ 60 chars> (#c<short-id>)`.
-pub fn subject_for(comment_body: &str, comment_id: CommentId) -> String {
-    let first = comment_body
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("apply review comment");
-    let excerpt = if first.chars().count() > SUBJECT_EXCERPT_CHARS {
-        let cut: String = first.chars().take(SUBJECT_EXCERPT_CHARS - 1).collect();
-        format!("{}…", cut.trim_end())
-    } else {
-        first.to_owned()
-    };
-    format!("argus: {excerpt} (#c{})", short_id(comment_id))
-}
-
-/// The comment's short id: the last 8 hex digits of its UUID. The first ones
-/// of a v7 UUID are a timestamp, shared by comments made close together.
-pub fn short_id(comment_id: CommentId) -> String {
-    let hex = comment_id.as_uuid().simple().to_string();
-    hex[hex.len() - 8..].to_owned()
-}
-
-/// `Argus-Comment: <comment-uuid>`.
-pub fn trailer(comment_id: CommentId) -> String {
-    format!("{COMMENT_TRAILER}: {}", comment_id.as_uuid().hyphenated())
-}
-
-/// Subject, blank line, body (when there is one), blank line, trailer.
-pub fn compose_message(subject: &str, body: &str, trailer: &str) -> String {
+/// Subject, blank line, body (when there is one).
+pub fn compose_message(subject: &str, body: &str) -> String {
     let subject = subject.lines().map(str::trim).collect::<Vec<_>>().join(" ");
     let subject = subject.trim();
     let body = body.trim();
@@ -916,20 +887,18 @@ pub fn compose_message(subject: &str, body: &str, trailer: &str) -> String {
         message.push_str("\n\n");
         message.push_str(body);
     }
-    message.push_str("\n\n");
-    message.push_str(trailer);
     message.push('\n');
     message
 }
 
-/// Haiku's commit body for the staged diff (spec §6.4), within the
-/// commit-message timeout. `Err` carries why the body is empty.
-async fn commit_body(
+/// Haiku's commit subject and body for the staged diff (spec §6.4), within
+/// the commit-message timeout. `Err` carries why the body is empty.
+async fn commit_text(
     env: &AcceptEnv,
     cwd: &Path,
     mut diff: Vec<u8>,
     comment_text: &str,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let settings = env.settings.borrow().clone();
     let timeout = settings.commit_message_timeout();
     let detected = env
@@ -951,11 +920,11 @@ async fn commit_body(
     let command = ClaudeCommand::commit_message(diff, comment_text).with_cwd(cwd);
     match tokio::time::timeout(timeout, run_claude(&command, &program)).await {
         Ok(Ok(text)) => {
-            let body = clean_body(&text);
-            if body.is_empty() {
+            let (subject, body) = split_message(&text);
+            if subject.is_empty() && body.is_empty() {
                 Err("Haiku returned an empty message".to_owned())
             } else {
-                Ok(body)
+                Ok((subject, body))
             }
         }
         Ok(Err(error)) => {
@@ -1020,37 +989,23 @@ async fn run_claude(command: &ClaudeCommand, program: &Path) -> Result<String, S
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
-/// Haiku's answer as a commit body: surrounding code fences removed, and a
-/// leading subject line dropped (Argus writes the subject itself). A
-/// subject is a first paragraph of one line, at most 72 characters, not
-/// ending like a sentence, followed by more text.
-pub fn clean_body(text: &str) -> String {
+/// Haiku's answer as a commit subject and body: surrounding code fences
+/// removed, the first line is the subject (at most 72 characters, without a
+/// trailing period) and the rest the body. A first line too long for a
+/// subject stays in the body and the subject is empty.
+pub fn split_message(text: &str) -> (String, String) {
     let mut text = text.trim();
     if let Some(inner) = text.strip_prefix("```") {
         let inner = inner.split_once('\n').map_or("", |(_, rest)| rest);
         text = inner.trim_end().strip_suffix("```").unwrap_or(inner).trim();
     }
-    let text = match text.split_once("\n\n") {
-        Some((first, rest))
-            if !first.contains('\n')
-                && first.chars().count() <= 72
-                && !first.trim_end().ends_with(['.', ':'])
-                && !rest.trim().is_empty() =>
-        {
-            rest
-        }
-        _ => text,
-    };
-    text.lines()
-        .filter(|line| {
-            !line
-                .trim_start()
-                .starts_with(&format!("{COMMENT_TRAILER}:"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_owned()
+    let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
+    let first = first.trim().trim_start_matches('#').trim();
+    if first.chars().count() > 72 {
+        return (String::new(), text.to_owned());
+    }
+    let subject = first.strip_suffix('.').unwrap_or(first).trim().to_owned();
+    (subject, rest.trim().to_owned())
 }
 
 fn format_timeout(timeout: Duration) -> String {

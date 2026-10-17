@@ -108,7 +108,7 @@ impl ClaudeCommand {
     ///
     /// ```text
     /// git diff --cached | claude -p --model haiku --tools "" --max-turns 1 \
-    ///   "Write a git commit message for this change. Review comment: <text>"
+    ///   "Write a git commit message for this change: <format rules>. Review comment: <text>"
     /// ```
     ///
     /// `diff_stdin` is the staged diff. Very long comments are truncated in
@@ -121,7 +121,10 @@ impl ClaudeCommand {
             kind: Kind::CommitMessage {
                 diff: diff_stdin.into(),
                 prompt: format!(
-                    "Write a git commit message for this change. Review comment: {comment}"
+                    "Write a git commit message for this change: a subject line of at \
+                     most 72 characters, a blank line, then the body. Describe the \
+                     change itself; do not quote the review comment or mention it. \
+                     Review comment, for context only: {comment}"
                 ),
             },
         }
