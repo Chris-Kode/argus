@@ -266,10 +266,6 @@ impl AcceptFlow {
         // A question the queue stopped waiting for is moot.
         self.dialogs
             .retain(|dialog| matches!(dialog, Dialog::Conflict(_)) || dialog.run_id() != run_id);
-        cx.emit(AcceptFlowEvent::Stage {
-            run_id,
-            stage: None,
-        });
         match outcome {
             Ok(AcceptOutcome::Committed(accepted)) => {
                 for warning in &accepted.warnings {
@@ -296,6 +292,12 @@ impl AcceptFlow {
                 self.notice(format!("Accept failed: {error}"), true, cx);
             }
         }
+        // After the outcome: a committed proposal's tab is closed by then,
+        // so it does not go back to following its deleted worktree.
+        cx.emit(AcceptFlowEvent::Stage {
+            run_id,
+            stage: None,
+        });
         // Only move the focus when a dialog had it.
         if had_dialogs {
             self.focus_front(cx);
@@ -409,22 +411,31 @@ impl AcceptFlow {
                 .font_family(theme.fonts.code_family.clone())
                 .child(text)
         };
+        let row = || {
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .text_sm()
+                .text_color(colors.text_muted)
+        };
         let text = div()
             .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_1()
-            .text_sm()
-            .text_color(colors.text_muted)
-            .child(code(head.to_owned()))
-            .child("is checked out at")
-            .child(code(crate::workspace::display_path(path)))
+            .flex_col()
+            .gap_2()
             .child(
-                ". Argus will move the branch; your checkout will show the new commits as \
-                 reverse changes until you run",
+                row()
+                    .child(code(head.to_owned()))
+                    .child("is checked out at")
+                    .child(code(crate::workspace::display_path(path))),
             )
-            .child(code(format!("git reset --keep {head}")))
-            .child(". Argus never runs anything in that checkout.")
+            .child(row().child(
+                "Argus will move the branch; your checkout will show the new commits as reverse \
+                 changes until you run:",
+            ))
+            .child(row().child(code(format!("git reset --keep {head}"))))
+            .child(row().child("Argus never runs anything in that checkout."))
             .into_any_element();
         let note = div()
             .text_xs()
