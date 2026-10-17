@@ -1,7 +1,7 @@
 //! [`CommentService`]: the comments of the open review, kept in memory and
 //! persisted through [`CommentStore`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use argus_store::{CommentId, CommentStatus, CommentStore, NewComment, Reply, ReplyAuthor};
@@ -10,7 +10,9 @@ use tokio::sync::broadcast;
 use crate::review::anchor::CommentAnchor;
 use crate::review::comment::{Comment, ReviewKey, store_anchor};
 use crate::review::error::{ReviewError, ReviewResult};
+use crate::review::reanchor::{self, AnchorChange};
 use crate::review::status::{CommentEvent, transition};
+use crate::session::DiffSession;
 
 /// Change notifications, buffered per subscriber. A subscriber that lags
 /// behind gets `RecvError::Lagged` and should re-read the snapshot.
@@ -39,6 +41,8 @@ pub enum CommentChange {
     Updated(CommentId),
     /// A comment and its replies were deleted.
     Deleted(CommentId),
+    /// Re-anchoring moved these comments, or changed their outdated flag.
+    Reanchored(Vec<CommentId>),
 }
 
 #[derive(Default)]
@@ -224,6 +228,79 @@ impl CommentService {
     pub async fn set_anchor(&self, id: CommentId, anchor: &CommentAnchor) -> ReviewResult<()> {
         self.store.set_anchor(id, store_anchor(anchor)).await?;
         self.refresh(id).await
+    }
+
+    /// Re-attaches a comment (typically an outdated one) to a range the user
+    /// picked: the anchor, `anchor_sha`, context hash and snippet all come
+    /// from `anchor`, and the outdated flag is cleared.
+    pub async fn reattach(&self, id: CommentId, anchor: CommentAnchor) -> ReviewResult<()> {
+        let stored = store_anchor(&anchor);
+        self.store
+            .reattach(id, stored, anchor.anchor_sha, anchor.snippet)
+            .await?;
+        tracing::debug!(comment = %id, "re-attached comment");
+        self.refresh(id).await
+    }
+
+    /// Re-anchors the comments of `key` over a refreshed diff (spec §7.3)
+    /// and persists the changes in one transaction. Does nothing unless
+    /// `key` is the loaded review. Returns the changes that were applied; a
+    /// comment edited meanwhile keeps its edit.
+    pub async fn reanchor(
+        &self,
+        key: &ReviewKey,
+        session: &DiffSession,
+    ) -> ReviewResult<Vec<AnchorChange>> {
+        let (generation, snapshot) = {
+            let state = self.lock();
+            if state.key.as_ref() != Some(key) {
+                return Ok(Vec::new());
+            }
+            (state.generation, state.comments.clone())
+        };
+        let changes = reanchor::reanchor(snapshot, session).await?;
+        if changes.is_empty() {
+            return Ok(changes);
+        }
+        let updates = changes.iter().map(AnchorChange::to_update).collect();
+        let applied: HashSet<CommentId> = self
+            .store
+            .apply_anchor_updates(updates)
+            .await?
+            .into_iter()
+            .collect();
+        let applied: Vec<AnchorChange> = changes
+            .into_iter()
+            .filter(|change| applied.contains(&change.id))
+            .collect();
+        if applied.is_empty() {
+            return Ok(applied);
+        }
+        let reload = {
+            let mut state = self.lock();
+            if state.generation == generation {
+                let comments = Arc::make_mut(&mut state.comments);
+                for change in &applied {
+                    if let Some(comment) = comments.iter_mut().find(|c| c.id == change.id) {
+                        change.apply_to(comment);
+                    }
+                }
+                comments.sort_by(|a, b| order(a).cmp(&order(b)));
+                self.emit(CommentChange::Reanchored(
+                    applied.iter().map(|change| change.id).collect(),
+                ));
+                false
+            } else {
+                // A load ran meanwhile and may have read the rows before
+                // this write.
+                true
+            }
+        };
+        tracing::debug!(changed = applied.len(), "persisted re-anchored comments");
+        if reload {
+            self.reload().await?;
+        }
+        Ok(applied)
     }
 
     /// Flags a comment as outdated: its code is gone from the diff.

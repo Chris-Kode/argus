@@ -196,3 +196,35 @@ pub fn section_header(title: impl Into<SharedString>, trailing: impl IntoElement
         )
         .child(trailing)
 }
+
+/// A plain-text tooltip, for [`gpui::StatefulInteractiveElement::tooltip`]:
+/// `.tooltip(text_tooltip("Why this is disabled"))`.
+pub fn text_tooltip(
+    text: impl Into<SharedString>,
+) -> impl Fn(&mut gpui::Window, &mut App) -> gpui::AnyView + 'static {
+    let text = text.into();
+    move |_, cx| {
+        let text = text.clone();
+        cx.new(|_| TextTooltip(text)).into()
+    }
+}
+
+struct TextTooltip(SharedString);
+
+impl gpui::Render for TextTooltip {
+    fn render(&mut self, _: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let colors = &cx.theme().colors;
+        div()
+            .max_w(px(320.0))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.elevated_surface)
+            .shadow_md()
+            .text_xs()
+            .text_color(colors.text)
+            .child(self.0.clone())
+    }
+}

@@ -6,6 +6,10 @@
 //! [`ReviewCommentsEvent`]s. Views read the in-memory snapshot only. Runs
 //! change comment statuses behind the service, so a run that starts or
 //! finishes for a shown comment reloads the review.
+//!
+//! After every diff refresh the workspace calls [`ReviewComments::reanchor`]
+//! with the new diff session, so comments follow their code or turn
+//! outdated (spec §7.3).
 
 use std::sync::Arc;
 
@@ -13,6 +17,7 @@ use argus_diff::review::{
     Comment, CommentAnchor, CommentChange, CommentEvent, CommentId, CommentService, ReplyAuthor,
     ReviewError, ReviewKey,
 };
+use argus_diff::{DiffError, DiffSession};
 use argus_runs::RunUpdate;
 use gpui::{Context, EventEmitter, SharedString, Task};
 use tokio::sync::broadcast::error::RecvError;
@@ -37,6 +42,8 @@ pub struct ReviewComments {
     /// The review last asked for; the service catches up once its load runs.
     requested: Option<ReviewKey>,
     load_task: Option<Task<()>>,
+    /// The re-anchoring pass in flight; replacing it cancels it.
+    reanchor_task: Option<Task<()>>,
     _listen_task: Task<()>,
     _runs_task: Task<()>,
 }
@@ -96,6 +103,7 @@ impl ReviewComments {
             requested: None,
             service,
             load_task: None,
+            reanchor_task: None,
             _listen_task: listen_task,
             _runs_task: runs_task,
         }
@@ -151,6 +159,55 @@ impl ReviewComments {
             })
             .ok();
         }));
+    }
+
+    /// Re-anchors the shown review's comments over `session`, the refreshed
+    /// diff of the same (base, head), off the UI thread. Changes are
+    /// persisted in one transaction and arrive as a
+    /// [`CommentChange::Reanchored`]. A later call cancels a pass still in
+    /// flight; a pass run before the comments are loaded does nothing, so
+    /// call it again on [`CommentChange::Loaded`].
+    pub fn reanchor(&mut self, session: DiffSession, cx: &mut Context<Self>) {
+        let Some(key) = self.requested.clone() else {
+            return;
+        };
+        let service = self.service.clone();
+        let job = spawn_job(cx, async move {
+            match service.reanchor(&key, &session).await {
+                Ok(changes) => {
+                    if !changes.is_empty() {
+                        tracing::debug!(changed = changes.len(), "re-anchored comments");
+                    }
+                    Ok(())
+                }
+                // The diff session went away: a newer pass follows.
+                Err(ReviewError::Diff(DiffError::Cancelled)) => Ok(()),
+                Err(error) => Err(error),
+            }
+        });
+        self.reanchor_task = Some(cx.spawn(async move |this, cx| {
+            let result = flatten(job.await);
+            this.update(cx, |this, cx| {
+                this.reanchor_task = None;
+                report(result, "re-anchor the comments", cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Re-attaches a comment to a range picked in the diff: its anchor,
+    /// `anchor_sha`, context hash and snippet are replaced and it is no
+    /// longer outdated.
+    pub fn reattach(
+        &mut self,
+        id: CommentId,
+        anchor: CommentAnchor,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
+        let service = self.service.clone();
+        self.run(cx, "re-attach the comment", async move {
+            service.reattach(id, anchor).await
+        })
     }
 
     /// Creates a comment on the loaded review. The task resolves to whether

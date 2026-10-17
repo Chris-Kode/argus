@@ -42,6 +42,25 @@ pub struct Anchor {
     pub context_hash: String,
 }
 
+/// One re-anchoring result to persist (spec §7.3): the comment moves from
+/// `expected` to `anchor`, or only changes its outdated flag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnchorUpdate {
+    /// The comment.
+    pub id: CommentId,
+    /// The anchor the update was computed from; the row is left alone when
+    /// it no longer has it (e.g. the user re-attached it meanwhile).
+    pub expected: Anchor,
+    /// The outdated flag the update was computed from.
+    pub expected_outdated: bool,
+    /// The new anchor.
+    pub anchor: Anchor,
+    /// The code under the new anchor, with its context.
+    pub snippet: String,
+    /// Whether the code is gone from the diff.
+    pub outdated: bool,
+}
+
 /// A stored comment thread root.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Comment {
@@ -296,6 +315,94 @@ impl CommentStore {
                         anchor.start_line,
                         anchor.end_line,
                         anchor.context_hash,
+                        now_ms(),
+                    ],
+                )?;
+                expect_changed(changed, "comment", id)
+            })
+            .await
+    }
+
+    /// Persists the results of one re-anchoring pass in a single
+    /// transaction. Each row is updated only if it still has the anchor and
+    /// outdated flag the update was computed from, so a concurrent edit
+    /// wins; deleted comments are skipped. `updated_at` is left alone: the
+    /// move is automatic, not a user edit. Returns the updated comments.
+    pub async fn apply_anchor_updates(&self, updates: Vec<AnchorUpdate>) -> Result<Vec<CommentId>> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.service
+            .call("CommentStore::apply_anchor_updates", move |conn| {
+                let tx = conn.transaction()?;
+                let mut applied = Vec::with_capacity(updates.len());
+                {
+                    let mut stmt = tx.prepare_cached(
+                        "UPDATE comments SET file_path = ?2, old_file_path = ?3, side = ?4,
+                             start_line = ?5, end_line = ?6, context_hash = ?7, snippet = ?8,
+                             outdated = ?9
+                         WHERE id = ?1 AND file_path = ?10 AND old_file_path IS ?11
+                             AND side = ?12 AND start_line = ?13 AND end_line = ?14
+                             AND context_hash = ?15 AND outdated = ?16",
+                    )?;
+                    for update in &updates {
+                        let (new, old) = (&update.anchor, &update.expected);
+                        let changed = stmt.execute(params![
+                            update.id,
+                            new.file_path,
+                            new.old_file_path,
+                            new.side,
+                            new.start_line,
+                            new.end_line,
+                            new.context_hash,
+                            update.snippet,
+                            update.outdated,
+                            old.file_path,
+                            old.old_file_path,
+                            old.side,
+                            old.start_line,
+                            old.end_line,
+                            old.context_hash,
+                            update.expected_outdated,
+                        ])?;
+                        if changed > 0 {
+                            applied.push(update.id);
+                        }
+                    }
+                }
+                tx.commit()?;
+                Ok(applied)
+            })
+            .await
+    }
+
+    /// Re-attaches the comment to a location the user picked: replaces the
+    /// anchor, the head SHA it was taken at and the snippet, and clears the
+    /// outdated flag.
+    pub async fn reattach(
+        &self,
+        id: CommentId,
+        anchor: Anchor,
+        anchor_sha: String,
+        snippet: String,
+    ) -> Result<()> {
+        self.service
+            .call("CommentStore::reattach", move |conn| {
+                let changed = conn.execute(
+                    "UPDATE comments SET file_path = ?2, old_file_path = ?3, side = ?4,
+                         start_line = ?5, end_line = ?6, context_hash = ?7, anchor_sha = ?8,
+                         snippet = ?9, outdated = 0, updated_at = ?10
+                     WHERE id = ?1",
+                    params![
+                        id,
+                        anchor.file_path,
+                        anchor.old_file_path,
+                        anchor.side,
+                        anchor.start_line,
+                        anchor.end_line,
+                        anchor.context_hash,
+                        anchor_sha,
+                        snippet,
                         now_ms(),
                     ],
                 )?;

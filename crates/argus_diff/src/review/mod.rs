@@ -9,10 +9,13 @@
 //! - [`CommentService`] holds the comments of one (repo, base, head) review,
 //!   persists every change through [`argus_store::CommentStore`] and
 //!   broadcasts [`CommentChange`]s for the UI.
+//! - [`reanchor`] moves comments after a diff refresh, or flags them
+//!   outdated when their code is gone (spec §7.3).
 
 mod anchor;
 mod comment;
 mod error;
+mod reanchor;
 mod service;
 mod status;
 
@@ -22,5 +25,6 @@ pub use anchor::{
 pub use argus_store::{CommentId, Reply, ReplyAuthor, ReplyId, RepoId};
 pub use comment::{Comment, ReviewKey};
 pub use error::{ReviewError, ReviewResult};
+pub use reanchor::{AnchorChange, AnchorChangeKind, SideText, reanchor, reanchor_in};
 pub use service::{CommentChange, CommentService, apply_event};
 pub use status::{CommentEvent, CommentStatus, InvalidTransition, transition};

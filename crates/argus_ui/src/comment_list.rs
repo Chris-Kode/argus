@@ -3,6 +3,11 @@
 //! §9). Status chips filter the list; a click asks the workspace to scroll
 //! the diff to the thread ([`CommentListEvent::Open`]).
 //!
+//! Outdated threads are not inline in the diff. Selecting one opens a card
+//! under the list with its stored snippet at the original line numbers and
+//! its actions: Re-attach ([`CommentListEvent::Reattach`]), Dismiss, and a
+//! disabled Run (outdated comments cannot run, spec Q5).
+//!
 //! Rows are rendered with `uniform_list` and rebuilt only when the comments
 //! or the filter change, so a review with thousands of comments stays
 //! cheap.
@@ -10,14 +15,16 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use argus_diff::review::{Comment, CommentId, CommentStatus};
+use argus_diff::review::{Comment, CommentEvent, CommentId, CommentStatus};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FontWeight, SharedString, Subscription,
     UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
-use crate::components::{chip, status_style};
+use crate::components::{
+    button, chip, disabled_button, primary_button, status_chip, status_style, text_tooltip,
+};
 use crate::theme::ActiveTheme;
 
 /// Height of every row (`uniform_list` needs one height).
@@ -37,6 +44,8 @@ const STATUSES: [CommentStatus; 5] = [
 pub enum CommentListEvent {
     /// Show this thread in the diff.
     Open(CommentId),
+    /// Pick new lines in the diff for this outdated thread.
+    Reattach(CommentId),
 }
 
 /// One visible row.
@@ -165,9 +174,181 @@ impl CommentList {
     fn open(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(comment) = self.snapshot.get(index) {
             self.selected = Some(comment.id);
-            cx.emit(CommentListEvent::Open(comment.id));
+            // Outdated threads have no place in the diff; their card shows
+            // below the list instead.
+            if !comment.outdated {
+                cx.emit(CommentListEvent::Open(comment.id));
+            }
             cx.notify();
         }
+    }
+
+    fn dismiss(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        self.comments
+            .update(cx, |comments, cx| {
+                comments.apply(id, CommentEvent::Dismissed, cx)
+            })
+            .detach();
+    }
+
+    /// The card of the selected thread when it is outdated: its stored
+    /// snippet with the original line numbers, and its actions.
+    fn render_outdated(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let comment = self
+            .selected
+            .and_then(|id| self.snapshot.iter().find(|comment| comment.id == id))
+            .filter(|comment| comment.outdated)?;
+        let theme = cx.theme().clone();
+        let colors = &theme.colors;
+        let id = comment.id;
+        let anchor = &comment.anchor;
+        let lines = if anchor.is_range() {
+            format!("lines {}–{}", anchor.start_line, anchor.end_line)
+        } else {
+            format!("line {}", anchor.start_line)
+        };
+        let first_line = anchor.snippet_start_line();
+        let digits = (first_line as usize + anchor.snippet.lines().count())
+            .to_string()
+            .len();
+        let snippet = anchor
+            .snippet
+            .split('\n')
+            .enumerate()
+            .map(|(offset, text)| {
+                let number = first_line + offset as u32;
+                let commented = anchor.lines().contains(&number);
+                div()
+                    .flex()
+                    .gap_2()
+                    .px_1()
+                    .when(commented, |row| row.bg(colors.warning.opacity(0.12)))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(colors.text_placeholder)
+                            .child(format!("{number:>digits$}")),
+                    )
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .text_color(if commented {
+                                colors.text
+                            } else {
+                                colors.text_muted
+                            })
+                            .child(text.to_owned()),
+                    )
+            });
+        let body = comment
+            .body_md
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let dismiss = match comment.status {
+            CommentStatus::Open | CommentStatus::Proposed => {
+                button("outdated-dismiss", "Dismiss", cx)
+                    .text_xs()
+                    .on_click(cx.listener(move |this, _, _, cx| this.dismiss(id, cx)))
+                    .into_any_element()
+            }
+            _ => disabled_button("outdated-dismiss", "Dismiss", cx)
+                .text_xs()
+                .tooltip(text_tooltip(format!(
+                    "A {} comment cannot be dismissed.",
+                    comment.status
+                )))
+                .into_any_element(),
+        };
+        Some(
+            div()
+                .id("outdated-card")
+                .flex()
+                .flex_col()
+                .flex_none()
+                .gap_1p5()
+                .max_h(px(360.0))
+                .p_2()
+                .border_t_1()
+                .border_color(colors.border)
+                .bg(colors.elevated_surface)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(chip("Outdated", colors.warning))
+                        .child(status_chip(comment.status, colors))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_xs()
+                                .text_color(colors.text_muted)
+                                .font_family(theme.fonts.code_family.clone())
+                                .child(format!("{} · {lines}", anchor.file_path)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.text_placeholder)
+                        .child("The code under this comment is no longer in the diff."),
+                )
+                .child(
+                    div()
+                        .id("outdated-snippet")
+                        .flex()
+                        .flex_col()
+                        .min_h_0()
+                        .overflow_scroll()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(colors.background)
+                        .text_xs()
+                        .font_family(theme.fonts.code_family.clone())
+                        .children(snippet),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(colors.text)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(body),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            primary_button("outdated-reattach", "Re-attach…", cx)
+                                .text_xs()
+                                .tooltip(text_tooltip("Pick the new lines in the diff, then Save."))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(CommentListEvent::Reattach(id))
+                                })),
+                        )
+                        .child(dismiss)
+                        .child(
+                            disabled_button("outdated-run", "Run", cx)
+                                .text_xs()
+                                .tooltip(text_tooltip(
+                                    "Outdated comments cannot be run. Re-attach it to the \
+                                     current code first.",
+                                )),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_rows(
@@ -378,5 +559,6 @@ impl Render for CommentList {
             .font_weight(FontWeight::NORMAL)
             .child(self.render_filter(cx))
             .child(body)
+            .children(self.render_outdated(cx))
     }
 }

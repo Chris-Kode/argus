@@ -38,6 +38,10 @@ pub enum ReviewError {
     #[error("no review is loaded")]
     NoReview,
 
+    /// Reading the diff to re-anchor comments failed.
+    #[error(transparent)]
+    Diff(#[from] crate::error::DiffError),
+
     /// Storage failed (including a comment that no longer exists).
     #[error(transparent)]
     Store(#[from] StoreError),
