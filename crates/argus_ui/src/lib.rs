@@ -7,6 +7,7 @@
 pub mod branch_picker;
 pub mod claude_settings;
 pub mod claude_status;
+pub mod comment_list;
 pub mod comments;
 pub mod components;
 pub mod diff_view;
@@ -15,9 +16,11 @@ mod fonts;
 pub mod fuzzy;
 pub mod jobs;
 pub mod keymap;
+pub mod markdown;
 pub mod runtime;
 pub mod session;
 pub mod settings;
+pub mod text_editor;
 pub mod text_field;
 pub mod theme;
 mod workspace;
@@ -33,12 +36,16 @@ use gpui::{
     px, size,
 };
 
+pub use comment_list::{CommentList, CommentListEvent};
 pub use comments::{ReviewComments, ReviewCommentsEvent};
-pub use diff_view::{DiffView, DiffViewEvent, DisplayOptions, LineSelection};
+pub use diff_view::{
+    CommentDrafts, DiffView, DiffViewEvent, DisplayOptions, DraftKey, LineSelection,
+};
 pub use file_tree::{FileTree, FileTreeEvent};
 pub use jobs::BackgroundJobs;
 pub use session::{Comparison, DiffTarget, RepoSession, SessionEvent, Side};
 pub use settings::{Settings, UiSettings};
+pub use text_editor::{TextEditor, TextEditorEvent};
 pub use theme::{ActiveTheme, Appearance, SyntaxTheme, Theme, ThemeColors, ThemeFonts, ThemeMode};
 pub use workspace::Workspace;
 

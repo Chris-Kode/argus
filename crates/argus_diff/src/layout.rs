@@ -18,6 +18,11 @@
 //! selection into a comment range with [`select_range`] /
 //! [`select_split_range`], and keeps the reading position across a mode
 //! toggle with [`row_key`] and [`find_row`].
+//!
+//! Comment threads become rows too: [`anchor_rows`] finds the row under
+//! which a comment's range ends, [`place_inline`] inserts [`Row::Inline`]
+//! blocks there (and [`strip_inline`] removes them again), and
+//! [`reveal_lines`] expands the context gaps that hide a commented line.
 
 use std::ops::Range;
 
@@ -84,6 +89,16 @@ pub enum Row {
         /// Soft-wrap segment, `0` for the first (or only) one. The row has as
         /// many segments as the longer of its two lines.
         segment: u32,
+    },
+    /// Part of a block inserted under a line: a comment thread or composer
+    /// (see [`place_inline`]). A block of `n` rows takes `n` consecutive
+    /// rows, `part` `0..n`; the viewer draws the whole block from its first
+    /// visible row.
+    Inline {
+        /// Index into the [`InlineBlock`]s given to [`place_inline`].
+        item: u32,
+        /// Row of the block, `0` for its first.
+        part: u32,
     },
 }
 
@@ -656,10 +671,14 @@ pub fn select_range(
             .ok_or(RangeError::NotALine)
     };
     let (start, end) = (line_at(first)?, line_at(last)?);
-    if rows[first..=last]
-        .iter()
-        .any(|row| !matches!(row, Row::Line { .. } | Row::Context { .. }))
-    {
+    // Comment threads between the ends are not part of the code; they do
+    // not break the range.
+    if rows[first..=last].iter().any(|row| {
+        !matches!(
+            row,
+            Row::Line { .. } | Row::Context { .. } | Row::Inline { .. }
+        )
+    }) {
         return Err(RangeError::CrossesHunk);
     }
     let range = |side: Side, a: u32, b: u32| LineRange {
@@ -694,7 +713,10 @@ pub fn select_split_range(
     if !is_line(&selected[0]) || !is_line(&selected[selected.len() - 1]) {
         return Err(RangeError::NotALine);
     }
-    if !selected.iter().all(is_line) {
+    if !selected
+        .iter()
+        .all(|row| is_line(row) || matches!(row, Row::Inline { .. }))
+    {
         return Err(RangeError::CrossesHunk);
     }
     let number = |row: &Row| {
@@ -718,6 +740,191 @@ pub fn select_split_range(
         start: start.min(end),
         end: start.max(end),
     })
+}
+
+/// A block of rows inserted under a line of a file: a comment thread or a
+/// comment composer (spec §9: threads render inline under the anchored
+/// line).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InlineBlock {
+    /// The row the block goes under, as an index into the rows *without*
+    /// inline blocks (see [`strip_inline`]). `0` (the file header) puts it
+    /// at the top of the file.
+    pub after: usize,
+    /// Caller-defined identifier, stored in the block's [`Row::Inline`]
+    /// rows.
+    pub item: u32,
+    /// Rows the block takes, at least 1.
+    pub rows: u32,
+}
+
+/// Removes every [`Row::Inline`] row, restoring the rows [`build_rows`]
+/// produced, and recomputes [`FileRows::hunk_rows`].
+pub fn strip_inline(rows: &mut FileRows) {
+    if rows
+        .rows
+        .iter()
+        .any(|row| matches!(row, Row::Inline { .. }))
+    {
+        rows.rows.retain(|row| !matches!(row, Row::Inline { .. }));
+        reindex_hunks(rows);
+    }
+}
+
+/// Inserts `blocks` into rows that hold no inline rows yet (fresh from
+/// [`build_rows`] or [`strip_inline`]). Blocks under the same row keep the
+/// order they are given in. Returns the index of each block's first row, in
+/// the order of `blocks`. Linear in the rows.
+pub fn place_inline(rows: &mut FileRows, blocks: &[InlineBlock]) -> Vec<usize> {
+    debug_assert!(
+        !rows
+            .rows
+            .iter()
+            .any(|row| matches!(row, Row::Inline { .. }))
+    );
+    let mut first_rows = vec![0; blocks.len()];
+    if blocks.is_empty() {
+        return first_rows;
+    }
+    let mut order: Vec<usize> = (0..blocks.len()).collect();
+    order.sort_by_key(|&index| blocks[index].after);
+    let added: usize = blocks.iter().map(|block| block.rows.max(1) as usize).sum();
+    let mut out = Vec::with_capacity(rows.rows.len() + added);
+    let mut next = order.iter().peekable();
+    for (index, row) in rows.rows.iter().enumerate() {
+        out.push(*row);
+        while let Some(&&block_index) = next.peek() {
+            let block = blocks[block_index];
+            // Blocks past the end go under the last row.
+            if block.after > index && index + 1 < rows.rows.len() {
+                break;
+            }
+            next.next();
+            first_rows[block_index] = out.len();
+            out.extend((0..block.rows.max(1)).map(|part| Row::Inline {
+                item: block.item,
+                part,
+            }));
+        }
+    }
+    rows.rows = out;
+    reindex_hunks(rows);
+    first_rows
+}
+
+fn reindex_hunks(rows: &mut FileRows) {
+    rows.hunk_rows = rows
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| matches!(row, Row::HunkHeader { .. }))
+        .map(|(index, _)| index as u32)
+        .collect();
+}
+
+/// For each `(side, line)` of `wanted`, the last row of `rows` showing that
+/// line on that side (its last soft-wrap segment), or `None` when the line
+/// is not shown (hidden context, or outside the file). One pass over the
+/// rows, so placing many comments stays linear.
+pub fn anchor_rows(text: &TextDiff, rows: &[Row], wanted: &[(Side, u32)]) -> Vec<Option<usize>> {
+    let mut found = vec![None; wanted.len()];
+    if wanted.is_empty() {
+        return found;
+    }
+    let mut lookup: std::collections::HashMap<(Side, u32), Vec<usize>> =
+        std::collections::HashMap::with_capacity(wanted.len());
+    for (index, key) in wanted.iter().enumerate() {
+        lookup.entry(*key).or_default().push(index);
+    }
+    let mut record = |side: Side, line: Option<u32>, row: usize| {
+        if let Some(indices) = line.and_then(|line| lookup.get(&(side, line))) {
+            for &index in indices {
+                found[index] = Some(row);
+            }
+        }
+    };
+    for (row_index, row) in rows.iter().enumerate() {
+        match *row {
+            Row::Line { index, .. } => {
+                if let Some(line) = text.lines().get(index as usize) {
+                    record(Side::Old, line.old_line, row_index);
+                    record(Side::New, line.new_line, row_index);
+                }
+            }
+            Row::Context { old, new, .. } => {
+                record(Side::Old, Some(old), row_index);
+                record(Side::New, Some(new), row_index);
+            }
+            Row::Split { old, new, .. } => {
+                if let Some(line) = old.index().and_then(|index| text.lines().get(index)) {
+                    record(Side::Old, line.old_line, row_index);
+                }
+                if let Some(line) = new.index().and_then(|index| text.lines().get(index)) {
+                    record(Side::New, line.new_line, row_index);
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Lines of context revealed around a commented line that was hidden.
+const REVEAL_MARGIN: u32 = 3;
+
+/// Expands the gaps of a file so that lines `start..=end` of `side` are
+/// shown, e.g. a comment made on expanded context, after a restart.
+/// `expansions` is grown to one entry per gap. Returns whether anything
+/// changed (the rows then need [`build_rows`] again).
+pub fn reveal_lines(
+    gaps: &[Gap],
+    expansions: &mut Vec<GapExpansion>,
+    side: Side,
+    start: u32,
+    end: u32,
+) -> bool {
+    if expansions.len() < gaps.len() {
+        expansions.resize(gaps.len(), GapExpansion::default());
+    }
+    let mut changed = false;
+    for (gap, expansion) in gaps.iter().zip(expansions.iter_mut()) {
+        if gap.is_empty() {
+            continue;
+        }
+        // The range in old line numbers of this gap.
+        let (low, high) = match side {
+            Side::Old => (start, end),
+            Side::New => {
+                let new_end = gap.new_start + gap.len();
+                if end < gap.new_start || start >= new_end {
+                    continue;
+                }
+                let to_old = |new: u32| {
+                    gap.old.start + (new.clamp(gap.new_start, new_end - 1) - gap.new_start)
+                };
+                (to_old(start), to_old(end))
+            }
+        };
+        let (low, high) = (low.max(gap.old.start), high.min(gap.old.end - 1));
+        if low > high {
+            continue;
+        }
+        let top_end = gap.old.start + expansion.top;
+        let bottom_start = gap.old.end - expansion.bottom.min(gap.len());
+        let shown = high < top_end || low >= bottom_start;
+        if shown || expansion.hidden(gap) == 0 {
+            continue;
+        }
+        let top = (high - gap.old.start + 1 + REVEAL_MARGIN).min(gap.len());
+        let bottom = (gap.old.end - low + REVEAL_MARGIN).min(gap.len());
+        if top - expansion.top.min(top) <= bottom - expansion.bottom.min(bottom) {
+            expansion.top = expansion.top.max(top);
+        } else {
+            expansion.bottom = expansion.bottom.max(bottom);
+        }
+        changed = true;
+    }
+    changed
 }
 
 /// A row's logical position in its file, independent of the layout mode and
@@ -755,6 +962,13 @@ pub fn row_key(rows: &[Row], index: usize) -> RowKey {
         },
         Some(&Row::Context { old, .. }) => RowKey::Context(old),
         Some(&Row::Expander { gap }) => RowKey::Expander(gap),
+        // A comment block belongs to the line above it.
+        Some(Row::Inline { .. }) => {
+            let above = rows[..index]
+                .iter()
+                .rposition(|row| !matches!(row, Row::Inline { .. }));
+            above.map_or(RowKey::FileHeader, |above| row_key(rows, above))
+        }
     }
 }
 

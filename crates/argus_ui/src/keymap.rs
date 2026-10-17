@@ -65,6 +65,67 @@ actions!(
         FocusFileFilter,
         /// Switch the file tree between tree and flat list.
         ToggleFileListMode,
+        /// Scroll to the next comment thread.
+        NextComment,
+        /// Scroll to the previous comment thread.
+        PreviousComment,
+        /// Collapse every comment thread, or expand them all again.
+        ToggleAllComments,
+        /// Switch the left dock between the file tree and the comment list.
+        ToggleCommentList,
+        /// Save the comment being written.
+        SubmitComment,
+        /// Debug builds: move the focused comment to its next status, to try
+        /// the status chips before runs exist.
+        AdvanceCommentStatus,
+    ]
+);
+
+actions!(
+    argus_editor,
+    [
+        /// Delete the character before the caret (or the selection).
+        Backspace,
+        /// Delete the character after the caret (or the selection).
+        Delete,
+        /// Insert a line break.
+        Newline,
+        /// Move the caret one character left.
+        MoveLeft,
+        /// Move the caret one character right.
+        MoveRight,
+        /// Move the caret one line up.
+        MoveUp,
+        /// Move the caret one line down.
+        MoveDown,
+        /// Move the caret one word left.
+        MoveWordLeft,
+        /// Move the caret one word right.
+        MoveWordRight,
+        /// Move the caret to the start of the line.
+        MoveToLineStart,
+        /// Move the caret to the end of the line.
+        MoveToLineEnd,
+        /// Extend the selection one character left.
+        SelectLeft,
+        /// Extend the selection one character right.
+        SelectRight,
+        /// Extend the selection one line up.
+        SelectUp,
+        /// Extend the selection one line down.
+        SelectDown,
+        /// Extend the selection to the start of the line.
+        SelectToLineStart,
+        /// Extend the selection to the end of the line.
+        SelectToLineEnd,
+        /// Select the whole text.
+        SelectAll,
+        /// Copy the selection.
+        Copy,
+        /// Cut the selection.
+        Cut,
+        /// Paste the clipboard.
+        Paste,
     ]
 );
 
@@ -77,6 +138,13 @@ pub const TEXT_INPUT_CONTEXT: &str = "TextInput";
 
 /// Key context set on the file tree dock.
 pub const FILE_TREE_CONTEXT: &str = "FileTree";
+
+/// Key context of the multi-line comment editor (set together with
+/// [`TEXT_INPUT_CONTEXT`]).
+pub const COMMENT_EDITOR_CONTEXT: &str = "CommentEditor";
+
+/// Predicate for the comment editor's keys.
+const COMMENT_EDITOR: Option<&str> = Some("CommentEditor");
 
 /// Predicate for single-key navigation shortcuts.
 const NAVIGATION: Option<&str> = Some("Workspace && !TextInput");
@@ -213,6 +281,35 @@ pub const SHORTCUTS: &[Shortcut] = &[
     ),
     shortcut!("a", Accept, NAVIGATION, "Review", "Accept the proposal"),
     shortcut!(
+        "secondary-enter",
+        SubmitComment,
+        COMMENT_EDITOR,
+        "Review",
+        "Save the comment (Esc cancels)"
+    ),
+    shortcut!("] c", NextComment, NAVIGATION, "Review", "Next comment"),
+    shortcut!(
+        "[ c",
+        PreviousComment,
+        NAVIGATION,
+        "Review",
+        "Previous comment"
+    ),
+    shortcut!(
+        "shift-c",
+        ToggleAllComments,
+        NAVIGATION,
+        "Review",
+        "Collapse / expand all comments"
+    ),
+    shortcut!(
+        "secondary-shift-c",
+        ToggleCommentList,
+        None,
+        "Review",
+        "Show the files / the comment list"
+    ),
+    shortcut!(
         "secondary-o",
         OpenRepository,
         None,
@@ -284,13 +381,62 @@ pub const SHORTCUTS: &[Shortcut] = &[
 pub const SHORTCUT_GROUPS: &[&str] = &[
     "Navigation",
     "File tree",
-    "Review",
     "Layout",
+    "Review",
     "Appearance",
     "Application",
 ];
 
-/// Registers every binding in [`SHORTCUTS`].
+/// The text-editing keys of the comment editor. They are the usual ones of
+/// each platform, so the shortcuts sheet does not list them.
+pub fn editor_bindings() -> Vec<KeyBinding> {
+    let context = COMMENT_EDITOR;
+    let mut bindings = vec![
+        KeyBinding::new("backspace", Backspace, context),
+        KeyBinding::new("shift-backspace", Backspace, context),
+        KeyBinding::new("delete", Delete, context),
+        KeyBinding::new("enter", Newline, context),
+        KeyBinding::new("shift-enter", Newline, context),
+        KeyBinding::new("left", MoveLeft, context),
+        KeyBinding::new("right", MoveRight, context),
+        KeyBinding::new("up", MoveUp, context),
+        KeyBinding::new("down", MoveDown, context),
+        KeyBinding::new("home", MoveToLineStart, context),
+        KeyBinding::new("end", MoveToLineEnd, context),
+        KeyBinding::new("shift-left", SelectLeft, context),
+        KeyBinding::new("shift-right", SelectRight, context),
+        KeyBinding::new("shift-up", SelectUp, context),
+        KeyBinding::new("shift-down", SelectDown, context),
+        KeyBinding::new("shift-home", SelectToLineStart, context),
+        KeyBinding::new("shift-end", SelectToLineEnd, context),
+        KeyBinding::new("secondary-a", SelectAll, context),
+        KeyBinding::new("secondary-c", Copy, context),
+        KeyBinding::new("secondary-x", Cut, context),
+        KeyBinding::new("secondary-v", Paste, context),
+    ];
+    if cfg!(target_os = "macos") {
+        bindings.extend([
+            KeyBinding::new("alt-left", MoveWordLeft, context),
+            KeyBinding::new("alt-right", MoveWordRight, context),
+            KeyBinding::new("cmd-left", MoveToLineStart, context),
+            KeyBinding::new("cmd-right", MoveToLineEnd, context),
+            KeyBinding::new("cmd-shift-left", SelectToLineStart, context),
+            KeyBinding::new("cmd-shift-right", SelectToLineEnd, context),
+            KeyBinding::new("ctrl-a", MoveToLineStart, context),
+            KeyBinding::new("ctrl-e", MoveToLineEnd, context),
+        ]);
+    } else {
+        bindings.extend([
+            KeyBinding::new("ctrl-left", MoveWordLeft, context),
+            KeyBinding::new("ctrl-right", MoveWordRight, context),
+        ]);
+    }
+    bindings
+}
+
+/// Registers every binding in [`SHORTCUTS`], plus the comment editor's
+/// [`editor_bindings`].
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys(SHORTCUTS.iter().map(Shortcut::binding));
+    cx.bind_keys(editor_bindings());
 }
