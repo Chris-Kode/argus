@@ -36,7 +36,7 @@ pub use worktrees::{
 
 /// Handle to the git service.
 ///
-/// Cheap to clone. It caches one opened [`Repo`] (and so one
+/// It caches one opened [`Repo`] (and so one
 /// `gix::ThreadSafeRepository` with its loaded pack indices) per git
 /// directory, so each linked worktree keeps its own handle; the other reads are the free functions of [`read`].
 #[derive(Clone, Debug, Default)]
