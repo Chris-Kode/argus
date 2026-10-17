@@ -39,7 +39,7 @@ pub use model::{
     Side,
 };
 pub use repos::{Repo, RepoStore};
-pub use runs::{NewRun, Run, RunEvent, RunOutcome, RunStore};
+pub use runs::{NewRun, Run, RunEvent, RunListing, RunOutcome, RunStore};
 pub use settings::SettingsStore;
 
 /// File name of the database inside the Argus home directory.

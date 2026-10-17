@@ -175,6 +175,15 @@ pub enum DiffViewEvent {
     /// The file under the top of the viewport changed (file-list index);
     /// the file tree highlights it.
     ActiveFileChanged(usize),
+    /// The user asked to run a comment with Claude (Run menu or `r`).
+    RunRequested {
+        /// The comment to run.
+        comment_id: argus_diff::review::CommentId,
+        /// Model picked in the Run menu.
+        model: String,
+        /// Thinking effort picked in the Run menu.
+        effort: String,
+    },
     /// "View proposal" on a `Proposed` comment thread.
     ViewProposal(argus_diff::review::CommentId),
     /// A proposal's "Open in editor" on a changed file (repository-relative
