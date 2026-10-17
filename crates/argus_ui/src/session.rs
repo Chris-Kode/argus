@@ -279,6 +279,7 @@ impl RepoSession {
             let result = flatten(job.await);
             this.update(cx, |this, cx| match result {
                 Ok(snapshot) => {
+                    crate::perf::mark(crate::perf::Milestone::BranchesListed, cx);
                     let (base, head) = initial_selection(
                         &snapshot,
                         this.record.last_base.as_deref(),

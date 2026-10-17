@@ -8,6 +8,18 @@ members = [
     "crates/argus_highlight",
     "crates/argus_runs",
     "crates/argus_store",
+    "xtask",
+]
+# `cargo run` / `cargo build` without `-p` stay on the app; `xtask` is a dev
+# tool reached through the `cargo xtask` alias (.cargo/config.toml).
+default-members = [
+    "crates/argus",
+    "crates/argus_ui",
+    "crates/argus_git",
+    "crates/argus_diff",
+    "crates/argus_highlight",
+    "crates/argus_runs",
+    "crates/argus_store",
 ]
 
 [workspace.package]

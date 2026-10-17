@@ -21,3 +21,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 unicode-segmentation.workspace = true
+
+# Peak RSS for the `ARGUS_PERF` report.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

@@ -161,6 +161,11 @@ stay plain unless you click "Highlight" in their header.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build, lint and GPUI-pin conventions,
 and [AGENTS.md](AGENTS.md) for the rules that apply to AI coding agents.
 
+Performance: `cargo xtask fixtures` generates the large fixture repositories,
+and `ARGUS_PERF=1 cargo run --release -- --repo target/fixtures/huge-files
+--base base --head head --auto-scroll` prints startup and scroll timings. See
+[docs/perf.md](docs/perf.md) for the harness and the latest results.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

@@ -110,6 +110,7 @@ use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{button, placeholder, toggle_button};
 use crate::jobs::BackgroundJobs;
 use crate::keymap::ToggleSoftWrap;
+use crate::perf;
 use crate::runtime::spawn_job;
 use crate::session::DiffTarget;
 use crate::theme::{ActiveTheme, SyntaxTheme};
@@ -1359,6 +1360,31 @@ impl DiffView {
         }
     }
 
+    /// Scrolls down by up to `pixels` and returns how far it moved (`0`
+    /// at the end of the diff). Drives the `ARGUS_PERF` auto-scroll.
+    pub fn scroll_by_pixels(&mut self, pixels: f64, cx: &mut Context<Self>) -> f64 {
+        let viewport = f64::from(self.list_bounds().size.height.as_f32());
+        let content = self.total_rows() as f64 * self.row_height();
+        let max = (content - viewport).max(0.0);
+        let before = self.scroll_top();
+        let after = (before + pixels).min(max);
+        if after <= before {
+            return 0.0;
+        }
+        self.set_scroll_top(after);
+        cx.notify();
+        after - before
+    }
+
+    /// Whether the files on screen have no load and no highlight job in
+    /// flight; the `ARGUS_PERF` report times how long this takes after a
+    /// scroll stops.
+    pub fn visible_settled(&self) -> bool {
+        self.visible_files
+            .clone()
+            .all(|file| !self.loads.contains_key(&file) && !self.highlights.contains_key(&file))
+    }
+
     /// Scrolls so that global row `row` is the first one in the viewport.
     fn scroll_to_row(&mut self, row: usize, cx: &mut Context<Self>) {
         let viewport = f64::from(self.list_bounds().size.height.as_f32());
@@ -1876,6 +1902,15 @@ impl DiffView {
         let list = list.clone();
         let columns = self.columns();
         self.render_start = range.start;
+        if !self.proposal && perf::enabled(cx) {
+            let shows_lines = range.clone().any(|row| {
+                let file = self.file_at(row);
+                row > self.starts[file] && self.files[file].loaded().is_some()
+            });
+            if shows_lines {
+                perf::mark_painted(perf::Milestone::FirstDiffPainted, cx);
+            }
+        }
         range
             .map(|row| {
                 let file = self.file_at(row);

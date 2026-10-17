@@ -30,6 +30,12 @@ cargo test --workspace
 Clippy warnings are errors. `cargo test --workspace` currently runs zero tests
 by project policy — see [AGENTS.md](AGENTS.md).
 
+## Performance
+
+`cargo xtask fixtures` builds the deterministic fixture repositories under
+`target/fixtures/`; `ARGUS_PERF=1` (with `--auto-scroll`) prints the timing
+report. See [docs/perf.md](docs/perf.md).
+
 ## GPUI pin
 
 GPUI is not reliably published on crates.io, so Argus depends on the Zed
