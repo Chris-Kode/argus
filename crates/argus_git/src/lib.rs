@@ -23,7 +23,10 @@ pub use cancel::{CancelGuard, CancelToken};
 pub use cli::{GitCli, GitOutput};
 pub use error::{GitError, Result};
 pub use read::{Branch, BranchKind, Checkout, Repo, RepoId, Sha};
-pub use worktrees::{ChangeKind, ChangedFile, Patch, ReconcileReport, Worktree, WorktreeManager};
+pub use worktrees::{
+    ApplyOutcome, ChangeKind, ChangedFile, CommitOutcome, Patch, ReconcileReport, Worktree,
+    WorktreeManager,
+};
 
 /// Handle to the git service.
 ///

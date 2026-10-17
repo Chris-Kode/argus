@@ -81,7 +81,8 @@ impl ReviewComments {
                 let comment_id = match runs.recv().await {
                     Ok(RunUpdate::Started { comment_id, .. }) => comment_id,
                     Ok(RunUpdate::Finished(finished)) => finished.comment_id,
-                    Ok(RunUpdate::Rejected { comment_id, .. }) => comment_id,
+                    Ok(RunUpdate::Rejected { comment_id, .. })
+                    | Ok(RunUpdate::Accepted { comment_id, .. }) => comment_id,
                     Err(RecvError::Lagged(_)) => None,
                     Err(RecvError::Closed) => break,
                 };

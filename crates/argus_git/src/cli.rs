@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
 
+use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 
 use crate::error::{GitError, Result};
@@ -65,7 +66,7 @@ impl GitCli {
         S: AsRef<OsStr>,
     {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-        let output = self.output(&args).await?;
+        let output = self.output(&args, None).await?;
         if output.success() {
             Ok(output)
         } else {
@@ -85,19 +86,49 @@ impl GitCli {
         S: AsRef<OsStr>,
     {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-        self.output(&args).await
+        self.output(&args, None).await
     }
 
-    async fn output(&self, args: &[OsString]) -> Result<GitOutput> {
+    /// Runs `git <args>` with `input` on its standard input (e.g. a patch
+    /// for `git apply -` or a message for `git commit -F -`) and returns its
+    /// output whatever the exit code; only a failure to start git is an
+    /// error.
+    pub async fn run_with_input<I, S>(&self, args: I, input: &[u8]) -> Result<GitOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+        self.output(&args, Some(input)).await
+    }
+
+    async fn output(&self, args: &[OsString], input: Option<&[u8]>) -> Result<GitOutput> {
         let started = Instant::now();
-        let output = self
-            .command(args)
-            .output()
-            .await
-            .map_err(|source| GitError::Spawn {
-                command: command_line(args),
-                source,
-            })?;
+        let spawn_error = |source| GitError::Spawn {
+            command: command_line(args),
+            source,
+        };
+        let mut command = self.command(args);
+        let output = match input {
+            None => command.output().await.map_err(spawn_error)?,
+            Some(input) => {
+                let mut child = command.stdin(Stdio::piped()).spawn().map_err(spawn_error)?;
+                let mut stdin = child.stdin.take();
+                let input = input.to_vec();
+                // Feed stdin while the output is read, so a large input
+                // cannot deadlock on a full pipe.
+                let writer = async move {
+                    if let Some(stdin) = stdin.as_mut() {
+                        // git may exit before reading everything; its exit
+                        // code reports why.
+                        let _ = stdin.write_all(&input).await;
+                    }
+                    drop(stdin);
+                };
+                let (output, ()) = tokio::join!(child.wait_with_output(), writer);
+                output.map_err(spawn_error)?
+            }
+        };
         let output = GitOutput {
             stdout: output.stdout,
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
