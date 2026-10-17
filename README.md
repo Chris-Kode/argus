@@ -52,6 +52,18 @@ every thread by file, filterable by status. File-tree rows show a comment
 count. Debug builds add "Advance status (debug)" to the thread menu, to try
 the status chips before runs exist.
 
+Comments follow their code. Every time the diff is refreshed (branch change,
+Fetch, Accept), each comment looks for its lines and their context in the new
+diff: unchanged, moved (lines inserted above, or the file renamed), or gone.
+When the code is gone, the comment becomes **outdated**. Outdated comments are
+not shown inline. They are listed in the "Outdated" group of the file tree and
+the Comments tab, which shows the original code at its original line numbers.
+From there, **Re-attach…** lets you pick new lines in the diff (gutter "+",
+`c` on a selection, or Save in the bar), and **Dismiss** closes the comment.
+Outdated comments cannot be run. A comment that finds its code again (for
+example after a revert) is no longer outdated. Resolved comments are moved
+too, but are never flagged outdated.
+
 ![Comment threads in the side-by-side diff](docs/screenshots/comments-light.png)
 
 When a run finishes with a change, its comment turns Proposed. "View proposal"

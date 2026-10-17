@@ -60,6 +60,12 @@ impl FileList {
         })
     }
 
+    /// Index of the entry whose new path (the merge-base path for
+    /// deletions) is exactly `path`; renames' old paths are not matched.
+    pub fn index_of_path(&self, path: &str) -> Option<usize> {
+        self.by_path.get(path).copied()
+    }
+
     /// The entry for `path` (see [`index_of`](Self::index_of)).
     pub fn get(&self, path: &str) -> Option<&FileEntry> {
         self.index_of(path).map(|index| &self.entries[index])
@@ -232,6 +238,11 @@ impl DiffSession {
         &self.inner.options
     }
 
+    /// A token cancelled with the session, for jobs run on its behalf.
+    pub(crate) fn cancel_token(&self) -> CancelToken {
+        self.inner.cancel.child()
+    }
+
     /// Cancels every running and future job of this session.
     pub fn cancel(&self) {
         self.inner.cancel.cancel();
@@ -354,7 +365,7 @@ impl DiffSession {
 }
 
 /// Runs `work` on tokio's blocking pool.
-async fn run_blocking<T, F>(work: F) -> Result<T>
+pub(crate) async fn run_blocking<T, F>(work: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
