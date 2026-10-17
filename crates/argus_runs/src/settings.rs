@@ -58,8 +58,11 @@ pub enum SettingError {
         /// The I/O error text.
         reason: String,
     },
-    /// No `claude` executable was found on `PATH`.
-    #[error("`claude` was not found on PATH; install Claude Code or set its path")]
+    /// No `claude` executable was found on `PATH` or in the common install
+    /// locations.
+    #[error(
+        "`claude` was not found on PATH or in the usual install locations; install Claude Code or set its path"
+    )]
     NotOnPath,
     /// A list setting has no entries.
     #[error("enter at least one value")]
@@ -199,18 +202,43 @@ impl ClaudeSettings {
         Duration::from_secs(self.commit_message_timeout_s)
     }
 
-    /// The `claude` binary to run: the configured path when it is a valid
-    /// executable, else the first `claude` on `PATH`. Blocking.
+    /// The `claude` binary to run; see [`resolve_claude_path`]. Blocking.
     pub fn resolve_claude(&self) -> Result<PathBuf, SettingError> {
-        match &self.claude_path {
-            Some(path) => {
-                let path = expand_home(path);
-                check_executable(&path)?;
-                Ok(path)
-            }
-            None => find_on_path(CLAUDE_BINARY).ok_or(SettingError::NotOnPath),
-        }
+        resolve_claude_path(self.claude_path.as_deref())
     }
+}
+
+/// Where installers put `claude` when it is not on the app's `PATH` (a GUI
+/// app started from the Finder sees only the system `PATH`). A leading `~`
+/// is expanded.
+pub const COMMON_CLAUDE_PATHS: [&str; 7] = [
+    "~/.claude/local/claude",
+    "~/.local/bin/claude",
+    "/opt/homebrew/bin/claude",
+    "/usr/local/bin/claude",
+    "~/.npm-global/bin/claude",
+    "~/.bun/bin/claude",
+    "~/.volta/bin/claude",
+];
+
+/// The `claude` binary to run: the configured path when set (it must be an
+/// executable file; there is no fallback), else the first `claude` on
+/// `PATH`, else the first of [`COMMON_CLAUDE_PATHS`] that is executable.
+/// Blocking.
+pub fn resolve_claude_path(configured: Option<&Path>) -> Result<PathBuf, SettingError> {
+    if let Some(path) = configured {
+        let path = expand_home(path);
+        check_executable(&path)?;
+        return Ok(path);
+    }
+    find_on_path(CLAUDE_BINARY)
+        .or_else(|| {
+            COMMON_CLAUDE_PATHS
+                .iter()
+                .map(|path| expand_home(Path::new(path)))
+                .find(|path| path.is_absolute() && check_executable(path).is_ok())
+        })
+        .ok_or(SettingError::NotOnPath)
 }
 
 /// `<argus_home>/review-rules.md`.

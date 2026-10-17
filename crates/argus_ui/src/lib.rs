@@ -6,6 +6,7 @@
 
 pub mod branch_picker;
 pub mod claude_settings;
+pub mod claude_status;
 pub mod comments;
 pub mod components;
 pub mod diff_view;
@@ -44,7 +45,8 @@ pub use workspace::Workspace;
 /// Application-wide handles to the services, stored as a GPUI global.
 ///
 /// Views read it with `cx.global::<AppContext>()`. The run manager carries the
-/// live Claude settings; spawning runs lands with issue #20.
+/// live Claude settings and the detected `claude` capabilities; spawning runs
+/// lands with issue #20.
 pub struct AppContext {
     /// Git reads (gix) and writes (git CLI).
     pub git: GitService,
@@ -203,6 +205,9 @@ pub fn run_gpui_app(
     });
     let ui_settings = settings.ui;
     let runs = RunManager::new(argus_home, settings.claude);
+    // `claude --version` / `--help` run on the runtime; the UI only receives
+    // the resulting status.
+    runs.start_detection(&runtime);
 
     argus_store::mark_ui_thread();
     gpui_platform::application().run(move |cx: &mut App| {

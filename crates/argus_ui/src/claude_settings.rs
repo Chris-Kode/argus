@@ -8,6 +8,10 @@
 //! so the next run picks them up without a restart, and are written to the
 //! `settings` table on the tokio runtime. Filesystem checks (does the Claude
 //! path exist and is it executable?) run there too, never on the UI thread.
+//!
+//! The "Claude binary" hint shows the run manager's detection of the
+//! installed CLI (version, missing flags), which reruns on its own whenever
+//! the path setting changes.
 
 use std::path::PathBuf;
 
@@ -15,12 +19,13 @@ use argus_runs::settings::{
     self, MAX_COMMIT_MESSAGE_TIMEOUT_S, MIN_COMMIT_MESSAGE_TIMEOUT_S, default_review_rules_path,
     format_list,
 };
-use argus_runs::{ClaudeSettings, RunManager, SettingError, review_rules};
+use argus_runs::{ClaudeSettings, ClaudeStatus, RunManager, SettingError, review_rules};
 use gpui::{
     AnyElement, Context, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 
 use crate::AppContext;
+use crate::claude_status::observe_claude_status;
 use crate::components::{button, section_header, toggle_button};
 use crate::runtime::spawn_job;
 use crate::text_field::{TextField, TextFieldEvent};
@@ -54,13 +59,6 @@ impl Field {
     }
 }
 
-/// Where the next run's `claude` binary comes from.
-enum Detection {
-    Checking,
-    Found(PathBuf),
-    Failed(SharedString),
-}
-
 /// One text field with its inline error and pending validation.
 struct FieldState {
     input: Entity<TextField>,
@@ -73,8 +71,9 @@ struct FieldState {
 pub struct ClaudeSettingsForm {
     settings: ClaudeSettings,
     fields: Vec<FieldState>,
-    detection: Detection,
-    detect_task: Option<Task<()>>,
+    /// The run manager's detection of the installed `claude`.
+    claude: ClaudeStatus,
+    _claude_task: Task<()>,
     /// Error of the last "Open review rules in editor" attempt.
     open_error: Option<SharedString>,
     open_task: Option<Task<()>>,
@@ -120,18 +119,18 @@ impl ClaudeSettingsForm {
             }
         }));
 
-        let mut this = Self {
+        Self {
             settings,
             fields,
-            detection: Detection::Checking,
-            detect_task: None,
+            claude: runs(cx).claude_status(),
+            _claude_task: observe_claude_status(cx, |this: &mut Self, status, _| {
+                this.claude = status;
+            }),
             open_error: None,
             open_task: None,
             save_task: None,
             _subscriptions: subscriptions,
-        };
-        this.detect_claude(cx);
-        this
+        }
     }
 
     fn field(&self, field: Field) -> &FieldState {
@@ -238,11 +237,9 @@ impl ClaudeSettingsForm {
         if self.settings == before {
             return;
         }
+        // The run manager re-detects `claude` itself when the path changed.
         runs(cx).set_settings(self.settings.clone());
         self.save(cx);
-        if self.settings.claude_path != before.claude_path {
-            self.detect_claude(cx);
-        }
         if self.settings.review_rules_path != before.review_rules_path {
             self.open_error = None;
         }
@@ -283,29 +280,6 @@ impl ClaudeSettingsForm {
                 Err(error) => tracing::warn!(%error, "Claude settings save task failed"),
             }
         }));
-    }
-
-    /// Resolves the `claude` binary the next run would use.
-    fn detect_claude(&mut self, cx: &mut Context<Self>) {
-        let settings = self.settings.clone();
-        let job = spawn_job(cx, async move {
-            tokio::task::spawn_blocking(move || settings.resolve_claude()).await
-        });
-        self.detection = Detection::Checking;
-        self.detect_task = Some(cx.spawn(async move |this, cx| {
-            let detection = match job.await {
-                Ok(Ok(Ok(path))) => Detection::Found(path),
-                Ok(Ok(Err(error))) => Detection::Failed(error_text(&error)),
-                Ok(Err(error)) => Detection::Failed(error.to_string().into()),
-                Err(error) => Detection::Failed(error.to_string().into()),
-            };
-            this.update(cx, |this, cx| {
-                this.detection = detection;
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
     }
 
     /// Opens the review rules file with the system's default application,
@@ -473,11 +447,10 @@ impl ClaudeSettingsForm {
 
 impl Render for ClaudeSettingsForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let claude_hint = match &self.detection {
-            Detection::Checking => ("Looking for claude…".into(), false),
-            Detection::Found(path) => (format!("Runs use {}", display_path(path)).into(), false),
-            Detection::Failed(error) => (error.clone(), true),
-        };
+        let claude_hint = claude_hint(&self.claude);
+        let recheck = button("recheck-claude", "Check again", cx)
+            .on_click(cx.listener(|_, _, _, cx| runs(cx).recheck_claude()))
+            .into_any_element();
         let rules_path = self.settings.review_rules_path(runs(cx).argus_home());
         let rules_hint = match &self.open_error {
             Some(error) => (error.clone(), true),
@@ -511,7 +484,7 @@ impl Render for ClaudeSettingsForm {
             .child(self.render_field_row(
                 Field::ClaudePath,
                 "Claude binary",
-                None,
+                Some(recheck),
                 Some(claude_hint),
                 cx,
             ))
@@ -576,6 +549,29 @@ fn runs(cx: &gpui::App) -> &RunManager {
     &cx.global::<AppContext>().runs
 }
 
+/// The "Claude binary" hint: the detected version and path, or why runs
+/// are disabled; `true` marks an error.
+fn claude_hint(status: &ClaudeStatus) -> (SharedString, bool) {
+    match status {
+        ClaudeStatus::Detecting => ("Looking for claude…".into(), false),
+        ClaudeStatus::Unavailable(error) => (capitalize(&error.to_string()), true),
+        ClaudeStatus::Detected(capabilities) => {
+            if let Some(blocker) = capabilities.run_blocker() {
+                return (blocker.into(), true);
+            }
+            let found = format!(
+                "Runs use Claude Code {} at {}",
+                capabilities.version_label(),
+                display_path(capabilities.path())
+            );
+            match capabilities.warning() {
+                Some(warning) => (format!("{found}. {warning}").into(), false),
+                None => (found.into(), false),
+            }
+        }
+    }
+}
+
 /// The applied value as shown in the field.
 fn field_text(settings: &ClaudeSettings, field: Field) -> String {
     let path = |path: &Option<PathBuf>| {
@@ -605,8 +601,11 @@ fn placeholder(field: Field, cx: &gpui::App) -> SharedString {
 }
 
 fn error_text(error: &SettingError) -> SharedString {
-    let text = error.to_string();
-    // Errors start lowercase so they compose; inline they read as sentences.
+    capitalize(&error.to_string())
+}
+
+/// Errors start lowercase so they compose; inline they read as sentences.
+fn capitalize(text: &str) -> SharedString {
     let mut chars = text.chars();
     match chars.next() {
         Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()).into(),

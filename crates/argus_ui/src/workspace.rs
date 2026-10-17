@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use argus_diff::layout::ViewMode;
+use argus_runs::ClaudeStatus;
 use argus_store::{Repo, StorageService};
 use gpui::{
     Action, AnyElement, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable,
@@ -23,6 +24,7 @@ use gpui::{
 use crate::AppContext;
 use crate::branch_picker::{BranchPicker, PickerEvent};
 use crate::claude_settings::ClaudeSettingsForm;
+use crate::claude_status::observe_claude_status;
 use crate::components::{
     button, disabled_button, kbd, panel_header, placeholder, primary_button, section_header,
     toggle_button,
@@ -129,6 +131,11 @@ pub struct Workspace {
     recent: RecentRepos,
     sheet: Option<Sheet>,
     notice: Option<Notice>,
+    /// The detected `claude`; a blocker disables Run and shows a banner.
+    claude: ClaudeStatus,
+    /// The user closed the banner of the current status' warning.
+    claude_warning_dismissed: bool,
+    _claude_task: Task<()>,
     save_task: Option<Task<()>>,
     open_task: Option<Task<()>>,
     recent_task: Option<Task<()>>,
@@ -177,6 +184,14 @@ impl Workspace {
             recent: RecentRepos::Loading,
             sheet: None,
             notice: None,
+            claude: cx.global::<AppContext>().runs.claude_status(),
+            claude_warning_dismissed: false,
+            _claude_task: observe_claude_status(cx, |this: &mut Self, status, _| {
+                if this.claude != status {
+                    this.claude = status;
+                    this.claude_warning_dismissed = false;
+                }
+            }),
             save_task: None,
             open_task: None,
             recent_task: None,
@@ -788,6 +803,21 @@ impl Workspace {
         }
     }
 
+    /// Run is disabled while `claude` is missing, still being checked, or
+    /// lacks a required flag (spec Q4); the reason goes to the status bar.
+    /// Starting runs lands with the Run menu (#21).
+    fn run(&mut self, action: &Run, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(blocker) = self.claude.run_blocker() {
+            self.notice = Some(Notice {
+                message: blocker.into(),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        self.not_wired_yet(action, window, cx);
+    }
+
     /// Placeholder handler for review actions whose views land in later
     /// issues (comments #14, runs #21, accept).
     fn not_wired_yet<A: Action>(&mut self, action: &A, _: &mut Window, _: &mut Context<Self>) {
@@ -1057,6 +1087,81 @@ impl Workspace {
                         .with_priority(1),
                 )
             })
+    }
+
+    /// The banner under the title bar when runs are disabled (`claude`
+    /// missing, unusable or lacking a required flag) or degraded (no
+    /// `--effort`). Nothing while detection is in progress.
+    fn render_claude_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (message, is_error) = match &self.claude {
+            ClaudeStatus::Detecting => return None,
+            status => match status.run_blocker() {
+                Some(blocker) => (format!("{blocker}. Run is disabled."), true),
+                None if self.claude_warning_dismissed => return None,
+                None => (status.warning()?, false),
+            },
+        };
+        let colors = cx.theme().colors.clone();
+        let tint = if is_error {
+            colors.error
+        } else {
+            colors.warning
+        };
+        let actions = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .child(
+                button("claude-banner-recheck", "Check again", cx)
+                    .h(px(20.0))
+                    .text_xs()
+                    .on_click(|_, _, cx| cx.global::<AppContext>().runs.recheck_claude()),
+            )
+            .child(
+                button("claude-banner-settings", "Settings", cx)
+                    .h(px(20.0))
+                    .text_xs()
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(OpenSettings.boxed_clone(), cx)
+                    }),
+            )
+            .when(!is_error, |actions| {
+                actions.child(
+                    button("claude-banner-dismiss", "Dismiss", cx)
+                        .h(px(20.0))
+                        .text_xs()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.claude_warning_dismissed = true;
+                            cx.notify();
+                        })),
+                )
+            });
+        Some(
+            div()
+                .id("claude-banner")
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .px_2()
+                .py_0p5()
+                .bg(tint.opacity(0.12))
+                .border_b_1()
+                .border_color(tint.opacity(0.4))
+                .text_xs()
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_color(tint)
+                        .child(message),
+                )
+                .child(actions)
+                .into_any_element(),
+        )
     }
 
     fn render_file_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2035,9 +2140,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::toggle_diff_mode))
             .on_action(cx.listener(Self::not_wired_yet::<Comment>))
-            .on_action(cx.listener(Self::not_wired_yet::<Run>))
+            .on_action(cx.listener(Self::run))
             .on_action(cx.listener(Self::not_wired_yet::<Accept>))
             .child(self.render_title_bar(cx))
+            .children(self.render_claude_banner(cx))
             .child(body)
             .child(self.render_status_bar(cx))
             .when_some(self.sheet, |root, sheet| {

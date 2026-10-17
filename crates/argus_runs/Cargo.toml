@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 argus_diff.workspace = true
 argus_store.workspace = true
+uuid.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
