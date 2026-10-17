@@ -5,6 +5,7 @@
 //! the [`AppContext`] global; colors and fonts through the [`Theme`] global.
 
 pub mod branch_picker;
+pub mod comments;
 pub mod components;
 pub mod diff_view;
 pub mod file_tree;
@@ -28,6 +29,7 @@ use gpui::{
     px, size,
 };
 
+pub use comments::{ReviewComments, ReviewCommentsEvent};
 pub use diff_view::{DiffView, DiffViewEvent, DisplayOptions, LineSelection};
 pub use file_tree::{FileTree, FileTreeEvent};
 pub use jobs::BackgroundJobs;
@@ -92,7 +94,39 @@ pub async fn open_worktrees(
             "marked interrupted runs as failed"
         );
     }
+    reopen_interrupted_comments(store, &interrupted).await;
     Ok(worktrees)
+}
+
+/// Moves the comments of interrupted runs from `Running` back to `Open`, as
+/// for any failed run (spec §6.3). Failures are logged, not fatal.
+async fn reopen_interrupted_comments(store: &StorageService, interrupted: &[argus_store::RunId]) {
+    let comments = store.comments();
+    for &run_id in interrupted {
+        let comment_id = match store.runs().get(run_id).await {
+            Ok(Some(run)) => run.comment_id,
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(run = %run_id, %error, "cannot read interrupted run");
+                None
+            }
+        };
+        let Some(comment_id) = comment_id else {
+            continue;
+        };
+        match comments.get(comment_id).await {
+            Ok(Some(comment)) if comment.status == argus_store::CommentStatus::Running => {}
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::warn!(comment = %comment_id, %error, "cannot read comment");
+                continue;
+            }
+        }
+        let event = argus_diff::review::CommentEvent::RunFailed;
+        if let Err(error) = argus_diff::review::apply_event(&comments, comment_id, event).await {
+            tracing::warn!(comment = %comment_id, %error, "cannot reopen comment");
+        }
+    }
 }
 
 /// Startup reconciliation of every known repository's worktrees (spec §5.2),
