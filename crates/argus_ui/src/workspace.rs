@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use argus_diff::layout::ViewMode;
+use argus_diff::review::CommentChange;
 use argus_runs::ClaudeStatus;
 use argus_store::{Repo, StorageService};
 use gpui::{
@@ -415,8 +416,12 @@ impl Workspace {
             cx.subscribe(
                 &comments,
                 |this, comments, event: &ReviewCommentsEvent, cx| {
-                    if let ReviewCommentsEvent::Changed(_) = event {
+                    if let ReviewCommentsEvent::Changed(change) = event {
                         this.sync_comment_badges(&comments, cx);
+                        // Comments that arrive after the diff still follow it.
+                        if let Some(CommentChange::Loaded(_)) = change {
+                            this.reanchor_comments(cx);
+                        }
                     }
                 },
             ),
@@ -426,6 +431,18 @@ impl Workspace {
                     CommentListEvent::Open(id) => {
                         let id = *id;
                         this.update_diff(cx, |view, cx| view.reveal_comment(id, cx));
+                    }
+                    CommentListEvent::Reattach(id) => {
+                        let id = *id;
+                        if this.diff_view.is_some() {
+                            this.update_diff(cx, |view, cx| view.start_reattach(id, cx));
+                        } else {
+                            this.notice = Some(Notice {
+                                message: "Open the diff to pick the new lines.".into(),
+                                is_error: false,
+                            });
+                            cx.notify();
+                        }
                     }
                 },
             ),
@@ -437,13 +454,15 @@ impl Workspace {
                         this.update_diff(cx, |view, cx| view.reveal_file(index, cx));
                     }
                     FileTreeEvent::OpenOutdated(item) => {
-                        // Shown folded at its stored line; the re-anchoring
-                        // view arrives with #15.
+                        // Outdated comments are not inline: the Comments tab
+                        // shows the stored snippet and the Re-attach and
+                        // Dismiss actions.
                         if let Some(&id) = this.outdated_comments.get(*item) {
-                            this.update_diff(cx, |view, cx| view.reveal_comment(id, cx));
                             if let Some(list) = this.comment_list.clone() {
                                 list.update(cx, |list, cx| list.select(id, cx));
                             }
+                            this.left_tab = LeftTab::Comments;
+                            cx.notify();
                         }
                     }
                     FileTreeEvent::ModeChanged { flat } => {
@@ -575,7 +594,28 @@ impl Workspace {
                 }),
             );
         self.diff_view = Some(view);
+        self.reanchor_comments(cx);
         cx.notify();
+    }
+
+    /// Re-anchors the review's comments over the diff on screen (spec §7.3):
+    /// runs for every new diff (branch change, Fetch, Accept) and once the
+    /// comments of the review have loaded.
+    fn reanchor_comments(&mut self, cx: &mut Context<Self>) {
+        let (Some(view), Some(session)) = (self.diff_view.as_ref(), self.session.as_ref()) else {
+            return;
+        };
+        let view = view.read(cx);
+        let target = view.target();
+        let diff = view.session().clone();
+        let comments = session.read(cx).comments().clone();
+        let same_review = comments
+            .read(cx)
+            .key()
+            .is_some_and(|key| key.base_ref == target.base && key.head_ref == target.head);
+        if same_review {
+            comments.update(cx, |comments, cx| comments.reanchor(diff, cx));
+        }
     }
 
     /// Drops the diff view, cancelling its jobs, and keeps its "Viewed"
@@ -831,6 +871,12 @@ impl Workspace {
             self.update_session(cx, |session, cx| session.cancel_tracking(cx));
         } else if self.sheet.take().is_some() {
             cx.notify();
+        } else if self
+            .diff_view
+            .as_ref()
+            .is_some_and(|view| view.read(cx).is_reattaching())
+        {
+            self.update_diff(cx, |view, cx| view.cancel_reattach(cx));
         } else {
             cx.propagate();
         }

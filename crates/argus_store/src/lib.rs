@@ -31,7 +31,7 @@ use rusqlite::Connection;
 use tokio::sync::oneshot;
 
 pub use accepts::{Accept, AcceptStore};
-pub use comments::{Anchor, Comment, CommentStore, NewComment, Reply};
+pub use comments::{Anchor, AnchorUpdate, Comment, CommentStore, NewComment, Reply};
 pub use error::{Result, StoreError};
 pub use migrations::SCHEMA_VERSION;
 pub use model::{

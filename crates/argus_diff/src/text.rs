@@ -26,7 +26,9 @@ pub struct SourceText {
 }
 
 impl SourceText {
-    fn new(bytes: Vec<u8>) -> Self {
+    /// Splits raw file content into lines. Invalid UTF-8 is replaced
+    /// lossily; line numbers are unaffected.
+    pub fn new(bytes: Vec<u8>) -> Self {
         // Diffing ran on the raw bytes; the lossy conversion is for display
         // and keeps every `\n`, so line numbers are unaffected.
         let text = match String::from_utf8(bytes) {

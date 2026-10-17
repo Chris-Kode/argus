@@ -555,6 +555,11 @@ impl DiffView {
         &self.target
     }
 
+    /// The diff session this view shows.
+    pub fn session(&self) -> &DiffSession {
+        &self.session
+    }
+
     /// Paths marked "Viewed", to carry over to a refreshed view.
     pub fn viewed_paths(&self) -> HashSet<String> {
         let ListStatus::Ready(list) = &self.status else {
@@ -2660,6 +2665,7 @@ impl Render for DiffView {
         let theme = cx.theme().clone();
         let colors = &theme.colors;
         let toolbar = self.render_toolbar(cx).into_any_element();
+        let reattach_bar = self.render_reattach_bar(cx);
         let root = div()
             .track_focus(&self.focus_handle)
             .flex()
@@ -2667,7 +2673,8 @@ impl Render for DiffView {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .child(toolbar);
+            .child(toolbar)
+            .children(reattach_bar);
 
         let list = match &self.status {
             ListStatus::Loading => {
