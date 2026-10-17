@@ -63,6 +63,8 @@ pub enum RunPanelEvent {
     OpenComment(CommentId),
     /// A run started; the panel should be shown.
     Started(RunId),
+    /// Open the proposal of a run that changed something.
+    ViewProposal(RunId),
     /// A message for the status bar.
     Notice {
         /// The text.
@@ -701,7 +703,13 @@ impl RunPanel {
         let title = listing
             .map(|listing| format!("{}:{}", listing.file_path, listing.start_line))
             .unwrap_or_else(|| "Run".to_owned());
-        let worktree = listing.map(|listing| listing.run.worktree_path.clone());
+        // A rejected run's worktree is gone.
+        let worktree = listing
+            .filter(|listing| listing.run.status != RunStatus::Rejected)
+            .map(|listing| listing.run.worktree_path.clone());
+        let proposal = listing
+            .filter(|listing| listing.run.status == RunStatus::Succeeded)
+            .map(|listing| listing.run.id);
         let toolbar =
             div()
                 .flex()
@@ -723,6 +731,15 @@ impl RunPanel {
                         .text_color(colors.text_muted)
                         .child(title),
                 )
+                .children(proposal.map(|run_id| {
+                    button("run-view-proposal", "View proposal", cx)
+                        .h(px(20.0))
+                        .text_xs()
+                        .text_color(colors.accent)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(RunPanelEvent::ViewProposal(run_id));
+                        }))
+                }))
                 .child(
                     toggle_button("run-view-prompt", "View prompt", self.show_prompt, cx)
                         .h(px(20.0))
@@ -1165,6 +1182,7 @@ fn run_status_style(status: RunStatus, colors: &ThemeColors) -> (&'static str, H
         RunStatus::NoChanges => ("No changes", colors.text_muted),
         RunStatus::Failed => ("Failed", colors.error),
         RunStatus::Stopped => ("Stopped", colors.text_placeholder),
+        RunStatus::Rejected => ("Rejected", colors.text_placeholder),
     }
 }
 

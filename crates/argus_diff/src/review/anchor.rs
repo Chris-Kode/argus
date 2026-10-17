@@ -155,7 +155,7 @@ pub fn context_hash_at(source: &SourceText, start_line: u32, end_line: u32) -> O
     ))
 }
 
-fn normalize_line(line: &str, out: &mut String) {
+pub(crate) fn normalize_line(line: &str, out: &mut String) {
     let mut in_blank = false;
     for ch in line.trim_end().chars() {
         if ch == ' ' || ch == '\t' {

@@ -257,6 +257,20 @@ impl RunStore {
             .await
     }
 
+    /// Moves the run from `from` to `to` only if it is still in `from`
+    /// (compare-and-swap); returns whether it moved.
+    pub async fn set_status_if(&self, id: RunId, from: RunStatus, to: RunStatus) -> Result<bool> {
+        self.service
+            .call("RunStore::set_status_if", move |conn| {
+                let changed = conn.execute(
+                    "UPDATE runs SET status = ?3 WHERE id = ?1 AND status = ?2",
+                    params![id, from, to],
+                )?;
+                Ok(changed == 1)
+            })
+            .await
+    }
+
     /// Writes the outcome of a run and stamps `finished_at`.
     pub async fn finish(&self, id: RunId, outcome: RunOutcome) -> Result<()> {
         let status = outcome.status;

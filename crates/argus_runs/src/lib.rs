@@ -9,6 +9,8 @@
 //!   one `claude -p` per run in its own worktree, streams and stores its
 //!   events, and records the outcome (spec §6.3).
 //! - [`log`] folds a run's events into the rows of the run panel's live log.
+//! - [`proposal`] shows what a finished run changed (`start_sha → worktree`)
+//!   and rejects it ([`RunManager::open_proposal`], [`RunManager::reject`]).
 //! - The run defaults of the settings screen live in [`settings`]; the
 //!   review rules file in [`review_rules`].
 //!
@@ -19,6 +21,7 @@
 pub mod claude;
 pub mod log;
 pub mod prompt;
+pub mod proposal;
 pub mod review_rules;
 pub mod run;
 pub mod settings;
@@ -33,6 +36,7 @@ use tokio::sync::{Mutex, Notify, broadcast, watch};
 
 pub use claude::{ClaudeCapabilities, ClaudeCommand, ClaudeStatus, SessionMode};
 pub use log::{LogChange, LogEntry, RunLog, ToolCall};
+pub use proposal::{Proposal, ProposalError, WorktreeWatch};
 pub use run::{RunError, RunFinished, RunStreamEvent, RunUpdate, STOP_GRACE};
 pub use settings::{ClaudeSettings, SettingError};
 pub use stream::StreamEvent;
@@ -170,6 +174,41 @@ impl RunManager {
     /// `false` when the run is not running. Never blocks.
     pub fn stop(&self, run_id: RunId) -> bool {
         self.services.stop(run_id)
+    }
+
+    /// The latest run of a comment with a change to review (succeeded, or
+    /// stopped with its partial change kept).
+    pub async fn proposal_run(&self, comment_id: CommentId) -> Result<RunId, ProposalError> {
+        proposal::latest_run(&self.services, comment_id).await
+    }
+
+    /// Opens the proposal of a finished run: snapshots its worktree and
+    /// prepares the diff `start_sha → worktree`, with the files outside the
+    /// comment's file listed first. Must run on the tokio runtime.
+    pub async fn open_proposal(&self, run_id: RunId) -> Result<Proposal, ProposalError> {
+        proposal::open(&self.services, run_id).await
+    }
+
+    /// Snapshots a proposal's worktree again (after a manual edit). `None`
+    /// when neither the worktree nor the head branch changed.
+    pub async fn refresh_proposal(
+        &self,
+        proposal: &Proposal,
+    ) -> Result<Option<Proposal>, ProposalError> {
+        proposal::refresh(&self.services, proposal).await
+    }
+
+    /// Watches a proposal's worktree for edits made outside Argus. Must be
+    /// called on the tokio runtime.
+    pub fn watch_proposal(&self, proposal: &Proposal) -> WorktreeWatch {
+        proposal::watch(proposal.worktree.path())
+    }
+
+    /// Rejects a run's proposal: deletes its worktree (`git worktree remove
+    /// --force` + `prune`), records the run as `Rejected` and moves its
+    /// comment back to `Open`. Publishes [`RunUpdate::Rejected`].
+    pub async fn reject(&self, run_id: RunId) -> Result<(), ProposalError> {
+        proposal::reject(&self.services, run_id).await
     }
 
     /// Whether the run's process is live in this session.

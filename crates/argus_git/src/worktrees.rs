@@ -244,6 +244,24 @@ impl WorktreeManager {
         Ok(Patch { bytes, files })
     }
 
+    /// Stages everything in the worktree (`git add -A`) and writes the
+    /// staged state as a tree object (`git write-tree`), so the proposal can
+    /// be diffed like any two commits: `start_sha → tree`.
+    ///
+    /// Only the worktree's own index changes; the objects land in the
+    /// repository's object store, as `git add` alone already does.
+    pub async fn snapshot_tree(&self, worktree: &Worktree) -> Result<Sha> {
+        self.guard(&worktree.path)?;
+        let cli = GitCli::new(&worktree.path);
+        cli.run(["add", "-A"]).await?;
+        let output = cli.run(["write-tree"]).await?;
+        let hex = output.stdout_lossy();
+        Sha::parse(hex.trim()).ok_or_else(|| GitError::Parse {
+            command: "git write-tree".to_owned(),
+            message: format!("not an object id: `{}`", hex.trim()),
+        })
+    }
+
     /// `git worktree remove --force <path>` then `git worktree prune`.
     ///
     /// A directory git does not know as a worktree (a leftover of a crash)

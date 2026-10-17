@@ -17,6 +17,7 @@ pub mod fuzzy;
 pub mod jobs;
 pub mod keymap;
 pub mod markdown;
+pub mod proposal;
 pub mod run_panel;
 pub mod runtime;
 pub mod session;
@@ -44,6 +45,7 @@ pub use diff_view::{
 };
 pub use file_tree::{FileTree, FileTreeEvent};
 pub use jobs::BackgroundJobs;
+pub use proposal::{ProposalEvent, ProposalSource, ProposalView};
 pub use run_panel::{RunPanel, RunPanelEvent};
 pub use session::{Comparison, DiffTarget, RepoSession, SessionEvent, Side};
 pub use settings::{Settings, UiSettings};

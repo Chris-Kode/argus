@@ -23,8 +23,11 @@
 //!   arrow opens the Run menu with the models and efforts of the settings.
 //!   The run manager makes the choice the new default once the run starts.
 //!
-//! Outdated comments still show at their stored line, collapsed and badged,
-//! but their range is not highlighted in the gutter.
+//! - **Outdated comments** (spec §7.3) are not shown inline: their code is
+//!   gone. The Comments list shows them with their stored snippet. Its
+//!   Re-attach action puts the view in re-attach mode
+//!   ([`DiffView::start_reattach`]): the next line or range picked (gutter
+//!   "+", `c`, or a selection and Save) becomes the comment's new anchor.
 //!
 //! [`ReviewComments`]: crate::comments::ReviewComments
 
@@ -45,7 +48,7 @@ use gpui::{
 
 use super::{
     Anchor, COMMENT_COLUMN_WIDTH, DiffView, DiffViewEvent, FileState, LineSelection, ListStatus,
-    SCROLLBAR_WIDTH, SPLIT_DIVIDER_WIDTH, side_index,
+    PROPOSAL_COMMENT_HINT, SCROLLBAR_WIDTH, SPLIT_DIVIDER_WIDTH, side_index,
 };
 use crate::AppContext;
 use crate::components::{button, chip, disabled_button, primary_button, status_chip};
@@ -191,6 +194,17 @@ pub(super) struct Threads {
     markdown: MarkdownCache,
     /// A thread to scroll to once its file is placed.
     pending_reveal: Option<CommentId>,
+    /// The outdated comment being re-attached to a new range.
+    reattach: Option<Reattach>,
+    /// A re-attached comment to scroll to once the snapshot has it inline.
+    reveal_reattached: Option<CommentId>,
+}
+
+/// Re-attach mode: the next picked range becomes the comment's anchor.
+pub(super) struct Reattach {
+    id: CommentId,
+    /// The save is in flight.
+    saving: bool,
 }
 
 /// What [`DiffView::with_scroll_anchor`] keeps in place.
@@ -218,12 +232,15 @@ impl DiffView {
             .find(|comment| comment.id == id)
     }
 
+    /// The file a thread is placed in; `None` for outdated threads, which
+    /// are not inline.
     fn comment_file(&self, id: CommentId) -> Option<usize> {
-        let comment = self.comment(id)?;
+        let comment = self.comment(id).filter(|comment| !comment.outdated)?;
         self.path_index.get(&comment.anchor.file_path).copied()
     }
 
-    /// Comments anchored in `file`, by line and creation time.
+    /// Current (not outdated) comments anchored in `file`, by line and
+    /// creation time.
     fn file_comments(&self, file: usize) -> Vec<&Comment> {
         let ListStatus::Ready(list) = &self.status else {
             return Vec::new();
@@ -263,8 +280,7 @@ impl DiffView {
     }
 
     fn is_collapsed(&self, comment: &Comment) -> bool {
-        // Outdated threads start folded.
-        self.threads.toggled.contains(&comment.id) != comment.outdated
+        self.threads.toggled.contains(&comment.id)
     }
 
     /// Whether `line` of `side` is under a comment in `file`.
@@ -283,10 +299,13 @@ impl DiffView {
         let snapshot = self.comments.read(cx).comments().clone();
         let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
         for (index, comment) in snapshot.iter().enumerate() {
-            by_path
-                .entry(comment.anchor.file_path.clone())
-                .or_default()
-                .push(index);
+            // Outdated threads are not inline (spec §7.3).
+            if !comment.outdated {
+                by_path
+                    .entry(comment.anchor.file_path.clone())
+                    .or_default()
+                    .push(index);
+            }
             self.threads
                 .markdown
                 .prepare(&comment.body_md, markdown_cache, cx);
@@ -314,6 +333,13 @@ impl DiffView {
                 *slot = None;
             }
         }
+        if threads
+            .reattach
+            .as_ref()
+            .is_some_and(|reattach| !ids.contains(&reattach.id))
+        {
+            threads.reattach = None;
+        }
         threads.snapshot = snapshot;
         threads.by_path = by_path;
         self.with_scroll_anchor(|this| {
@@ -325,6 +351,14 @@ impl DiffView {
             }
         });
         self.reveal_pending(cx);
+        if let Some(id) = self.threads.reveal_reattached
+            && self.comment(id).is_none_or(|comment| !comment.outdated)
+        {
+            self.threads.reveal_reattached = None;
+            if self.comment(id).is_some() {
+                self.reveal_comment(id, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -361,9 +395,7 @@ impl DiffView {
         for comment in self.file_comments(file) {
             let anchor = &comment.anchor;
             blocks.push((BlockKey::Thread(comment.id), anchor.side, anchor.end_line));
-            if !comment.outdated {
-                ranges[side_index(anchor.side)].push((anchor.start_line, anchor.end_line));
-            }
+            ranges[side_index(anchor.side)].push((anchor.start_line, anchor.end_line));
         }
         for composer in &self.threads.composers {
             if composer.file == file {
@@ -632,6 +664,10 @@ impl DiffView {
         selection: LineSelection,
         cx: &mut Context<Self>,
     ) {
+        if self.threads.reattach.is_some() {
+            self.save_reattach(file, selection, cx);
+            return;
+        }
         let draft = DraftKey::New {
             review: self.comments.read(cx).key().cloned(),
             file: selection.file.clone(),
@@ -656,6 +692,11 @@ impl DiffView {
 
     /// `c`: comments on the gutter selection, or on the first line in view.
     pub fn comment_on_current_line(&mut self, cx: &mut Context<Self>) {
+        if self.proposal {
+            self.hint = Some(PROPOSAL_COMMENT_HINT.into());
+            cx.notify();
+            return;
+        }
         if let Some(selection) = self.selection {
             match self.selection() {
                 Some(Ok(lines)) => {
@@ -669,6 +710,12 @@ impl DiffView {
                 }
                 None => {}
             }
+        }
+        if self.threads.reattach.is_some() {
+            // Re-attaching to whatever line is on screen would be a guess.
+            self.hint = Some("Select the lines to re-attach the comment to.".into());
+            cx.notify();
+            return;
         }
         let total = self.total_rows();
         let first = self.top_row() + 1;
@@ -771,8 +818,13 @@ impl DiffView {
             .composers
             .iter()
             .find(|composer| composer.slot.draft == *draft)?;
-        let text = self.files.get(composer.file)?.loaded()?.diff.text()?;
-        let selection = &composer.selection;
+        self.capture_anchor(composer.file, &composer.selection)
+    }
+
+    /// The anchor of `selection` in `file`, captured from the loaded text at
+    /// the head this view diffs.
+    fn capture_anchor(&self, file: usize, selection: &LineSelection) -> Option<CommentAnchor> {
+        let text = self.files.get(file)?.loaded()?.diff.text()?;
         let location = AnchorLocation {
             file_path: selection.file.clone(),
             old_file_path: selection.old_file.clone(),
@@ -883,6 +935,7 @@ impl DiffView {
         self.threads
             .snapshot
             .iter()
+            .filter(|comment| !comment.outdated)
             .all(|comment| self.is_collapsed(comment))
     }
 
@@ -893,9 +946,7 @@ impl DiffView {
             .threads
             .snapshot
             .iter()
-            // Toggled means "not in the default fold", which is collapsed
-            // only for outdated threads.
-            .filter(|comment| collapse != comment.outdated)
+            .filter(|comment| collapse && !comment.outdated)
             .map(|comment| comment.id)
             .collect();
         self.threads
@@ -951,6 +1002,13 @@ impl DiffView {
         if let Some(file) = self.comment_file(id) {
             self.replace_threads(file, cx);
         }
+    }
+
+    /// Asks the workspace to open the comment's proposal in its own tab.
+    fn view_proposal(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        self.threads.menu = None;
+        cx.emit(super::DiffViewEvent::ViewProposal(id));
+        cx.notify();
     }
 
     fn request_delete(&mut self, id: CommentId, cx: &mut Context<Self>) {
@@ -1112,6 +1170,144 @@ impl DiffView {
         cx.notify();
     }
 
+    // ---- re-attach ----------------------------------------------------------
+
+    /// Enters re-attach mode for an outdated comment: the next line or range
+    /// picked in the diff becomes its anchor (spec §7.3).
+    pub fn start_reattach(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        if self.comment(id).is_none() {
+            return;
+        }
+        self.threads.reattach = Some(Reattach { id, saving: false });
+        self.hint = None;
+        self.focus_requested = true;
+        cx.notify();
+    }
+
+    /// Whether the view is waiting for the lines to re-attach a comment to.
+    pub fn is_reattaching(&self) -> bool {
+        self.threads.reattach.is_some()
+    }
+
+    /// Leaves re-attach mode without changing the comment.
+    pub fn cancel_reattach(&mut self, cx: &mut Context<Self>) {
+        if self.threads.reattach.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Save in the re-attach bar: re-attaches to the gutter selection.
+    fn save_reattach_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(file) = self.selection.map(|selection| selection.file) else {
+            self.hint = Some("Select a line or range in the gutter first.".into());
+            cx.notify();
+            return;
+        };
+        if let Some(lines) = self.resolve_selection(cx) {
+            self.save_reattach(file, lines, cx);
+        }
+        cx.notify();
+    }
+
+    /// Re-attaches the comment of re-attach mode to `selection`: the anchor,
+    /// `anchor_sha`, context hash and snippet are re-captured there.
+    fn save_reattach(&mut self, file: usize, selection: LineSelection, cx: &mut Context<Self>) {
+        let Some(reattach) = self.threads.reattach.as_mut() else {
+            return;
+        };
+        if reattach.saving {
+            return;
+        }
+        let id = reattach.id;
+        let Some(anchor) = self.capture_anchor(file, &selection) else {
+            self.hint = Some("These lines cannot be commented on.".into());
+            cx.notify();
+            return;
+        };
+        if let Some(reattach) = self.threads.reattach.as_mut() {
+            reattach.saving = true;
+        }
+        let task = self
+            .comments
+            .update(cx, |comments, cx| comments.reattach(id, anchor, cx));
+        cx.spawn(async move |this, cx| {
+            let saved = task.await;
+            this.update(cx, |this, cx| {
+                if saved {
+                    this.threads.reattach = None;
+                    this.selection = None;
+                    this.threads.reveal_reattached = Some(id);
+                    this.comments_changed(cx);
+                } else if let Some(reattach) = this.threads.reattach.as_mut() {
+                    reattach.saving = false;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The re-attach mode bar under the toolbar.
+    pub(super) fn render_reattach_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let reattach = self.threads.reattach.as_ref()?;
+        let comment = self.comment(reattach.id)?;
+        let colors = cx.theme().colors.clone();
+        let first = comment
+            .body_md
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .to_owned();
+        let picked = match self.selection() {
+            Some(Ok(lines)) if lines.end > lines.start => {
+                format!("{} lines {}–{}", lines.file, lines.start, lines.end)
+            }
+            Some(Ok(lines)) => format!("{} line {}", lines.file, lines.start),
+            _ => "select a line or range in the gutter".to_owned(),
+        };
+        let save = if reattach.saving {
+            disabled_button("reattach-save", "Saving…", cx).into_any_element()
+        } else {
+            primary_button("reattach-save", "Save", cx)
+                .text_xs()
+                .on_click(cx.listener(|this, _, _, cx| this.save_reattach_selection(cx)))
+                .into_any_element()
+        };
+        Some(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(colors.border_variant)
+                .bg(colors.warning.opacity(0.08))
+                .text_sm()
+                .child(chip("Re-attach", colors.warning))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_color(colors.text_muted)
+                        .child(format!("“{first}” → {picked}")),
+                )
+                .child(save)
+                .child(
+                    button("reattach-cancel", "Cancel", cx)
+                        .text_xs()
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_reattach(cx))),
+                )
+                .into_any_element(),
+        )
+    }
+
     // ---- navigation -------------------------------------------------------
 
     /// The global row of a placed thread.
@@ -1148,6 +1344,7 @@ impl DiffView {
             .threads
             .snapshot
             .iter()
+            .filter(|comment| !comment.outdated)
             .filter_map(|comment| {
                 let file = *self.path_index.get(&comment.anchor.file_path)?;
                 let row = self
@@ -1179,6 +1376,12 @@ impl DiffView {
     /// Scrolls to a thread (unfolding its file and the thread), loading the
     /// file first when needed. Used by the comment list and `]c` / `[c`.
     pub fn reveal_comment(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        if self.comment(id).is_some_and(|comment| comment.outdated) {
+            self.hint =
+                Some("That comment is outdated: its code is no longer in this diff.".into());
+            cx.notify();
+            return;
+        }
         let Some(file) = self.comment_file(id) else {
             self.hint = Some("That comment's file is not in this diff.".into());
             cx.notify();
@@ -1477,6 +1680,16 @@ impl DiffView {
             .children(preview)
             .children(replies)
             .children(self.render_run_button(comment, &key, cx))
+            .when(comment.status == CommentStatus::Proposed, |header| {
+                header.child(
+                    button((key.clone(), 3), "View proposal", cx)
+                        .flex_none()
+                        .h(px(20.0))
+                        .text_xs()
+                        .text_color(colors.accent)
+                        .on_click(cx.listener(move |this, _, _, cx| this.view_proposal(id, cx))),
+                )
+            })
             .child(menu_button);
 
         let body = (!collapsed).then(|| {
@@ -1678,7 +1891,6 @@ impl DiffView {
             )
             .children(status_item)
             .child(div().my_0p5().h(px(1.0)).bg(colors.border_variant))
-            // Runs (#21) and proposals (#22) plug in here.
             .child({
                 let enabled = self.run_blocker(comment, cx).is_none();
                 let (model, effort) = self.run_choice(id, cx);
@@ -1688,7 +1900,16 @@ impl DiffView {
                     item.on_click(cx.listener(move |this, _, _, cx| this.request_run(id, cx)))
                 })
             })
-            .child(item(4, "View proposal (soon)", false))
+            .child(
+                item(
+                    4,
+                    "View proposal",
+                    comment.status == CommentStatus::Proposed,
+                )
+                .when(comment.status == CommentStatus::Proposed, |item| {
+                    item.on_click(cx.listener(move |this, _, _, cx| this.view_proposal(id, cx)))
+                }),
+            )
             .children(debug_item)
             .into_any_element()
     }

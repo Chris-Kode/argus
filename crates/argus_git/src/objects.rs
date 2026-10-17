@@ -142,8 +142,10 @@ pub async fn tree_diff(
     blocking(move |_| tree_diff_blocking(&repo, from, to, &token)).await
 }
 
-/// Lists the files that differ between the trees of commits `from` and `to`
-/// (like `git diff --no-renames from to`), sorted by path. Directories are
+/// Lists the files that differ between the trees of `from` and `to`
+/// (like `git diff --no-renames from to`), sorted by path. Each side is a
+/// commit or a tree, e.g. one written from a run's worktree by
+/// [`WorktreeManager::snapshot_tree`](crate::WorktreeManager::snapshot_tree). Directories are
 /// never reported, only the files inside them.
 pub fn tree_diff_blocking(
     repo: &Repo,
@@ -152,8 +154,8 @@ pub fn tree_diff_blocking(
     cancel: &CancelToken,
 ) -> Result<Vec<TreeChange>> {
     let local = repo.local();
-    let old_tree = commit_tree(&local, from)?;
-    let new_tree = commit_tree(&local, to)?;
+    let old_tree = peel_to_tree(&local, from)?;
+    let new_tree = peel_to_tree(&local, to)?;
     cancel.check()?;
 
     let mut recorder = gix::diff::tree::Recorder::default();
@@ -173,14 +175,11 @@ pub fn tree_diff_blocking(
     Ok(changes)
 }
 
-fn commit_tree(repo: &gix::Repository, commit: Sha) -> Result<gix::Tree<'_>> {
-    let commit = repo
-        .find_commit(commit.object_id())
-        .map_err(|err| GitError::gix("reading a commit", err))?;
-    let tree_id = commit
-        .tree_id()
-        .map_err(|err| GitError::gix("reading a commit's tree", err))?;
-    repo.find_tree(tree_id)
+/// The tree of a commit, or the tree itself.
+fn peel_to_tree(repo: &gix::Repository, id: Sha) -> Result<gix::Tree<'_>> {
+    repo.find_object(id.object_id())
+        .map_err(|err| GitError::gix("reading an object", err))?
+        .peel_to_tree()
         .map_err(|err| GitError::gix("reading a tree", err))
 }
 
