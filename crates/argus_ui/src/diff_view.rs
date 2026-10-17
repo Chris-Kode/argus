@@ -41,8 +41,23 @@
 //! before shaping: a horizontally scrolled line only shapes the visible
 //! columns, and soft wrap splits a line into fixed-width segments, each one
 //! row. Word-level highlights come from the diff engine and are computed off
-//! the UI thread after a file loads; syntax highlights (#11) will join the
-//! same text runs. Nothing here blocks on either.
+//! the UI thread after a file loads. Nothing here blocks on them.
+//!
+//! # Syntax highlighting
+//!
+//! Once a file loads, each side that shows lines (old for removed lines,
+//! new for the rest) is sent to the [`HighlightService`] keyed by its blob
+//! and detected [`Language`]. The service parses the whole blob, so a block
+//! comment opening above a hunk colors the lines inside it. Rows paint
+//! plain text until the spans arrive, then the view repaints; only spans
+//! inside a row's visible columns are looked up. Files on screen are
+//! requested at [`Priority::Visible`], the rest of the prefetch range at
+//! [`Priority::Prefetch`], re-prioritized as the viewport moves; jobs of
+//! files that leave the prefetch range are cancelled, like loads. Results
+//! are cached per blob, so a file scrolled back into view (or reloaded
+//! after eviction) repaints highlighted at once. Unknown languages stay
+//! plain text; huge blobs stay plain until the header's "Highlight" asks
+//! for them anyway.
 //!
 //! # Selection
 //!
@@ -67,6 +82,10 @@ use argus_diff::{
     ChangeKind, DiffContent, DiffSession, FileDiff, FileEntry, FileList, FileStats, LineKind,
     LoadMode, Side as DiffSide, StatsEvent, TextDiff,
 };
+use argus_highlight::{
+    HighlightError, HighlightJob, HighlightKey, HighlightRequest, HighlightService, Highlights,
+    JobControl, Language, Outcome, Priority, Span,
+};
 use gpui::{
     AnyElement, Context, DispatchPhase, EventEmitter, FontWeight, HighlightStyle, Hsla,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent,
@@ -74,11 +93,13 @@ use gpui::{
     prelude::*, px, uniform_list,
 };
 
+use crate::AppContext;
 use crate::components::{button, placeholder, toggle_button};
+use crate::jobs::BackgroundJobs;
 use crate::keymap::ToggleSoftWrap;
 use crate::runtime::spawn_job;
 use crate::session::DiffTarget;
-use crate::theme::ActiveTheme;
+use crate::theme::{ActiveTheme, SyntaxTheme};
 
 /// Files within this many screens above and below the viewport are loaded.
 const PREFETCH_SCREENS: usize = 2;
@@ -176,6 +197,68 @@ impl LoadedFile {
     }
 }
 
+/// Syntax highlighting of one side of a loaded file.
+#[derive(Clone, Debug, Default)]
+enum SideSyntax {
+    /// Plain text: nothing on this side to color, an unknown language, or
+    /// highlighting failed.
+    #[default]
+    Plain,
+    /// Requested; plain text until it arrives.
+    Pending,
+    /// Highlighted.
+    Ready(Arc<Highlights>),
+    /// Above the size limits; plain until the user forces it.
+    TooLarge,
+}
+
+/// Syntax highlighting of a file, indexed like [`side_index`].
+#[derive(Debug, Default)]
+struct FileSyntax {
+    sides: [SideSyntax; 2],
+    /// Highlighting was requested for the current diff of the file.
+    requested: bool,
+    /// The user asked to highlight past the size limits.
+    force: bool,
+}
+
+impl FileSyntax {
+    /// Forgets the results (eviction, reload); keeps the user's choice.
+    fn reset(&mut self) {
+        *self = Self {
+            force: self.force,
+            ..Self::default()
+        };
+    }
+
+    fn too_large(&self) -> bool {
+        self.sides
+            .iter()
+            .any(|side| matches!(side, SideSyntax::TooLarge))
+    }
+}
+
+/// A file's highlight jobs in flight. Dropping it cancels them.
+struct HighlightTask {
+    _task: Task<()>,
+    controls: Vec<JobControl>,
+    priority: Priority,
+}
+
+/// One side of a loaded diff, lent to the highlighter without copying it.
+struct SideText {
+    diff: Arc<FileDiff>,
+    side: DiffSide,
+}
+
+impl AsRef<str> for SideText {
+    fn as_ref(&self) -> &str {
+        self.diff
+            .text()
+            .map_or("", |text| text.source(self.side).as_str())
+    }
+}
+
 /// Where a file is in its load cycle.
 enum FileState {
     /// Never loaded: placeholder rows estimated from the +/- counts.
@@ -202,6 +285,8 @@ struct FileSlot {
     last_used: u64,
     /// Computes the word-level highlights of a loaded file.
     words_task: Option<Task<()>>,
+    /// Syntax highlights of the loaded diff.
+    syntax: FileSyntax,
 }
 
 impl FileSlot {
@@ -216,6 +301,7 @@ impl FileSlot {
             mode: LoadMode::Normal,
             last_used: 0,
             words_task: None,
+            syntax: FileSyntax::default(),
         }
     }
 
@@ -333,6 +419,12 @@ pub struct DiffView {
     tick: u64,
     held_bytes: usize,
     loads: HashMap<usize, Task<()>>,
+    /// Syntax highlight jobs in flight, by file.
+    highlights: HashMap<usize, HighlightTask>,
+    /// Whether this view reported highlighting as busy in the status bar.
+    reported_highlighting: bool,
+    /// Files on screen at the last prefetch: their jobs run first.
+    visible_files: RangeInclusive<usize>,
     selection: Option<Selection>,
     drag: Option<Drag>,
     hint: Option<SharedString>,
@@ -385,6 +477,9 @@ impl DiffView {
             tick: 0,
             held_bytes: 0,
             loads: HashMap::new(),
+            highlights: HashMap::new(),
+            reported_highlighting: false,
+            visible_files: 0..=0,
             selection: None,
             drag: None,
             hint: None,
@@ -396,6 +491,13 @@ impl DiffView {
             stats_task: None,
         };
         this.load_list(cx);
+        // A view dropped mid-highlight must not leave the status bar busy.
+        cx.on_release(|this, cx| {
+            if this.reported_highlighting {
+                BackgroundJobs::update(cx, |jobs| jobs.highlighting = false);
+            }
+        })
+        .detach();
         this
     }
 
@@ -603,8 +705,13 @@ impl DiffView {
                         slot.stats = Some(stats);
                     }
                     slot.state = FileState::Loaded(Box::new(loaded));
+                    slot.syntax.reset();
                 });
                 self.compute_words(file, diff, cx);
+                if !self.files[file].collapsed {
+                    let priority = self.priority_of(file);
+                    self.start_highlight(file, priority, cx);
+                }
             }
             Err(message) => {
                 tracing::warn!(file, %message, "failed to load a file diff");
@@ -665,6 +772,7 @@ impl DiffView {
         let top = self.top_row();
         let first = self.file_at(top.saturating_sub(margin));
         let last = self.file_at((top + screen + margin).min(total - 1));
+        self.visible_files = self.file_at(top)..=self.file_at((top + screen).min(total - 1));
         self.tick += 1;
         for file in first..=last {
             let slot = &mut self.files[file];
@@ -677,7 +785,232 @@ impl DiffView {
             }
         }
         self.loads.retain(|file, _| (first..=last).contains(file));
+        self.schedule_highlights(first..=last, cx);
         self.evict(first..=last);
+    }
+
+    // ---- syntax highlighting ----------------------------------------------
+
+    /// The priority of `file`'s highlight jobs: on screen first.
+    fn priority_of(&self, file: usize) -> Priority {
+        if self.visible_files.contains(&file) {
+            Priority::Visible
+        } else {
+            Priority::Prefetch
+        }
+    }
+
+    /// Requests highlights for loaded files in `range` that have none yet,
+    /// re-prioritizes the jobs in flight, and cancels those of files that
+    /// left the range.
+    fn schedule_highlights(&mut self, range: RangeInclusive<usize>, cx: &mut Context<Self>) {
+        let leaving: Vec<usize> = self
+            .highlights
+            .keys()
+            .copied()
+            .filter(|file| !range.contains(file))
+            .collect();
+        for file in leaving {
+            self.cancel_highlight(file);
+        }
+        for file in range {
+            let priority = self.priority_of(file);
+            if let Some(task) = self.highlights.get_mut(&file) {
+                if task.priority != priority {
+                    task.priority = priority;
+                    for control in &task.controls {
+                        control.set_priority(priority);
+                    }
+                }
+                continue;
+            }
+            let slot = &self.files[file];
+            if !slot.syntax.requested && !slot.collapsed && slot.loaded().is_some() {
+                self.start_highlight(file, priority, cx);
+            }
+        }
+        self.report_highlighting(cx);
+    }
+
+    /// Drops `file`'s jobs in flight (cancelling them); the sides still
+    /// pending are requested again when the file comes back.
+    fn cancel_highlight(&mut self, file: usize) {
+        if self.highlights.remove(&file).is_none() {
+            return;
+        }
+        if let Some(slot) = self.files.get_mut(file) {
+            for side in &mut slot.syntax.sides {
+                if matches!(side, SideSyntax::Pending) {
+                    *side = SideSyntax::Plain;
+                }
+            }
+            slot.syntax.requested = false;
+        }
+    }
+
+    /// Requests the highlights of both sides of a loaded `file`. Cached
+    /// results apply at once; the rest arrive through a task that
+    /// repaints.
+    fn start_highlight(&mut self, file: usize, priority: Priority, cx: &mut Context<Self>) {
+        let ListStatus::Ready(list) = &self.status else {
+            return;
+        };
+        let Some(entry) = list.entries().get(file) else {
+            return;
+        };
+        let Some(slot) = self.files.get_mut(file) else {
+            return;
+        };
+        let FileState::Loaded(loaded) = &slot.state else {
+            return;
+        };
+        let diff = loaded.diff.clone();
+        let Some(text) = diff.text() else {
+            return;
+        };
+        self.highlights.remove(&file);
+        slot.syntax.requested = true;
+        let service: HighlightService = cx.global::<AppContext>().highlighter.clone();
+        let mut jobs: Vec<(usize, HighlightJob)> = Vec::new();
+        for side in [DiffSide::Old, DiffSide::New] {
+            let index = side_index(side);
+            let source = text.source(side);
+            // Old text is only shown for removed lines; context and added
+            // lines come from the new side.
+            let shown = match side {
+                DiffSide::Old => text.removed() > 0,
+                DiffSide::New => source.line_count() > 0,
+            };
+            let blob = match side {
+                DiffSide::Old => entry.old,
+                DiffSide::New => entry.new,
+            }
+            .filter(|tree_entry| tree_entry.kind.is_blob());
+            let language = Language::detect(entry.path_on(side), source.line(1));
+            let (true, Some(blob), Some(language)) = (shown, blob, language) else {
+                slot.syntax.sides[index] = SideSyntax::Plain;
+                continue;
+            };
+            let key = HighlightKey {
+                blob: blob.id,
+                language,
+            };
+            if let Some(highlights) = service.cached(&key) {
+                slot.syntax.sides[index] = SideSyntax::Ready(highlights);
+                continue;
+            }
+            slot.syntax.sides[index] = SideSyntax::Pending;
+            let job = service.request(HighlightRequest {
+                key,
+                text: Box::new(SideText {
+                    diff: diff.clone(),
+                    side,
+                }),
+                priority,
+                force: slot.syntax.force,
+            });
+            jobs.push((index, job));
+        }
+        if jobs.is_empty() {
+            cx.notify();
+            return;
+        }
+        let controls = jobs.iter().map(|(_, job)| job.control()).collect();
+        let task = cx.spawn(async move |this, cx| {
+            for (index, job) in jobs {
+                let result = job.await;
+                let applied =
+                    this.update(cx, |this, cx| this.apply_highlight(file, index, result, cx));
+                if applied.is_err() {
+                    return;
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.highlights.remove(&file);
+                this.report_highlighting(cx);
+            })
+            .ok();
+        });
+        self.highlights.insert(
+            file,
+            HighlightTask {
+                _task: task,
+                controls,
+                priority,
+            },
+        );
+        self.report_highlighting(cx);
+    }
+
+    /// Stores one side's result and repaints the visible rows.
+    fn apply_highlight(
+        &mut self,
+        file: usize,
+        index: usize,
+        result: Result<Outcome, HighlightError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(slot) = self.files.get_mut(file) else {
+            return;
+        };
+        if !matches!(slot.syntax.sides[index], SideSyntax::Pending) {
+            return;
+        }
+        slot.syntax.sides[index] = match result {
+            Ok(Outcome::Highlighted(highlights)) => SideSyntax::Ready(highlights),
+            Ok(Outcome::TooLarge { bytes, lines }) => {
+                tracing::debug!(file, bytes, lines, "file too large to highlight");
+                SideSyntax::TooLarge
+            }
+            Err(HighlightError::Cancelled) => SideSyntax::Plain,
+            Err(error) => {
+                tracing::warn!(file, %error, "syntax highlighting failed");
+                SideSyntax::Plain
+            }
+        };
+        cx.notify();
+    }
+
+    /// "Highlight" on a file above the size limits.
+    fn force_highlight(&mut self, file: usize, cx: &mut Context<Self>) {
+        let Some(slot) = self.files.get_mut(file) else {
+            return;
+        };
+        slot.syntax.force = true;
+        slot.syntax.reset();
+        self.highlights.remove(&file);
+        self.start_highlight(file, Priority::Visible, cx);
+    }
+
+    /// Mirrors "highlighting in progress" into the status bar.
+    fn report_highlighting(&mut self, cx: &mut Context<Self>) {
+        let busy = !self.highlights.is_empty();
+        if busy == self.reported_highlighting {
+            return;
+        }
+        self.reported_highlighting = busy;
+        // Possibly called while rendering: update the global afterwards.
+        cx.defer(move |cx| BackgroundJobs::update(cx, |jobs| jobs.highlighting = busy));
+    }
+
+    /// The highlights of `line` (on its side) inside the source bytes the
+    /// row draws.
+    fn syntax_spans(&self, file: usize, line: &RowLine<'_>, bytes: Range<usize>) -> &[Span] {
+        let (side, number) = match line.kind {
+            LineKind::Removed => (DiffSide::Old, line.old_line),
+            LineKind::Added | LineKind::Context => (DiffSide::New, line.new_line),
+        };
+        let Some(number) = number else {
+            return &[];
+        };
+        match self
+            .files
+            .get(file)
+            .map(|slot| &slot.syntax.sides[side_index(side)])
+        {
+            Some(SideSyntax::Ready(highlights)) => highlights.line_window(number, bytes),
+            _ => &[],
+        }
     }
 
     /// Drops the least recently shown loaded files outside `keep` until the
@@ -703,6 +1036,9 @@ impl DiffView {
                 self.held_bytes = self.held_bytes.saturating_sub(loaded.bytes);
             }
             slot.words_task = None;
+            // The service keeps the results cached; a reload reuses them.
+            slot.syntax.reset();
+            self.highlights.remove(&victim);
             if self
                 .selection
                 .is_some_and(|selection| selection.file == victim)
@@ -1141,6 +1477,9 @@ impl DiffView {
         if let FileState::Loaded(loaded) = std::mem::replace(&mut slot.state, FileState::Pending) {
             self.held_bytes = self.held_bytes.saturating_sub(loaded.bytes);
         }
+        slot.syntax.reset();
+        self.highlights.remove(&file);
+        self.report_highlighting(cx);
         self.loads.remove(&file);
         self.start_load(file, cx);
         cx.notify();
@@ -1523,6 +1862,7 @@ impl DiffView {
             .child(number(line.old_line))
             .child(number(line.new_line));
         let code = self.render_code(
+            file,
             text,
             loaded,
             &line,
@@ -1672,6 +2012,7 @@ impl DiffView {
                     .children(number.filter(|_| first_segment).map(|n| n.to_string())),
             );
         let code = self.render_code(
+            file,
             text,
             loaded,
             &line,
@@ -1784,6 +2125,7 @@ impl DiffView {
     #[allow(clippy::too_many_arguments)]
     fn render_code(
         &self,
+        file: usize,
         text: &TextDiff,
         loaded: &LoadedFile,
         line: &RowLine<'_>,
@@ -1815,7 +2157,15 @@ impl DiffView {
                 Some(text.intra_line_if_ready(hunk)?.ranges(index))
             })
             .unwrap_or(&[]);
-        let runs = highlight_runs(&display, words, word_background, colors.text_placeholder);
+        let syntax = self.syntax_spans(file, line, display.source_range());
+        let runs = highlight_runs(
+            &display,
+            syntax,
+            &cx.theme().syntax,
+            words,
+            word_background,
+            colors.text_placeholder,
+        );
         let code = StyledText::new(display.text).with_highlights(runs);
         div()
             .flex_1()
@@ -2020,6 +2370,24 @@ impl DiffView {
                 .child(format!("{} → {}", old.mode(), new.mode()))
         });
         let viewed = slot.viewed;
+        // Huge files skip highlighting; the user can still ask for it.
+        let force_highlight = slot.syntax.too_large().then(|| {
+            let id = if sticky {
+                "diff-sticky-highlight"
+            } else {
+                "diff-header-highlight"
+            };
+            div()
+                .id((id, file))
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(colors.text_muted)
+                .hover(|style| style.bg(colors.element_hover))
+                .on_click(cx.listener(move |this, _, _, cx| this.force_highlight(file, cx)))
+                .child("Plain text (large) · Highlight")
+        });
         div()
             .flex()
             .items_center()
@@ -2073,6 +2441,7 @@ impl DiffView {
             .child(div().flex_none().child(counts))
             .children(mode)
             .child(div().flex_1())
+            .children(force_highlight)
             .child(
                 div()
                     .id((id_base, file * 3 + 2))
@@ -2363,14 +2732,28 @@ impl LineStyle {
     }
 }
 
-/// Text runs of a display line: word-diff backgrounds and subtle whitespace
-/// marks, as the sorted, non-overlapping ranges [`StyledText`] wants.
+/// Text runs of a display line: syntax colors, word-diff backgrounds and
+/// subtle whitespace marks, as the sorted, non-overlapping ranges
+/// [`StyledText`] wants. `syntax` holds the spans of the drawn window, in
+/// source bytes; whitespace marks keep their muted color over syntax.
 fn highlight_runs(
     display: &DisplayLine,
+    syntax: &[Span],
+    syntax_theme: &SyntaxTheme,
     words: &[Range<usize>],
     word_background: Hsla,
     mark_color: Hsla,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
+    // Sorted and non-overlapping, like the source spans.
+    let syntax_ranges: Vec<(Range<usize>, HighlightStyle)> = syntax
+        .iter()
+        .filter_map(|span| {
+            Some((
+                display.map_range(span.range())?,
+                syntax_theme.style(span.kind),
+            ))
+        })
+        .collect();
     let word_ranges: Vec<Range<usize>> = words
         .iter()
         .filter_map(|range| display.map_range(range.clone()))
@@ -2382,33 +2765,49 @@ fn highlight_runs(
         .filter(|range| !range.is_empty())
         .cloned()
         .collect();
-    if word_ranges.is_empty() && marks.is_empty() {
+    if syntax_ranges.is_empty() && word_ranges.is_empty() && marks.is_empty() {
         return Vec::new();
     }
-    let mut bounds: Vec<usize> = word_ranges
+    let mut bounds: Vec<usize> = syntax_ranges
         .iter()
+        .map(|(range, _)| range)
+        .chain(&word_ranges)
         .chain(&marks)
         .flat_map(|range| [range.start, range.end])
         .collect();
     bounds.sort_unstable();
     bounds.dedup();
     let inside = |ranges: &[Range<usize>], at: usize| ranges.iter().any(|r| r.contains(&at));
+    let mut next_syntax = 0;
     bounds
         .windows(2)
         .filter_map(|pair| {
             let (start, end) = (pair[0], pair[1]);
+            while syntax_ranges
+                .get(next_syntax)
+                .is_some_and(|(range, _)| range.end <= start)
+            {
+                next_syntax += 1;
+            }
+            let syntax = syntax_ranges
+                .get(next_syntax)
+                .filter(|(range, _)| range.start <= start)
+                .map(|(_, style)| *style);
             let word = inside(&word_ranges, start);
             let mark = inside(&marks, start);
-            (word || mark).then(|| {
-                (
-                    start..end,
-                    HighlightStyle {
-                        background_color: word.then_some(word_background),
-                        color: mark.then_some(mark_color),
-                        ..HighlightStyle::default()
-                    },
-                )
-            })
+            if syntax.is_none() && !word && !mark {
+                return None;
+            }
+            let mut style = syntax.unwrap_or_default();
+            if word {
+                style.background_color = Some(word_background);
+            }
+            if mark {
+                style.color = Some(mark_color);
+                style.font_weight = None;
+                style.font_style = None;
+            }
+            Some((start..end, style))
         })
         .collect()
 }

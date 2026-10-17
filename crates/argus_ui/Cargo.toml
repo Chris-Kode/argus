@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 argus_diff.workspace = true
 argus_git.workspace = true
+argus_highlight.workspace = true
 argus_runs.workspace = true
 argus_store.workspace = true
 gpui.workspace = true

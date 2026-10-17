@@ -38,6 +38,17 @@ side" title-bar button switches to the unified layout and back, keeping the
 line at the top of the viewport in place. The settings choose the default
 layout and whether both columns scroll horizontally together.
 
+Code is syntax-highlighted with tree-sitter, Zed-style, for Rust,
+TypeScript/TSX, JavaScript/JSX, Python, Go, Java, Kotlin, Swift, C, C++, C#,
+Ruby, PHP, JSON, YAML, TOML, Markdown, HTML, CSS, SQL and Bash (detected from the
+file name, extension or shebang; anything else stays plain text). Highlighting
+runs on background threads and parses each whole file once, so a block comment
+that opens above a hunk is still colored inside it; text is shown plain right
+away and recolored when the highlights arrive. Files over 2 MB or 50,000 lines
+stay plain unless you click "Highlight" in their header.
+
+![Syntax highlighting in One Light](docs/screenshots/diff-syntax-light.png)
+![Syntax highlighting in One Dark](docs/screenshots/diff-syntax-dark.png)
 ![Side-by-side diff view](docs/screenshots/diff-split-light.png)
 ![Unified diff view](docs/screenshots/diff-unified-light.png)
 ![Argus in One Dark](docs/screenshots/shell-dark.png)
