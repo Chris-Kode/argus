@@ -102,3 +102,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-segmentation = "1.13.3"
 uuid = { version = "1.28.0", features = ["serde", "v7"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+
+# Shipped builds (`cargo xtask bundle`): whole-crate-graph thin LTO, one
+# codegen unit and no symbols trade build time for a smaller, faster binary.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
