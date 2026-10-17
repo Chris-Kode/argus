@@ -20,7 +20,7 @@
 //! - **Runs.** An open thread carries a "Run · model · effort ▾" split
 //!   button (spec §3.1): the main part (or `r` on the focused thread) asks
 //!   the workspace to start a run ([`DiffViewEvent::RunRequested`]); the
-//!   arrow opens the Run menu with the models and efforts of the settings.
+//!   arrow opens the Run menu with every model and effort on offer.
 //!   The run manager makes the choice the new default once the run starts.
 //!
 //! - **Outdated comments** (spec §7.3) are not shown inline: their code is
@@ -41,6 +41,7 @@ use argus_diff::review::{
     AnchorLocation, Comment, CommentAnchor, CommentEvent, CommentId, CommentStatus, ReplyAuthor,
     ReviewKey,
 };
+use argus_runs::settings::{EFFORTS, MODELS};
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, Global, Hsla, MouseButton, MouseDownEvent,
     Pixels, SharedString, Subscription, deferred, div, prelude::*, px,
@@ -2123,7 +2124,7 @@ impl DiffView {
         )
     }
 
-    /// The Run menu: the models and efforts of the settings, and Run.
+    /// The Run menu: every model and effort on offer, and Run.
     fn render_run_menu(
         &self,
         id: CommentId,
@@ -2131,7 +2132,6 @@ impl DiffView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let settings = cx.global::<AppContext>().runs.settings();
         let (model, effort) = self.run_choice(id, cx);
         let section = |title: &'static str| {
             div()
@@ -2163,15 +2163,15 @@ impl DiffView {
                 )
                 .child(label)
         };
-        let models = settings.models.iter().enumerate().map(|(index, name)| {
-            let name = name.clone();
+        let models = MODELS.iter().enumerate().map(|(index, &name)| {
+            let name = name.to_owned();
             option(index, name.clone(), name == model).on_click(cx.listener(
                 move |this, _, _, cx| this.pick_run_option(id, Some(name.clone()), None, cx),
             ))
         });
-        let offset = settings.models.len();
-        let efforts = settings.efforts.iter().enumerate().map(|(index, name)| {
-            let name = name.clone();
+        let offset = MODELS.len();
+        let efforts = EFFORTS.iter().enumerate().map(|(index, &name)| {
+            let name = name.to_owned();
             option(offset + index, name.clone(), name == effort).on_click(cx.listener(
                 move |this, _, _, cx| this.pick_run_option(id, None, Some(name.clone()), cx),
             ))

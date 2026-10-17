@@ -1,6 +1,6 @@
 //! The Claude section of the settings sheet (spec §10): the `claude` binary,
-//! the model and effort lists with their defaults, the review rules file and
-//! the commit-message timeout.
+//! the default model and effort, the review rules file and the
+//! commit-message timeout.
 //!
 //! Text fields apply on Enter (or their Apply button). Each value is
 //! validated first; an invalid one shows an inline error and is neither
@@ -16,8 +16,8 @@
 use std::path::PathBuf;
 
 use argus_runs::settings::{
-    self, MAX_COMMIT_MESSAGE_TIMEOUT_S, MIN_COMMIT_MESSAGE_TIMEOUT_S, default_review_rules_path,
-    format_list,
+    self, EFFORTS, MAX_COMMIT_MESSAGE_TIMEOUT_S, MIN_COMMIT_MESSAGE_TIMEOUT_S, MODELS,
+    default_review_rules_path,
 };
 use argus_runs::{ClaudeSettings, ClaudeStatus, RunManager, SettingError, review_rules};
 use gpui::{
@@ -39,20 +39,12 @@ const LABEL_WIDTH: f32 = 150.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Field {
     ClaudePath,
-    Models,
-    Efforts,
     ReviewRules,
     CommitTimeout,
 }
 
 impl Field {
-    const ALL: [Field; 5] = [
-        Field::ClaudePath,
-        Field::Models,
-        Field::Efforts,
-        Field::ReviewRules,
-        Field::CommitTimeout,
-    ];
+    const ALL: [Field; 3] = [Field::ClaudePath, Field::ReviewRules, Field::CommitTimeout];
 
     fn index(self) -> usize {
         self as usize
@@ -183,16 +175,6 @@ impl ClaudeSettingsForm {
     fn submit(&mut self, field: Field, cx: &mut Context<Self>) {
         let text = self.field(field).input.read(cx).text().to_owned();
         match field {
-            Field::Models => match settings::parse_list(&text) {
-                Ok(models) => self.apply(Some(field), cx, |settings| settings.set_models(models)),
-                Err(error) => self.set_error(field, Some(error_text(&error)), cx),
-            },
-            Field::Efforts => match settings::parse_list(&text) {
-                Ok(efforts) => {
-                    self.apply(Some(field), cx, |settings| settings.set_efforts(efforts))
-                }
-                Err(error) => self.set_error(field, Some(error_text(&error)), cx),
-            },
             Field::CommitTimeout => match settings::parse_commit_message_timeout(&text) {
                 Ok(seconds) => self.apply(Some(field), cx, |settings| {
                     settings.commit_message_timeout_s = seconds;
@@ -432,7 +414,7 @@ impl ClaudeSettingsForm {
         &self,
         id: &'static str,
         label: &'static str,
-        options: &[String],
+        options: &[&str],
         selected: &str,
         pick: fn(&mut ClaudeSettings, String),
         cx: &mut Context<Self>,
@@ -441,9 +423,9 @@ impl ClaudeSettingsForm {
         let buttons: Vec<AnyElement> = options
             .iter()
             .enumerate()
-            .map(|(index, option)| {
-                let value = option.clone();
-                toggle_button((id, index), option.clone(), option == selected, cx)
+            .map(|(index, &option)| {
+                let value = option.to_owned();
+                toggle_button((id, index), option.to_owned(), option == selected, cx)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let value = value.clone();
                         this.apply(None, cx, |settings| pick(settings, value));
@@ -502,8 +484,6 @@ impl Render for ClaudeSettingsForm {
             .text_color(cx.theme().colors.text_muted)
             .child("s")
             .into_any_element();
-        let models = self.settings.models.clone();
-        let efforts = self.settings.efforts.clone();
         let default_model = self.settings.default_model.clone();
         let default_effort = self.settings.default_effort.clone();
 
@@ -526,7 +506,7 @@ impl Render for ClaudeSettingsForm {
             .child(self.render_choice_row(
                 "default-model",
                 "Default model",
-                &models,
+                &MODELS,
                 &default_model,
                 |settings, model| settings.default_model = model,
                 cx,
@@ -534,23 +514,9 @@ impl Render for ClaudeSettingsForm {
             .child(self.render_choice_row(
                 "default-effort",
                 "Default effort",
-                &efforts,
+                &EFFORTS,
                 &default_effort,
                 |settings, effort| settings.default_effort = effort,
-                cx,
-            ))
-            .child(self.render_field_row(
-                Field::Models,
-                "Models",
-                None,
-                Some(("Comma-separated; offered in the Run menu".into(), false)),
-                cx,
-            ))
-            .child(self.render_field_row(
-                Field::Efforts,
-                "Efforts",
-                None,
-                Some(("Comma-separated; offered in the Run menu".into(), false)),
                 cx,
             ))
             .child(self.render_field_row(
@@ -616,8 +582,6 @@ fn field_text(settings: &ClaudeSettings, field: Field) -> String {
     };
     match field {
         Field::ClaudePath => path(&settings.claude_path),
-        Field::Models => format_list(&settings.models),
-        Field::Efforts => format_list(&settings.efforts),
         Field::ReviewRules => path(&settings.review_rules_path),
         Field::CommitTimeout => settings.commit_message_timeout_s.to_string(),
     }
@@ -626,8 +590,6 @@ fn field_text(settings: &ClaudeSettings, field: Field) -> String {
 fn placeholder(field: Field, cx: &gpui::App) -> SharedString {
     match field {
         Field::ClaudePath => "Auto-detect on PATH".into(),
-        Field::Models => "opus, sonnet, haiku".into(),
-        Field::Efforts => "low, medium, high".into(),
         Field::ReviewRules => {
             display_path(&default_review_rules_path(runs(cx).argus_home())).into()
         }

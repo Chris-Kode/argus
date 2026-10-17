@@ -11,6 +11,7 @@
 
 use argus_diff::review::CommentId;
 use argus_runs::RunError;
+use argus_runs::settings::{EFFORTS, MODELS};
 use argus_store::RunId;
 use gpui::{App, Context, Div, SharedString, Task, prelude::*};
 
@@ -43,18 +44,18 @@ pub fn label(model: &str, effort: &str) -> String {
     }
 }
 
-/// Makes the next model of the settings' list the Run menu default.
+/// Makes the next offered model the Run menu default.
 pub fn cycle_model(cx: &mut App) {
     let settings = cx.global::<AppContext>().runs.settings();
-    if let Some(model) = next_in(&settings.models, &settings.default_model) {
+    if let Some(model) = next_in(&MODELS, &settings.default_model) {
         remember(model, settings.default_effort, cx);
     }
 }
 
-/// Makes the next effort of the settings' list the Run menu default.
+/// Makes the next offered effort the Run menu default.
 pub fn cycle_effort(cx: &mut App) {
     let settings = cx.global::<AppContext>().runs.settings();
-    if let Some(effort) = next_in(&settings.efforts, &settings.default_effort) {
+    if let Some(effort) = next_in(&EFFORTS, &settings.default_effort) {
         remember(settings.default_model, effort, cx);
     }
 }
@@ -72,14 +73,14 @@ fn remember(model: String, effort: String, cx: &mut App) {
     }
 }
 
-fn next_in(list: &[String], current: &str) -> Option<String> {
-    let index = list.iter().position(|entry| entry == current);
+fn next_in(list: &[&str], current: &str) -> Option<String> {
+    let index = list.iter().position(|&entry| entry == current);
     let next = index.map_or(0, |index| (index + 1) % list.len().max(1));
-    list.get(next).cloned()
+    list.get(next).map(|&entry| entry.to_owned())
 }
 
 /// The model and effort buttons of a reply box (the Run menu defaults); a
-/// click picks the next entry of the settings' list.
+/// click picks the next offered entry.
 pub fn choice_buttons<V: 'static>(id: &str, cx: &mut Context<V>) -> Div {
     let (model, effort) = current(cx);
     let colors = cx.theme().colors.clone();

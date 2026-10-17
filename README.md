@@ -231,7 +231,7 @@ too, but are never flagged outdated.
 
 Run a comment with Claude from its thread: the "Run · sonnet · medium ▾"
 split button runs with the shown model and effort, and its arrow opens the Run
-menu with the models and efforts from the settings. `r` runs the focused
+menu with every model and effort on offer. `r` runs the focused
 thread. The last choice becomes the default for the next run and survives a
 restart. Run is disabled for outdated comments and while Claude Code is
 missing or too old. Each run gets its own worktree, and runs go in parallel.

@@ -168,17 +168,17 @@ impl RunManager {
     }
 
     /// Makes `model` and `effort` the Run menu defaults when they are
-    /// listed in the settings (an empty effort is not remembered). Returns
+    /// offered ([`settings::MODELS`], [`settings::EFFORTS`]; an empty effort is not remembered). Returns
     /// whether the live settings changed; save them with
     /// [`RunManager::save_settings`].
     pub fn remember_choice(&self, model: &str, effort: &str) -> bool {
         self.settings.send_if_modified(|settings| {
             let mut changed = false;
-            if settings.default_model != model && settings.models.iter().any(|m| m == model) {
+            if settings.default_model != model && settings::MODELS.contains(&model) {
                 settings.default_model = model.to_owned();
                 changed = true;
             }
-            if settings.default_effort != effort && settings.efforts.iter().any(|e| e == effort) {
+            if settings.default_effort != effort && settings::EFFORTS.contains(&effort) {
                 settings.default_effort = effort.to_owned();
                 changed = true;
             }

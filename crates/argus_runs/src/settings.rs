@@ -1,6 +1,7 @@
 //! Run defaults the user sets once (spec §10, Claude section): the `claude`
-//! binary, the model and effort lists with their defaults, the review rules
-//! file and the commit-message timeout.
+//! binary, the default model and effort, the review rules file and the
+//! commit-message timeout. The models and efforts on offer are fixed:
+//! [`MODELS`] and [`EFFORTS`].
 //!
 //! [`ClaudeSettings`] is stored as JSON in the `settings` table under
 //! [`CLAUDE_SETTINGS_KEY`]. Every field has a serde default and unknown keys
@@ -25,10 +26,10 @@ pub const CLAUDE_BINARY: &str = "claude";
 pub const DEFAULT_MODEL: &str = "sonnet";
 /// Initial default thinking effort.
 pub const DEFAULT_EFFORT: &str = "medium";
-/// Initial model list of the Run menu.
-pub const DEFAULT_MODELS: [&str; 3] = ["opus", "sonnet", "haiku"];
-/// Initial effort list of the Run menu.
-pub const DEFAULT_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+/// Models offered in the Run menu, as `claude --model` aliases.
+pub const MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+/// Thinking efforts offered in the Run menu.
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// File name of the review rules inside the Argus home.
 pub const REVIEW_RULES_FILE_NAME: &str = "review-rules.md";
 /// Default timeout of the Haiku commit-message call (spec §6.4), in seconds.
@@ -64,15 +65,6 @@ pub enum SettingError {
         "`claude` was not found on PATH or in the usual install locations; install Claude Code or set its path"
     )]
     NotOnPath,
-    /// A list setting has no entries.
-    #[error("enter at least one value")]
-    EmptyList,
-    /// A list entry contains whitespace, which `claude` would not accept.
-    #[error("\"{0}\" must not contain spaces")]
-    Whitespace(String),
-    /// A list entry appears twice.
-    #[error("\"{0}\" is listed twice")]
-    Duplicate(String),
     /// The value is not a whole number.
     #[error("enter a whole number of seconds")]
     NotANumber,
@@ -100,10 +92,6 @@ pub struct ClaudeSettings {
     pub default_model: String,
     /// Thinking effort preselected in the Run menu.
     pub default_effort: String,
-    /// Models offered in the Run menu.
-    pub models: Vec<String>,
-    /// Thinking efforts offered in the Run menu.
-    pub efforts: Vec<String>,
     /// Review rules passed with `--append-system-prompt-file`; `None` uses
     /// `<argus_home>/review-rules.md`. A leading `~` is expanded.
     pub review_rules_path: Option<PathBuf>,
@@ -118,14 +106,6 @@ impl Default for ClaudeSettings {
             claude_path: None,
             default_model: DEFAULT_MODEL.to_owned(),
             default_effort: DEFAULT_EFFORT.to_owned(),
-            models: DEFAULT_MODELS
-                .iter()
-                .map(|&model| model.to_owned())
-                .collect(),
-            efforts: DEFAULT_EFFORTS
-                .iter()
-                .map(|&effort| effort.to_owned())
-                .collect(),
             review_rules_path: None,
             commit_message_timeout_s: DEFAULT_COMMIT_MESSAGE_TIMEOUT_S,
         }
@@ -151,19 +131,17 @@ impl ClaudeSettings {
         store.set(CLAUDE_SETTINGS_KEY, self).await
     }
 
-    /// Repairs values a hand-edited or corrupted record could make invalid:
-    /// empty or malformed lists reset, defaults missing from their list
-    /// fall back to the first entry, and the timeout is clamped.
+    /// Repairs values a hand-edited, corrupted or older record could make
+    /// invalid: a default model or effort that is no longer offered falls
+    /// back to [`DEFAULT_MODEL`] / [`DEFAULT_EFFORT`], and the timeout is
+    /// clamped.
     pub fn sanitized(mut self) -> Self {
-        let defaults = Self::default();
-        if validate_list(&self.models).is_err() {
-            self.models = defaults.models;
+        if !MODELS.contains(&self.default_model.as_str()) {
+            self.default_model = DEFAULT_MODEL.to_owned();
         }
-        if validate_list(&self.efforts).is_err() {
-            self.efforts = defaults.efforts;
+        if !EFFORTS.contains(&self.default_effort.as_str()) {
+            self.default_effort = DEFAULT_EFFORT.to_owned();
         }
-        self.default_model = pick_default(&self.models, &self.default_model);
-        self.default_effort = pick_default(&self.efforts, &self.default_effort);
         self.claude_path = self.claude_path.filter(|path| !path.as_os_str().is_empty());
         self.review_rules_path = self
             .review_rules_path
@@ -172,20 +150,6 @@ impl ClaudeSettings {
             .commit_message_timeout_s
             .clamp(MIN_COMMIT_MESSAGE_TIMEOUT_S, MAX_COMMIT_MESSAGE_TIMEOUT_S);
         self
-    }
-
-    /// Replaces the model list, keeping the default model when it is still
-    /// listed and switching to the first entry otherwise.
-    pub fn set_models(&mut self, models: Vec<String>) {
-        self.default_model = pick_default(&models, &self.default_model);
-        self.models = models;
-    }
-
-    /// Replaces the effort list, keeping the default effort when it is still
-    /// listed and switching to the first entry otherwise.
-    pub fn set_efforts(&mut self, efforts: Vec<String>) {
-        self.default_effort = pick_default(&efforts, &self.default_effort);
-        self.efforts = efforts;
     }
 
     /// The review rules file: the configured path, or
@@ -244,47 +208,6 @@ pub fn resolve_claude_path(configured: Option<&Path>) -> Result<PathBuf, Setting
 /// `<argus_home>/review-rules.md`.
 pub fn default_review_rules_path(argus_home: &Path) -> PathBuf {
     argus_home.join(REVIEW_RULES_FILE_NAME)
-}
-
-/// Splits a comma- or newline-separated list into trimmed entries and
-/// validates them: at least one entry, no inner whitespace, no duplicates.
-pub fn parse_list(input: &str) -> Result<Vec<String>, SettingError> {
-    let entries: Vec<String> = input
-        .split([',', '\n'])
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(str::to_owned)
-        .collect();
-    validate_list(&entries)?;
-    Ok(entries)
-}
-
-/// The list as shown in its text field.
-pub fn format_list(entries: &[String]) -> String {
-    entries.join(", ")
-}
-
-fn validate_list(entries: &[String]) -> Result<(), SettingError> {
-    if entries.is_empty() {
-        return Err(SettingError::EmptyList);
-    }
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.is_empty() || entry.chars().any(char::is_whitespace) {
-            return Err(SettingError::Whitespace(entry.clone()));
-        }
-        if entries[..index].contains(entry) {
-            return Err(SettingError::Duplicate(entry.clone()));
-        }
-    }
-    Ok(())
-}
-
-fn pick_default(list: &[String], current: &str) -> String {
-    if list.iter().any(|entry| entry == current) {
-        current.to_owned()
-    } else {
-        list.first().cloned().unwrap_or_default()
-    }
 }
 
 /// Parses the commit-message timeout field.
