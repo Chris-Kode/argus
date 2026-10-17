@@ -52,8 +52,7 @@ pub use workspace::Workspace;
 /// Application-wide handles to the services, stored as a GPUI global.
 ///
 /// Views read it with `cx.global::<AppContext>()`. The run manager carries the
-/// live Claude settings and the detected `claude` capabilities; spawning runs
-/// lands with issue #20.
+/// live Claude settings, the detected `claude` capabilities and the live runs.
 pub struct AppContext {
     /// Git reads (gix) and writes (git CLI).
     pub git: GitService,
@@ -211,7 +210,13 @@ pub fn run_gpui_app(
         }
     });
     let ui_settings = settings.ui;
-    let runs = RunManager::new(argus_home, settings.claude);
+    let runs = RunManager::new(
+        argus_home,
+        settings.claude,
+        store.clone(),
+        git.clone(),
+        worktrees.clone(),
+    );
     // `claude --version` / `--help` run on the runtime; the UI only receives
     // the resulting status.
     runs.start_detection(&runtime);

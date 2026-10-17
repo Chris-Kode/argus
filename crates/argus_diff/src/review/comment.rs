@@ -76,7 +76,8 @@ impl Comment {
         )
     }
 
-    pub(crate) fn from_stored(stored: argus_store::Comment, replies: Vec<Reply>) -> Self {
+    /// Builds the thread from its stored row and replies.
+    pub fn from_stored(stored: argus_store::Comment, replies: Vec<Reply>) -> Self {
         let argus_store::Comment {
             id,
             repo_id,

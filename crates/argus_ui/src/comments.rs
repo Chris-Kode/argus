@@ -3,7 +3,9 @@
 //! [`ReviewComments`] wraps an [`argus_diff::review::CommentService`]: every
 //! storage call runs on the tokio runtime through [`spawn_job`], and the
 //! service's change broadcast is forwarded to views as
-//! [`ReviewCommentsEvent`]s. Views read the in-memory snapshot only.
+//! [`ReviewCommentsEvent`]s. Views read the in-memory snapshot only. Runs
+//! change comment statuses behind the service, so a run that starts or
+//! finishes for a shown comment reloads the review.
 //!
 //! After every diff refresh the workspace calls [`ReviewComments::reanchor`]
 //! with the new diff session, so comments follow their code or turn
@@ -16,6 +18,7 @@ use argus_diff::review::{
     ReviewError, ReviewKey,
 };
 use argus_diff::{DiffError, DiffSession};
+use argus_runs::RunUpdate;
 use gpui::{Context, EventEmitter, SharedString, Task};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -42,6 +45,7 @@ pub struct ReviewComments {
     /// The re-anchoring pass in flight; replacing it cancels it.
     reanchor_task: Option<Task<()>>,
     _listen_task: Task<()>,
+    _runs_task: Task<()>,
 }
 
 impl EventEmitter<ReviewCommentsEvent> for ReviewComments {}
@@ -71,6 +75,29 @@ impl ReviewComments {
                 }
             }
         });
+        let mut runs = cx.global::<AppContext>().runs.subscribe_runs();
+        let runs_task = cx.spawn(async move |this, cx| {
+            loop {
+                let comment_id = match runs.recv().await {
+                    Ok(RunUpdate::Started { comment_id, .. }) => comment_id,
+                    Ok(RunUpdate::Finished(finished)) => finished.comment_id,
+                    Err(RecvError::Lagged(_)) => None,
+                    Err(RecvError::Closed) => break,
+                };
+                let alive = this
+                    .update(cx, |this, cx| {
+                        let shown =
+                            comment_id.is_none_or(|id| this.comments.iter().any(|c| c.id == id));
+                        if shown {
+                            this.reload(cx);
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        });
         Self {
             comments: service.comments(),
             requested: None,
@@ -78,6 +105,7 @@ impl ReviewComments {
             load_task: None,
             reanchor_task: None,
             _listen_task: listen_task,
+            _runs_task: runs_task,
         }
     }
 

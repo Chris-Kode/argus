@@ -162,11 +162,17 @@ impl RunStore {
 
     /// Records a new run in the `Queued` state.
     pub async fn create(&self, new: NewRun) -> Result<Run> {
+        self.create_with_id(RunId::new(), new).await
+    }
+
+    /// Records a new run in the `Queued` state under an id chosen by the
+    /// caller, e.g. because the worktree path is derived from it.
+    pub async fn create_with_id(&self, id: RunId, new: NewRun) -> Result<Run> {
         let worktree_text = path_to_text(&new.worktree_path)?;
         self.service
             .call("RunStore::create", move |conn| {
                 let run = Run {
-                    id: RunId::new(),
+                    id,
                     comment_id: new.comment_id,
                     kind: new.kind,
                     session_id: new.session_id,
