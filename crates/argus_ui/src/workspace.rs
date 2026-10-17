@@ -2629,7 +2629,16 @@ impl Workspace {
                                     .text_color(colors.text)
                                     .child(title),
                             )
-                            .child(kbd(shortcut_text::<Dismiss>(), cx)),
+                            .child(
+                                kbd("Esc", cx)
+                                    .id("sheet-close")
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(colors.element_hover))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.sheet = None;
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                     .child(
                         div()

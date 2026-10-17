@@ -434,7 +434,7 @@ impl Render for ConflictDialog {
         } else {
             button("conflict-cancel", "Cancel", cx)
                 .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
-                .child(kbd("esc", cx))
+                .child(kbd("Esc", cx))
                 .into_any_element()
         };
         let resolve = if self.starting {

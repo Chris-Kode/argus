@@ -573,7 +573,7 @@ impl AcceptFlow {
         let actions = vec![
             button("accept-commit-cancel", "Cancel", cx)
                 .on_click(cx.listener(|this, _, _, cx| this.answer_front(false, cx)))
-                .child(kbd("esc", cx))
+                .child(kbd("Esc", cx))
                 .into_any_element(),
             primary_button("accept-commit-confirm", commit_label, cx)
                 .h(px(24.0))
