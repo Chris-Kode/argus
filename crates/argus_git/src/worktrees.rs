@@ -85,6 +85,34 @@ impl Patch {
     }
 }
 
+/// How [`WorktreeManager::apply_patch`] went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// The patch applied cleanly; the change is staged.
+    Applied,
+    /// The patch conflicts with the worktree's commit. The worktree was
+    /// reset; nothing is staged.
+    Conflict {
+        /// The conflicted paths, relative to the repository root.
+        files: Vec<PathBuf>,
+        /// What `git apply` printed.
+        detail: String,
+    },
+}
+
+/// How [`WorktreeManager::commit`] went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// The new commit (the worktree's `HEAD`).
+    Committed(Sha),
+    /// `git commit` failed, e.g. a pre-commit hook refused; nothing was
+    /// committed and the staged change is kept.
+    Failed {
+        /// git's and the hook's output.
+        output: String,
+    },
+}
+
 /// What [`WorktreeManager::reconcile`] did for one repository.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
@@ -332,6 +360,94 @@ impl WorktreeManager {
         Ok(())
     }
 
+    /// `git apply --3way --index -` of `patch` in an Argus worktree (the
+    /// integration worktree of an Accept, spec §5.3), with the patch on
+    /// stdin.
+    ///
+    /// When the patch does not apply cleanly, the conflicted paths are
+    /// collected and the worktree is put back with `git reset --hard`, so a
+    /// conflict never leaves half-applied state behind.
+    pub async fn apply_patch(&self, worktree: &Worktree, patch: &[u8]) -> Result<ApplyOutcome> {
+        self.guard(&worktree.path)?;
+        let cli = GitCli::new(&worktree.path);
+        let output = cli
+            .run_with_input(["apply", "--3way", "--index", "-"], patch)
+            .await?;
+        if output.success() {
+            return Ok(ApplyOutcome::Applied);
+        }
+        let unmerged = cli
+            .run(["diff", "--name-only", "--diff-filter=U", "-z"])
+            .await?
+            .stdout;
+        let mut files = Vec::new();
+        for path in unmerged.split(|&b| b == 0).filter(|path| !path.is_empty()) {
+            let path = gix::path::from_byte_slice(path).map_err(|err| GitError::Parse {
+                command: "git diff --name-only --diff-filter=U -z".to_owned(),
+                message: format!("invalid path: {err}"),
+            })?;
+            files.push(path.to_owned());
+        }
+        if files.is_empty() {
+            // Paths git refused outright (no 3-way fallback possible, e.g. a
+            // new file that already exists) are only named in its errors.
+            files = rejected_paths(&output.stderr);
+        }
+        cli.run(["reset", "--hard", "--quiet"]).await?;
+        cli.run(["clean", "-ffdx", "--quiet"]).await?;
+        tracing::info!(
+            path = %worktree.path.display(),
+            files = files.len(),
+            "patch does not apply cleanly"
+        );
+        Ok(ApplyOutcome::Conflict {
+            files,
+            detail: output.stderr,
+        })
+    }
+
+    /// The staged change of a worktree: `git diff --cached`, in git's
+    /// default text format (for the commit-message call). Empty when
+    /// nothing is staged.
+    pub async fn staged_diff(&self, worktree: &Worktree) -> Result<Vec<u8>> {
+        self.guard(&worktree.path)?;
+        let output = GitCli::new(&worktree.path)
+            .run(["diff", "--cached", "--no-color", "--no-ext-diff"])
+            .await?;
+        Ok(output.stdout)
+    }
+
+    /// `git commit -F -` in an Argus worktree, with `message` on stdin.
+    ///
+    /// The user's identity, signing config and hooks apply, as for any
+    /// commit of theirs. A failure (typically a hook) is returned as
+    /// [`CommitOutcome::Failed`] with git's and the hook's output, so the
+    /// caller can show it and let the user retry.
+    pub async fn commit(&self, worktree: &Worktree, message: &str) -> Result<CommitOutcome> {
+        self.guard(&worktree.path)?;
+        let cli = GitCli::new(&worktree.path);
+        let output = cli
+            .run_with_input(["commit", "--quiet", "-F", "-"], message.as_bytes())
+            .await?;
+        if !output.success() {
+            let stdout = output.stdout_lossy();
+            let text = [stdout.trim(), output.stderr.as_str()]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(CommitOutcome::Failed { output: text });
+        }
+        let head = cli.run(["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+        let hex = head.stdout_lossy();
+        let sha = Sha::parse(hex.trim()).ok_or_else(|| GitError::Parse {
+            command: "git rev-parse --verify HEAD^{commit}".to_owned(),
+            message: format!("not an object id: `{}`", hex.trim()),
+        })?;
+        tracing::info!(path = %worktree.path.display(), %sha, "committed in worktree");
+        Ok(CommitOutcome::Committed(sha))
+    }
+
     /// Marks every run left `Queued` or `Running` by a previous session as
     /// `Failed` with error [`INTERRUPTED`]. Call once at startup, before any
     /// run of the new session starts.
@@ -487,6 +603,29 @@ fn io_error(path: &Path, source: std::io::Error) -> GitError {
         path: path.to_owned(),
         source,
     }
+}
+
+/// The paths named by `git apply`'s `error: patch failed: <path>:<line>`
+/// and `error: <path>: <reason>` lines, in order, without duplicates.
+fn rejected_paths(stderr: &str) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for line in stderr.lines() {
+        let Some(rest) = line.strip_prefix("error: ") else {
+            continue;
+        };
+        let path = if let Some(failed) = rest.strip_prefix("patch failed: ") {
+            failed.rsplit_once(':').map(|(path, _)| path)
+        } else {
+            rest.split_once(": ").map(|(path, _)| path)
+        };
+        if let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) {
+            let path = PathBuf::from(path);
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
 }
 
 /// Parses `git diff --name-status -z --no-renames`: `<status>\0<path>\0` pairs.

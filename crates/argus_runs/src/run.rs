@@ -159,6 +159,16 @@ pub enum RunUpdate {
         /// The comment it worked on.
         comment_id: Option<CommentId>,
     },
+    /// The run's proposal was accepted: the commit is on the head branch,
+    /// the comment is `Resolved` and the run's worktree is gone.
+    Accepted {
+        /// The run.
+        run_id: RunId,
+        /// The comment it worked on.
+        comment_id: Option<CommentId>,
+        /// The new head tip.
+        commit: Sha,
+    },
 }
 
 /// The outcome of a finished run, as published.

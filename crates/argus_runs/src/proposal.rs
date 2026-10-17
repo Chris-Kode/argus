@@ -140,7 +140,7 @@ pub(crate) async fn latest_run(
 }
 
 /// The run, its comment, repository and worktree, checked for review.
-async fn load_parts(
+pub(crate) async fn load_parts(
     services: &Services,
     run_id: RunId,
 ) -> Result<(Run, Comment, Repo, Worktree), ProposalError> {

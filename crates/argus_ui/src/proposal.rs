@@ -18,7 +18,10 @@
 //! a note only. While the follow-up runs, the diff follows its edits and
 //! Accept / Reject wait; when it ends, the tab shows the combined proposal
 //! of the latest run. A follow-up whose session is gone offers a fresh run
-//! with the thread as context. A file watcher on the worktree takes a new snapshot after manual
+//! with the thread as context. Accept is handed to the workspace's accept
+//! flow; while it is queued or in progress the tab shows "Accepting…" and
+//! stops following the worktree, since the patch was already taken. A file
+//! watcher on the worktree takes a new snapshot after manual
 //! edits, so the diff follows them. Every git call runs on the tokio
 //! runtime; this view only stores results.
 
@@ -29,7 +32,7 @@ use std::time::Duration;
 
 use argus_diff::Side as DiffSide;
 use argus_diff::review::{CommentId, CommentStatus, ReplyAuthor};
-use argus_runs::{Proposal, RunUpdate};
+use argus_runs::{AcceptStage, Proposal, RunUpdate};
 use argus_store::{RunId, RunStatus};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, SharedString,
@@ -101,6 +104,7 @@ enum State {
     Ready(Box<Loaded>),
     Failed(SharedString),
     Rejected,
+    Accepted,
 }
 
 /// One proposal tab.
@@ -124,6 +128,8 @@ pub struct ProposalView {
     session_lost: bool,
     confirm_reject: bool,
     rejecting: bool,
+    /// Where the Accept of this proposal is, while queued or in progress.
+    accepting: Option<AcceptStage>,
     refreshing: bool,
     focus_requested: bool,
     load_task: Option<Task<()>>,
@@ -179,6 +185,7 @@ impl ProposalView {
             session_lost: false,
             confirm_reject: false,
             rejecting: false,
+            accepting: None,
             refreshing: false,
             focus_requested: true,
             load_task: None,
@@ -221,7 +228,40 @@ impl ProposalView {
             State::Failed(_) => "Proposal (error)".into(),
             State::Loading => "Proposal…".into(),
             State::Rejected => "Proposal (rejected)".into(),
+            State::Accepted => "Proposal (accepted)".into(),
         }
+    }
+
+    /// The run shown, once loaded.
+    pub fn run_id(&self) -> Option<RunId> {
+        self.loaded().map(|loaded| loaded.proposal.run.id)
+    }
+
+    /// Shows the Accept's progress (`None` once it ended). While accepting,
+    /// the worktree is not followed: the patch was taken already, and the
+    /// worktree is deleted once the commit lands.
+    pub fn set_accepting(&mut self, stage: Option<AcceptStage>, cx: &mut Context<Self>) {
+        let was_accepting = self.accepting.is_some();
+        self.accepting = stage;
+        if stage.is_some() {
+            self.watch_task = None;
+            self.confirm_reject = false;
+        } else if was_accepting && let State::Ready(loaded) = &self.state {
+            let proposal = loaded.proposal.clone();
+            let runs = cx.global::<AppContext>().runs.clone();
+            let job = spawn_job(cx, async move { runs.watch_proposal(&proposal) });
+            self.watch_task = Some(cx.spawn(async move |this, cx| {
+                if let Ok(watch) = job.await {
+                    this.update(cx, |this, cx| {
+                        if this.accepting.is_none() {
+                            this.start_watching(watch, cx);
+                        }
+                    })
+                    .ok();
+                }
+            }));
+        }
+        cx.notify();
     }
 
     /// The proposal's diff view, for the workspace's navigation keys.
@@ -433,6 +473,15 @@ impl ProposalView {
     }
 
     fn run_update(&mut self, update: RunUpdate, cx: &mut Context<Self>) {
+        if let RunUpdate::Accepted { run_id, .. } = update {
+            if self.run_id() == Some(run_id) {
+                self.state = State::Accepted;
+                self.watch_task = None;
+                self.refresh_task = None;
+                cx.notify();
+            }
+            return;
+        }
         let comment_id = self.loaded().map(|loaded| loaded.proposal.comment.id);
         match update {
             RunUpdate::Rejected { run_id, .. } => {
@@ -502,6 +551,9 @@ impl ProposalView {
     // ---- actions ------------------------------------------------------------
 
     fn accept(&mut self, _: &Accept, _: &mut Window, cx: &mut Context<Self>) {
+        if self.accepting.is_some() || self.rejecting {
+            return;
+        }
         let Some(run_id) = self.loaded().map(|loaded| loaded.proposal.run.id) else {
             return;
         };
@@ -514,6 +566,9 @@ impl ProposalView {
 
     /// `x` / Reject: asks first; a second `x` (or the button) confirms.
     fn reject_action(&mut self, _: &RejectProposal, _: &mut Window, cx: &mut Context<Self>) {
+        if self.accepting.is_some() {
+            return;
+        }
         if self.followup_running() {
             self.notice("Wait for the follow-up run to finish.", false, cx);
         } else if self.confirm_reject {
@@ -528,7 +583,7 @@ impl ProposalView {
         let Some(run_id) = self.loaded().map(|loaded| loaded.proposal.run.id) else {
             return;
         };
-        if self.rejecting {
+        if self.rejecting || self.accepting.is_some() {
             return;
         }
         self.confirm_reject = false;
@@ -967,7 +1022,9 @@ impl ProposalView {
         let colors = cx.theme().colors.clone();
         let running = self.followup_running();
         let busy = self.rejecting || self.load_task.is_some() || running;
-        let reject = if self.rejecting {
+        let reject = if self.accepting.is_some() {
+            disabled_button("proposal-reject", "Reject", cx).into_any_element()
+        } else if self.rejecting {
             disabled_button("proposal-reject", "Rejecting…", cx).into_any_element()
         } else if running {
             disabled_button("proposal-reject", "Reject", cx).into_any_element()
@@ -981,7 +1038,14 @@ impl ProposalView {
                 .child(kbd(shortcut_keys::<RejectProposal>(), cx))
                 .into_any_element()
         };
-        let accept = if busy {
+        let accept = if let Some(stage) = self.accepting {
+            disabled_button(
+                "proposal-accept",
+                format!("Accepting… · {}", stage.label()),
+                cx,
+            )
+            .into_any_element()
+        } else if busy {
             disabled_button("proposal-accept", "Accept", cx).into_any_element()
         } else {
             primary_button("proposal-accept", "Accept", cx)
@@ -1225,6 +1289,9 @@ impl Render for ProposalView {
                 .child(format!("Could not open the proposal: {message}"))
                 .into_any_element(),
             State::Rejected => placeholder("This proposal was rejected.", cx).into_any_element(),
+            State::Accepted => {
+                placeholder("This proposal was accepted and committed.", cx).into_any_element()
+            }
             State::Ready(loaded) => {
                 let view = loaded.view.clone();
                 let header = self.render_header(loaded, cx);

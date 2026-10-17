@@ -93,7 +93,8 @@ impl ReviewComments {
                     Ok(RunUpdate::Finished(finished)) => {
                         (finished.comment_id, Some(finished.session_not_found))
                     }
-                    Ok(RunUpdate::Rejected { comment_id, .. }) => (comment_id, Some(false)),
+                    Ok(RunUpdate::Rejected { comment_id, .. })
+                    | Ok(RunUpdate::Accepted { comment_id, .. }) => (comment_id, Some(false)),
                     Err(RecvError::Lagged(_)) => (None, None),
                     Err(RecvError::Closed) => break,
                 };

@@ -9,8 +9,11 @@
 //! diff's Run menu and `r` start runs through it, and its rows jump back to
 //! their comments. "View proposal" on a `Proposed` comment opens a
 //! [`ProposalView`] tab next to the main diff tab (#22); the navigation keys
-//! follow the active tab. Settings, the repository list and git are read and
-//! written on the tokio runtime; this view only receives the results.
+//! follow the active tab. Accept goes through the [`AcceptFlow`] (#24): its
+//! dialogs overlay the shell, and each landed commit refreshes the branches,
+//! so the diff, the comment anchors and the Push counts follow. Settings, the
+//! repository list and git are read and written on the tokio runtime; this
+//! view only receives the results.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -27,6 +30,7 @@ use gpui::{
 };
 
 use crate::AppContext;
+use crate::accept::{AcceptFlow, AcceptFlowEvent};
 use crate::branch_picker::{BranchPicker, PickerEvent};
 use crate::claude_settings::ClaudeSettingsForm;
 use crate::claude_status::observe_claude_status;
@@ -159,6 +163,8 @@ pub struct Workspace {
     proposals: Vec<ProposalTab>,
     /// The proposal tab shown in the center; `None` shows the main diff.
     active_proposal: Option<usize>,
+    /// Queued accepts and their dialogs.
+    accept_flow: Entity<AcceptFlow>,
     /// Focus the workspace at the next render (e.g. after leaving a tab).
     focus_requested: bool,
     /// "Viewed" marks of the last closed diff view, by (base, head), so a
@@ -213,6 +219,11 @@ impl Workspace {
             }),
         ];
 
+        let accept_flow = cx.new(AcceptFlow::new);
+        let mut subscriptions = subscriptions;
+        subscriptions.push(cx.observe(&accept_flow, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.subscribe(&accept_flow, Self::accept_flow_event));
+
         let mut this = Self {
             focus_handle,
             settings,
@@ -230,6 +241,7 @@ impl Workspace {
             diff_subscription: None,
             proposals: Vec::new(),
             active_proposal: None,
+            accept_flow,
             focus_requested: false,
             viewed_stash: None,
             picker: None,
@@ -808,14 +820,10 @@ impl Workspace {
                 cx.notify();
             }
             ProposalEvent::AcceptRequested(run_id) => {
-                // Accept (integration worktree, commit message, CAS ref
-                // update) lands with #24.
+                let run_id = *run_id;
                 tracing::debug!(run = %run_id, "accept requested");
-                self.notice = Some(Notice {
-                    message: "Accept is not available yet (#24); the proposal stays open.".into(),
-                    is_error: false,
-                });
-                cx.notify();
+                self.accept_flow
+                    .update(cx, |flow, cx| flow.accept(run_id, cx));
             }
             ProposalEvent::Replied {
                 comment_id,
@@ -847,6 +855,64 @@ impl Workspace {
                               again."
                         .into(),
                     is_error: false,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// Follows the accepts: "Accepting…" on their tabs, and a refresh of the
+    /// branches (diff, comment anchors, Push counts) after each commit.
+    fn accept_flow_event(
+        &mut self,
+        _: Entity<AcceptFlow>,
+        event: &AcceptFlowEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            AcceptFlowEvent::Stage { run_id, stage } => {
+                for tab in &self.proposals {
+                    if tab.view.read(cx).run_id() == Some(*run_id) {
+                        let stage = *stage;
+                        tab.view
+                            .update(cx, |view, cx| view.set_accepting(stage, cx));
+                    }
+                }
+            }
+            AcceptFlowEvent::Committed(accepted) => {
+                while let Some(index) = self
+                    .proposals
+                    .iter()
+                    .position(|tab| tab.view.read(cx).run_id() == Some(accepted.run_id))
+                {
+                    self.close_proposal(index, cx);
+                }
+                if let Some(session) = self.session.clone() {
+                    session.update(cx, |session, cx| session.refresh_branches(cx));
+                }
+                let subject = accepted.message.lines().next().unwrap_or_default();
+                let mut message = format!(
+                    "Committed {} on `{}`: {subject}",
+                    accepted.commit.short(8),
+                    accepted.head
+                );
+                if accepted.retried {
+                    message.push_str(" (the branch had moved; applied on the new tip)");
+                }
+                if !accepted.warnings.is_empty() {
+                    message.push_str(&format!(". Warning: {}", accepted.warnings.join("; ")));
+                }
+                self.notice = Some(Notice {
+                    message: message.into(),
+                    is_error: !accepted.warnings.is_empty(),
+                });
+                cx.notify();
+            }
+            AcceptFlowEvent::DialogsClosed => self.activate_tab(self.active_proposal, cx),
+            AcceptFlowEvent::Notice { message, is_error } => {
+                self.notice = Some(Notice {
+                    message: message.clone(),
+                    is_error: *is_error,
                 });
                 cx.notify();
             }
@@ -1083,7 +1149,9 @@ impl Workspace {
             .session
             .as_ref()
             .is_some_and(|session| session.read(cx).tracking_prompt().is_some());
-        if self.picker.is_some() {
+        if self.accept_flow.read(cx).has_dialog() {
+            self.accept_flow.update(cx, |flow, cx| flow.dismiss(cx));
+        } else if self.picker.is_some() {
             self.close_picker(cx);
             window.focus(&self.focus_handle, cx);
         } else if tracking {
@@ -2739,6 +2807,9 @@ impl Render for Workspace {
                 root.child(self.render_sheet(sheet, cx))
             })
             .children(self.render_tracking_dialog(cx))
+            .when(self.accept_flow.read(cx).has_dialog(), |root| {
+                root.child(self.accept_flow.clone())
+            })
     }
 }
 
