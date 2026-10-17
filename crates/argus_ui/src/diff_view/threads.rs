@@ -16,7 +16,12 @@
 //! - **Status.** Chips read the [`ReviewComments`] snapshot, which follows
 //!   every change of the comment service, so a status change shows at once.
 //!   Debug builds offer "Advance status" in the thread menu to walk the
-//!   state machine until runs (#20) drive it.
+//!   state machine by hand.
+//! - **Runs.** An open thread carries a "Run · model · effort ▾" split
+//!   button (spec §3.1): the main part (or `r` on the focused thread) asks
+//!   the workspace to start a run ([`DiffViewEvent::RunRequested`]); the
+//!   arrow opens the Run menu with the models and efforts of the settings.
+//!   The run manager makes the choice the new default once the run starts.
 //!
 //! Outdated comments still show at their stored line, collapsed and badged,
 //! but their range is not highlighted in the gutter.
@@ -39,9 +44,10 @@ use gpui::{
 };
 
 use super::{
-    Anchor, COMMENT_COLUMN_WIDTH, DiffView, FileState, LineSelection, ListStatus, SCROLLBAR_WIDTH,
-    SPLIT_DIVIDER_WIDTH, side_index,
+    Anchor, COMMENT_COLUMN_WIDTH, DiffView, DiffViewEvent, FileState, LineSelection, ListStatus,
+    SCROLLBAR_WIDTH, SPLIT_DIVIDER_WIDTH, side_index,
 };
+use crate::AppContext;
 use crate::components::{button, chip, disabled_button, primary_button, status_chip};
 use crate::keymap::SubmitComment;
 use crate::markdown::{self, MarkdownCache};
@@ -175,6 +181,11 @@ pub(super) struct Threads {
     confirm_delete: Option<CommentId>,
     menu: Option<CommentId>,
     menu_closed: Option<(CommentId, Instant)>,
+    /// The thread whose Run menu (model and effort) is open.
+    run_menu: Option<CommentId>,
+    run_menu_closed: Option<(CommentId, Instant)>,
+    /// Model and effort picked in a thread's Run menu, until it runs.
+    run_choice: HashMap<CommentId, (String, String)>,
     /// The thread last clicked or jumped to (accent border, debug actions).
     focused: Option<CommentId>,
     markdown: MarkdownCache,
@@ -1005,6 +1016,102 @@ impl DiffView {
         cx.notify();
     }
 
+    // ---- runs ---------------------------------------------------------------
+
+    /// The model and effort a thread would run with: its Run menu pick, or
+    /// the defaults from the settings (the last run's choice).
+    fn run_choice(&self, id: CommentId, cx: &App) -> (String, String) {
+        if let Some(choice) = self.threads.run_choice.get(&id) {
+            return choice.clone();
+        }
+        let settings = cx.global::<AppContext>().runs.settings();
+        (settings.default_model, settings.default_effort)
+    }
+
+    /// Why a comment cannot run now, or `None` when it can.
+    fn run_blocker(&self, comment: &Comment, cx: &App) -> Option<String> {
+        if comment.outdated {
+            return Some("Outdated comments cannot run; re-anchor them first.".to_owned());
+        }
+        match comment.status {
+            CommentStatus::Open => {}
+            CommentStatus::Running => return Some("This comment is already running.".to_owned()),
+            _ => return Some("Only open comments can run.".to_owned()),
+        }
+        cx.global::<AppContext>().runs.claude_status().run_blocker()
+    }
+
+    /// Asks the workspace to run the thread with its Run menu choice.
+    fn request_run(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        self.threads.run_menu = None;
+        self.threads.menu = None;
+        let Some(comment) = self.comment(id) else {
+            return;
+        };
+        if let Some(blocker) = self.run_blocker(comment, cx) {
+            self.hint = Some(blocker.into());
+            cx.notify();
+            return;
+        }
+        let (model, effort) = self.run_choice(id, cx);
+        self.threads.run_choice.remove(&id);
+        self.threads.focused = Some(id);
+        cx.emit(DiffViewEvent::RunRequested {
+            comment_id: id,
+            model,
+            effort,
+        });
+        cx.notify();
+    }
+
+    /// `r`: runs the focused thread with its Run menu choice.
+    pub fn run_focused_comment(&mut self, cx: &mut Context<Self>) {
+        match self.threads.focused {
+            Some(id) if self.comment(id).is_some() => self.request_run(id, cx),
+            _ => {
+                self.hint = Some("Click a comment thread first.".into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn toggle_run_menu(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        if let Some((closed, at)) = self.threads.run_menu_closed.take()
+            && closed == id
+            && at.elapsed() < MENU_REOPEN_GUARD
+        {
+            return;
+        }
+        self.threads.menu = None;
+        self.threads.focused = Some(id);
+        self.threads.run_menu = if self.threads.run_menu == Some(id) {
+            None
+        } else {
+            Some(id)
+        };
+        cx.notify();
+    }
+
+    fn pick_run_option(
+        &mut self,
+        id: CommentId,
+        model: Option<String>,
+        effort: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let (mut current_model, mut current_effort) = self.run_choice(id, cx);
+        if let Some(model) = model {
+            current_model = model;
+        }
+        if let Some(effort) = effort {
+            current_effort = effort;
+        }
+        self.threads
+            .run_choice
+            .insert(id, (current_model, current_effort));
+        cx.notify();
+    }
+
     // ---- navigation -------------------------------------------------------
 
     /// The global row of a placed thread.
@@ -1369,6 +1476,7 @@ impl DiffView {
             .child(meta)
             .children(preview)
             .children(replies)
+            .children(self.render_run_button(comment, &key, cx))
             .child(menu_button);
 
         let body = (!collapsed).then(|| {
@@ -1571,9 +1679,236 @@ impl DiffView {
             .children(status_item)
             .child(div().my_0p5().h(px(1.0)).bg(colors.border_variant))
             // Runs (#21) and proposals (#22) plug in here.
-            .child(item(3, "Run with Claude… (soon)", false))
+            .child({
+                let enabled = self.run_blocker(comment, cx).is_none();
+                let (model, effort) = self.run_choice(id, cx);
+                let label: SharedString =
+                    format!("Run with Claude ({})", choice_label(&model, &effort)).into();
+                item(3, "", enabled).child(label).when(enabled, |item| {
+                    item.on_click(cx.listener(move |this, _, _, cx| this.request_run(id, cx)))
+                })
+            })
             .child(item(4, "View proposal (soon)", false))
             .children(debug_item)
+            .into_any_element()
+    }
+
+    /// The "Run · sonnet · medium ▾" split button of an open thread: the
+    /// main part runs with the shown choice, the arrow opens the Run menu.
+    /// While the comment cannot run (outdated, Claude unavailable) the
+    /// button is greyed out and a click shows the reason in the hint bar.
+    fn render_run_button(
+        &self,
+        comment: &Comment,
+        key: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !matches!(comment.status, CommentStatus::Open | CommentStatus::Running) {
+            return None;
+        }
+        let colors = cx.theme().colors.clone();
+        let id = comment.id;
+        if comment.status == CommentStatus::Running {
+            return Some(
+                div()
+                    .flex_none()
+                    .px_1p5()
+                    .text_xs()
+                    .text_color(colors.warning)
+                    .child("Running…")
+                    .into_any_element(),
+            );
+        }
+        let (model, effort) = self.run_choice(id, cx);
+        let label = format!("Run · {}", choice_label(&model, &effort));
+        if let Some(blocker) = self.run_blocker(comment, cx) {
+            let hint: SharedString = blocker.into();
+            return Some(
+                div()
+                    .id((key.clone(), 20))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .h(px(20.0))
+                    .px_1p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .text_xs()
+                    .text_color(colors.text_placeholder)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.hint = Some(hint.clone());
+                        cx.notify();
+                    }))
+                    .child(label)
+                    .into_any_element(),
+            );
+        }
+        let open = self.threads.run_menu == Some(id);
+        let accent = colors.accent;
+        let split = div()
+            .flex()
+            .items_center()
+            .h(px(20.0))
+            .rounded_md()
+            .border_1()
+            .border_color(accent.opacity(0.6))
+            .text_xs()
+            .text_color(colors.text)
+            .overflow_hidden()
+            .child(
+                div()
+                    .id((key.clone(), 20))
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .px_1p5()
+                    .cursor_pointer()
+                    .whitespace_nowrap()
+                    .hover(move |style| style.bg(accent.opacity(0.15)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.request_run(id, cx)))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .id((key.clone(), 21))
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .px_1()
+                    .border_l_1()
+                    .border_color(accent.opacity(0.6))
+                    .cursor_pointer()
+                    .when(open, |arrow| arrow.bg(colors.element_selected))
+                    .hover(move |style| style.bg(accent.opacity(0.15)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_run_menu(id, cx)))
+                    .child("▾"),
+            );
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .child(split)
+                .when(open, |slot| {
+                    slot.child(
+                        deferred(
+                            div()
+                                .absolute()
+                                .top(px(24.0))
+                                .right_0()
+                                .child(self.render_run_menu(id, key, cx)),
+                        )
+                        .with_priority(2),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The Run menu: the models and efforts of the settings, and Run.
+    fn render_run_menu(
+        &self,
+        id: CommentId,
+        key: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let settings = cx.global::<AppContext>().runs.settings();
+        let (model, effort) = self.run_choice(id, cx);
+        let section = |title: &'static str| {
+            div()
+                .px_2()
+                .pt_1()
+                .text_xs()
+                .text_color(colors.text_placeholder)
+                .child(title)
+        };
+        let option = |index: usize, label: String, selected: bool| {
+            div()
+                .id((key.clone(), 100 + index))
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .whitespace_nowrap()
+                .cursor_pointer()
+                .text_color(colors.text)
+                .hover(|style| style.bg(colors.element_hover))
+                .child(
+                    div()
+                        .w(px(12.0))
+                        .flex_none()
+                        .text_color(colors.accent)
+                        .child(if selected { "✓" } else { "" }),
+                )
+                .child(label)
+        };
+        let models = settings.models.iter().enumerate().map(|(index, name)| {
+            let name = name.clone();
+            option(index, name.clone(), name == model).on_click(cx.listener(
+                move |this, _, _, cx| this.pick_run_option(id, Some(name.clone()), None, cx),
+            ))
+        });
+        let offset = settings.models.len();
+        let efforts = settings.efforts.iter().enumerate().map(|(index, name)| {
+            let name = name.clone();
+            option(offset + index, name.clone(), name == effort).on_click(cx.listener(
+                move |this, _, _, cx| this.pick_run_option(id, None, Some(name.clone()), cx),
+            ))
+        });
+        let effort_note = cx
+            .global::<AppContext>()
+            .runs
+            .claude_status()
+            .warning()
+            .map(|_| {
+                div()
+                    .px_2()
+                    .text_xs()
+                    .text_color(colors.warning)
+                    .child("This Claude Code ignores the effort.")
+            });
+        div()
+            .id((key.clone(), 99))
+            .occlude()
+            .flex()
+            .flex_col()
+            .min_w(px(180.0))
+            .p_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.elevated_surface)
+            .shadow_lg()
+            .text_sm()
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                if this.threads.run_menu == Some(id) {
+                    this.threads.run_menu = None;
+                    this.threads.run_menu_closed = Some((id, Instant::now()));
+                    cx.notify();
+                }
+            }))
+            .child(section("MODEL"))
+            .children(models)
+            .child(section("EFFORT"))
+            .children(efforts)
+            .children(effort_note)
+            .child(div().my_0p5().h(px(1.0)).bg(colors.border_variant))
+            .child(
+                div().p_0p5().child(
+                    primary_button(
+                        (key.clone(), 98),
+                        format!("Run · {}", choice_label(&model, &effort)),
+                        cx,
+                    )
+                    .w_full()
+                    .h(px(24.0))
+                    .text_xs()
+                    .on_click(cx.listener(move |this, _, _, cx| this.request_run(id, cx))),
+                ),
+            )
             .into_any_element()
     }
 
@@ -1719,4 +2054,13 @@ fn confirm_bar(
                 .on_click(on_yes),
         )
         .into_any_element()
+}
+
+/// `sonnet · medium`, or just the model without an effort.
+fn choice_label(model: &str, effort: &str) -> String {
+    if effort.is_empty() {
+        model.to_owned()
+    } else {
+        format!("{model} · {effort}")
+    }
 }

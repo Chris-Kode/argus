@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{OptionalExtension as _, Row, params};
 
 use crate::error::Result;
-use crate::model::{CommentId, RunId, RunKind, RunStatus};
+use crate::model::{CommentId, RepoId, RunId, RunKind, RunStatus};
 use crate::writer::PendingEvent;
 use crate::{StorageService, expect_changed, now_ms, path_to_text};
 
@@ -120,6 +120,21 @@ pub struct RunEvent {
     pub event_type: String,
     /// The raw JSON line.
     pub json: String,
+}
+
+/// A run with the comment it works on, as the run panel lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunListing {
+    /// The run.
+    pub run: Run,
+    /// File path of the comment, in head.
+    pub file_path: String,
+    /// First line of the comment's range.
+    pub start_line: u32,
+    /// Last line of the comment's range.
+    pub end_line: u32,
+    /// The comment's Markdown body.
+    pub body_md: String,
 }
 
 const COLUMNS: &str = "id, comment_id, kind, session_id, model, effort, worktree_path, \
@@ -332,6 +347,43 @@ impl RunStore {
                      ORDER BY created_at, id"
                 ))?;
                 let rows = stmt.query_map([], from_row)?;
+                Ok(rows.collect::<rusqlite::Result<_>>()?)
+            })
+            .await
+    }
+
+    /// Lists the newest `limit` comment runs of a repository, newest first,
+    /// with their comment's location and body. Runs whose comment was
+    /// deleted are left out: nothing ties them to a repository any more.
+    pub async fn list_recent_for_repo(
+        &self,
+        repo_id: RepoId,
+        limit: usize,
+    ) -> Result<Vec<RunListing>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.service
+            .call("RunStore::list_recent_for_repo", move |conn| {
+                let columns = COLUMNS
+                    .split(", ")
+                    .map(|column| format!("r.{}", column.trim()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut stmt = conn.prepare_cached(&format!(
+                    "SELECT {columns}, c.file_path, c.start_line, c.end_line, c.body_md
+                     FROM runs r JOIN comments c ON c.id = r.comment_id
+                     WHERE c.repo_id = ?1
+                     ORDER BY r.created_at DESC, r.id DESC
+                     LIMIT ?2"
+                ))?;
+                let rows = stmt.query_map(params![repo_id, limit], |row| {
+                    Ok(RunListing {
+                        run: from_row(row)?,
+                        file_path: row.get(18)?,
+                        start_line: row.get(19)?,
+                        end_line: row.get(20)?,
+                        body_md: row.get(21)?,
+                    })
+                })?;
                 Ok(rows.collect::<rusqlite::Result<_>>()?)
             })
             .await
