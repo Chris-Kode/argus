@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+description = "Argus dev tasks: `cargo xtask bundle` packages the app, `cargo xtask fixtures` builds the perf fixture repos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true

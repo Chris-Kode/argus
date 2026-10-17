@@ -1,0 +1,3 @@
+# `cargo xtask <command>` runs the repository's dev tasks (see xtask/).
+[alias]
+xtask = "run --package xtask --"

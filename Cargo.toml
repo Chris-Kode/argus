@@ -8,6 +8,18 @@ members = [
     "crates/argus_highlight",
     "crates/argus_runs",
     "crates/argus_store",
+    "xtask",
+]
+# `cargo run` / `cargo build` without `-p` stay on the app; `xtask` is a dev
+# tool reached through the `cargo xtask` alias (.cargo/config.toml).
+default-members = [
+    "crates/argus",
+    "crates/argus_ui",
+    "crates/argus_git",
+    "crates/argus_diff",
+    "crates/argus_highlight",
+    "crates/argus_runs",
+    "crates/argus_store",
 ]
 
 [workspace.package]
@@ -37,6 +49,15 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fb690677
 # later issues; keep versions here so every crate uses the same ones.
 anyhow = "1.0.104"
 gix = "0.89.0"
+# The imara-diff fork maintained by gitoxide; the same crate gix diffs with.
+# Process-group signals for Stop (`kill(-pgid, …)`).
+libc = "0.2.190"
+imara-diff = { package = "gix-imara-diff", version = "0.3.1" }
+# Watches a proposal's worktree for manual edits (CC0-1.0).
+notify = "8.2.0"
+# Markdown parsing of comment bodies (MIT). No default features: the HTML
+# renderer and its CLI are not needed.
+pulldown-cmark = { version = "0.13.4", default-features = false }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -52,5 +73,39 @@ tokio = { version = "1.53.3", features = [
     "time",
 ] }
 tracing = "0.1.44"
+# Tree-sitter and the bundled grammars of `argus_highlight` (all MIT).
+tree-sitter = "0.27.1"
+tree-sitter-highlight = "0.27.1"
+tree-sitter-bash = "0.25.1"
+tree-sitter-c = "0.24.2"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-css = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-html = "0.23.2"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-kotlin-ng = "1.1.0"
+tree-sitter-md = "0.5.3"
+tree-sitter-php = "0.25.1"
+tree-sitter-python = "0.25.0"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-rust = "0.24.2"
+tree-sitter-sequel = "0.3.11"
+tree-sitter-swift = "0.7.4"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-yaml = "0.7.2"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Grapheme boundaries for the comment editor's caret.
+unicode-segmentation = "1.13.3"
 uuid = { version = "1.28.0", features = ["serde", "v7"] }
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+
+# Shipped builds (`cargo xtask bundle`): whole-crate-graph thin LTO, one
+# codegen unit and no symbols trade build time for a smaller, faster binary.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -3,12 +3,21 @@
 //! Keep this crate thin: services live in the library crates so they can be
 //! exercised without a window (spec §4.1). This crate only wires them up.
 
+mod cli;
 mod logging;
 mod paths;
 
 use anyhow::Context as _;
 
 fn main() -> anyhow::Result<()> {
+    let launched = std::time::Instant::now();
+    let launch = match cli::parse(std::env::args_os(), launched)? {
+        cli::Command::Run(launch) => launch,
+        cli::Command::Print(text) => {
+            println!("{text}");
+            return Ok(());
+        }
+    };
     let argus_home = paths::argus_home();
     logging::init(&argus_home).with_context(|| {
         format!(
@@ -32,7 +41,27 @@ fn main() -> anyhow::Result<()> {
         "starting Argus"
     );
 
-    argus_ui::run_gpui_app(runtime.handle().clone());
+    // Opening runs the migrations on the storage thread; the main thread only
+    // waits for it here, before the UI exists. A database from a newer Argus
+    // is refused rather than touched.
+    let db_path = argus_store::database_path(&argus_home);
+    let store = runtime
+        .block_on(argus_store::StorageService::open(db_path.clone()))
+        .with_context(|| format!("failed to open the database at {}", db_path.display()))?;
+
+    // Worktrees live under `<argus_home>/worktrees`; runs left active by a
+    // previous session are marked interrupted before any new run can start.
+    let worktrees = runtime
+        .block_on(argus_ui::open_worktrees(&argus_home, &store))
+        .context("failed to prepare the worktrees directory")?;
+
+    argus_ui::run_gpui_app(
+        runtime.handle().clone(),
+        store,
+        worktrees,
+        argus_home,
+        launch,
+    );
 
     tracing::info!("Argus exited");
     Ok(())
