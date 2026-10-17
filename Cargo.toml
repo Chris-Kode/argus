@@ -80,3 +80,4 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-yaml = "0.7.2"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.28.0", features = ["serde", "v7"] }
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }

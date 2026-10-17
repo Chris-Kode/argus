@@ -55,6 +55,7 @@ pub mod layout;
 mod model;
 mod options;
 mod renames;
+pub mod review;
 mod session;
 mod text;
 mod xdiff;
