@@ -42,8 +42,8 @@ use gpui::{
 };
 
 use super::{
-    Anchor, COMMENT_COLUMN_WIDTH, DiffView, FileState, LineSelection, ListStatus, SCROLLBAR_WIDTH,
-    SPLIT_DIVIDER_WIDTH, side_index,
+    Anchor, COMMENT_COLUMN_WIDTH, DiffView, FileState, LineSelection, ListStatus,
+    PROPOSAL_COMMENT_HINT, SCROLLBAR_WIDTH, SPLIT_DIVIDER_WIDTH, side_index,
 };
 use crate::components::{button, chip, disabled_button, primary_button, status_chip};
 use crate::keymap::SubmitComment;
@@ -681,6 +681,11 @@ impl DiffView {
 
     /// `c`: comments on the gutter selection, or on the first line in view.
     pub fn comment_on_current_line(&mut self, cx: &mut Context<Self>) {
+        if self.proposal {
+            self.hint = Some(PROPOSAL_COMMENT_HINT.into());
+            cx.notify();
+            return;
+        }
         if let Some(selection) = self.selection {
             match self.selection() {
                 Some(Ok(lines)) => {
@@ -986,6 +991,13 @@ impl DiffView {
         if let Some(file) = self.comment_file(id) {
             self.replace_threads(file, cx);
         }
+    }
+
+    /// Asks the workspace to open the comment's proposal in its own tab.
+    fn view_proposal(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        self.threads.menu = None;
+        cx.emit(super::DiffViewEvent::ViewProposal(id));
+        cx.notify();
     }
 
     fn request_delete(&mut self, id: CommentId, cx: &mut Context<Self>) {
@@ -1560,6 +1572,16 @@ impl DiffView {
             .child(meta)
             .children(preview)
             .children(replies)
+            .when(comment.status == CommentStatus::Proposed, |header| {
+                header.child(
+                    button((key.clone(), 3), "View proposal", cx)
+                        .flex_none()
+                        .h(px(20.0))
+                        .text_xs()
+                        .text_color(colors.accent)
+                        .on_click(cx.listener(move |this, _, _, cx| this.view_proposal(id, cx))),
+                )
+            })
             .child(menu_button);
 
         let body = (!collapsed).then(|| {
@@ -1761,9 +1783,18 @@ impl DiffView {
             )
             .children(status_item)
             .child(div().my_0p5().h(px(1.0)).bg(colors.border_variant))
-            // Runs (#21) and proposals (#22) plug in here.
+            // Runs plug in here with #21.
             .child(item(3, "Run with Claude… (soon)", false))
-            .child(item(4, "View proposal (soon)", false))
+            .child(
+                item(
+                    4,
+                    "View proposal",
+                    comment.status == CommentStatus::Proposed,
+                )
+                .when(comment.status == CommentStatus::Proposed, |item| {
+                    item.on_click(cx.listener(move |this, _, _, cx| this.view_proposal(id, cx)))
+                }),
+            )
             .children(debug_item)
             .into_any_element()
     }

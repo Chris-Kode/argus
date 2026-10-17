@@ -105,6 +105,45 @@ const MIGRATIONS: &[&str] = &[
         value_json  TEXT NOT NULL
     );
     "#,
+    // 2: runs can be `rejected` (the user rejected the proposal, #22). SQLite
+    // cannot alter a CHECK constraint, so the table is rebuilt; `run` turns
+    // foreign keys off around migrations, so dropping the old table does not
+    // cascade into `run_events` and `accepts`.
+    r#"
+    CREATE TABLE runs_new (
+        id             TEXT PRIMARY KEY NOT NULL,
+        comment_id     TEXT REFERENCES comments(id) ON DELETE SET NULL,
+        kind           TEXT NOT NULL CHECK (kind IN ('comment', 'followup', 'resolve')),
+        session_id     TEXT NOT NULL,
+        model          TEXT NOT NULL,
+        effort         TEXT NOT NULL,
+        worktree_path  TEXT NOT NULL,
+        start_sha      TEXT NOT NULL,
+        prompt         TEXT NOT NULL,
+        status         TEXT NOT NULL CHECK (status IN
+                           ('queued', 'running', 'succeeded', 'no_changes', 'failed', 'stopped',
+                            'rejected')),
+        exit_code      INTEGER,
+        cost_usd       REAL,
+        num_turns      INTEGER,
+        duration_ms    INTEGER,
+        summary        TEXT,
+        error          TEXT,
+        created_at     INTEGER NOT NULL,
+        finished_at    INTEGER
+    );
+    INSERT INTO runs_new (id, comment_id, kind, session_id, model, effort, worktree_path,
+                          start_sha, prompt, status, exit_code, cost_usd, num_turns,
+                          duration_ms, summary, error, created_at, finished_at)
+        SELECT id, comment_id, kind, session_id, model, effort, worktree_path, start_sha,
+               prompt, status, exit_code, cost_usd, num_turns, duration_ms, summary, error,
+               created_at, finished_at
+        FROM runs;
+    DROP TABLE runs;
+    ALTER TABLE runs_new RENAME TO runs;
+    CREATE INDEX runs_comment ON runs(comment_id);
+    CREATE INDEX runs_status ON runs(status);
+    "#,
 ];
 
 /// Newest schema version this build understands.
@@ -140,10 +179,36 @@ pub fn run(conn: &mut Connection, path: &Path) -> Result<()> {
         });
     }
 
+    if current == SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // Table rebuilds drop the old table; with foreign keys on, that would
+    // cascade-delete its children. The pragma is a no-op inside a
+    // transaction, so it is switched around the whole loop, and each
+    // migration checks the keys itself before it commits.
+    let enforced: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = apply(conn, current);
+    conn.pragma_update(None, "foreign_keys", enforced)?;
+    result
+}
+
+fn apply(conn: &mut Connection, current: i64) -> Result<()> {
     for (index, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
         let version = index as i64 + 1;
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
+        let violations: i64 =
+            tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if violations > 0 {
+            return Err(StoreError::Migration {
+                version,
+                message: format!("{violations} foreign key violations"),
+            });
+        }
         tx.execute(
             "INSERT INTO schema_version (id, version) VALUES (1, ?1)
              ON CONFLICT(id) DO UPDATE SET version = excluded.version",
@@ -152,6 +217,5 @@ pub fn run(conn: &mut Connection, path: &Path) -> Result<()> {
         tx.commit()?;
         tracing::info!(version, "applied storage migration");
     }
-
     Ok(())
 }

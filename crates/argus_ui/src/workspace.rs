@@ -5,8 +5,11 @@
 //! the title bar hosts its branch pickers, swap and Fetch buttons. Each
 //! resolved comparison gets a [`DiffView`] in the center. The left dock has
 //! two tabs: the file tree (#8), with comment-count badges, and the comment
-//! list (#14); runs (#21) plug into the right or bottom dock. Settings, the repository list and git are read and written on the
-//! tokio runtime; this view only receives the results.
+//! list (#14); runs (#21) plug into the right or bottom dock. "View proposal"
+//! on a `Proposed` comment opens a [`ProposalView`] tab next to the main diff
+//! tab (#22); the navigation keys follow the active tab. Settings, the
+//! repository list and git are read and written on the tokio runtime; this
+//! view only receives the results.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -44,6 +47,7 @@ use crate::keymap::{
     ToggleKeyboardShortcuts, ToggleRunPanel, ToggleRunPanelPosition, ToggleSoftWrap,
     WORKSPACE_CONTEXT,
 };
+use crate::proposal::{ProposalEvent, ProposalSource, ProposalView};
 use crate::runtime::spawn_job;
 use crate::session::{
     BranchList, Comparison, DiffTarget, RepoSession, SessionEvent, Side, open_repository,
@@ -115,6 +119,12 @@ struct Notice {
     is_error: bool,
 }
 
+/// An open proposal tab and its subscription.
+struct ProposalTab {
+    view: Entity<ProposalView>,
+    _subscription: Subscription,
+}
+
 /// The open branch picker and its subscription.
 struct OpenPicker {
     picker: Entity<BranchPicker>,
@@ -140,6 +150,12 @@ pub struct Workspace {
     outdated_comments: Vec<argus_diff::review::CommentId>,
     diff_view: Option<Entity<DiffView>>,
     diff_subscription: Option<Subscription>,
+    /// Proposal tabs, after the main diff tab.
+    proposals: Vec<ProposalTab>,
+    /// The proposal tab shown in the center; `None` shows the main diff.
+    active_proposal: Option<usize>,
+    /// Focus the workspace at the next render (e.g. after leaving a tab).
+    focus_requested: bool,
     /// "Viewed" marks of the last closed diff view, by (base, head), so a
     /// refresh of the same branches keeps them.
     viewed_stash: Option<(String, String, HashSet<String>)>,
@@ -199,6 +215,9 @@ impl Workspace {
             outdated_comments: Vec::new(),
             diff_view: None,
             diff_subscription: None,
+            proposals: Vec::new(),
+            active_proposal: None,
+            focus_requested: false,
             viewed_stash: None,
             picker: None,
             picker_closed: None,
@@ -317,6 +336,10 @@ impl Workspace {
         if let Some(view) = self.diff_view.clone() {
             view.update(cx, |view, cx| view.set_options(options, cx));
         }
+        for tab in &self.proposals {
+            tab.view
+                .update(cx, |view, cx| view.set_options(options, cx));
+        }
     }
 
     fn change_font_size(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
@@ -402,6 +425,8 @@ impl Workspace {
             old.update(cx, |tree, cx| tree.shutdown(cx));
         }
         self.close_diff(cx);
+        self.proposals.clear();
+        self.active_proposal = None;
         self.viewed_stash = None;
         let session = cx.new(|cx| RepoSession::new(record, repo, cx));
         let flat = self.settings.file_tree.flat_list;
@@ -430,12 +455,14 @@ impl Workspace {
                 |this, _, event: &CommentListEvent, cx| match event {
                     CommentListEvent::Open(id) => {
                         let id = *id;
-                        this.update_diff(cx, |view, cx| view.reveal_comment(id, cx));
+                        this.activate_tab(None, cx);
+                        this.update_main_diff(cx, |view, cx| view.reveal_comment(id, cx));
                     }
                     CommentListEvent::Reattach(id) => {
                         let id = *id;
                         if this.diff_view.is_some() {
-                            this.update_diff(cx, |view, cx| view.start_reattach(id, cx));
+                            this.activate_tab(None, cx);
+                            this.update_main_diff(cx, |view, cx| view.start_reattach(id, cx));
                         } else {
                             this.notice = Some(Notice {
                                 message: "Open the diff to pick the new lines.".into(),
@@ -451,7 +478,8 @@ impl Workspace {
                 |this, _, event: &FileTreeEvent, cx| match event {
                     FileTreeEvent::OpenFile { index, .. } => {
                         let index = *index;
-                        this.update_diff(cx, |view, cx| view.reveal_file(index, cx));
+                        this.activate_tab(None, cx);
+                        this.update_main_diff(cx, |view, cx| view.reveal_file(index, cx));
                     }
                     FileTreeEvent::OpenOutdated(item) => {
                         // Outdated comments are not inline: the Comments tab
@@ -591,6 +619,11 @@ impl Workspace {
                     DiffViewEvent::SelectionRejected(hint) => {
                         tracing::debug!(%hint, "selection rejected");
                     }
+                    DiffViewEvent::ViewProposal(id) => {
+                        this.open_proposal(ProposalSource::Comment(*id), cx);
+                    }
+                    // Only proposal diffs offer "Open in editor".
+                    DiffViewEvent::OpenInEditor(_) => {}
                 }),
             );
         self.diff_view = Some(view);
@@ -634,7 +667,30 @@ impl Workspace {
         }
     }
 
+    /// The diff view of the active tab: the main diff, or the open
+    /// proposal's.
+    fn active_diff(&self, cx: &gpui::App) -> Option<Entity<DiffView>> {
+        match self
+            .active_proposal
+            .and_then(|index| self.proposals.get(index))
+        {
+            Some(tab) => tab.view.read(cx).diff_view(),
+            None => self.diff_view.clone(),
+        }
+    }
+
     fn update_diff(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut DiffView, &mut Context<DiffView>),
+    ) {
+        if let Some(view) = self.active_diff(cx) {
+            view.update(cx, f);
+        }
+    }
+
+    /// Like [`Self::update_diff`], always on the main diff.
+    fn update_main_diff(
         &mut self,
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut DiffView, &mut Context<DiffView>),
@@ -642,6 +698,137 @@ impl Workspace {
         if let Some(view) = self.diff_view.clone() {
             view.update(cx, f);
         }
+    }
+
+    // ---- proposal tabs ------------------------------------------------------
+
+    /// Shows the proposal of `source` in its tab, opening one if needed.
+    fn open_proposal(&mut self, source: ProposalSource, cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .proposals
+            .iter()
+            .position(|tab| tab.view.read(cx).shows(source))
+        {
+            self.activate_tab(Some(index), cx);
+            return;
+        }
+        let display = self.diff_options();
+        let view = cx.new(|cx| ProposalView::new(source, display, cx));
+        let subscription = cx.subscribe(&view, Self::proposal_event);
+        self.proposals.push(ProposalTab {
+            view,
+            _subscription: subscription,
+        });
+        self.activate_tab(Some(self.proposals.len() - 1), cx);
+    }
+
+    /// Shows the main diff (`None`) or a proposal tab, and moves the focus
+    /// there.
+    fn activate_tab(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        self.active_proposal = index.filter(|&index| index < self.proposals.len());
+        match self.active_proposal {
+            Some(index) => {
+                let view = self.proposals[index].view.clone();
+                view.update(cx, |view, cx| view.request_focus(cx));
+            }
+            None => self.focus_requested = true,
+        }
+        cx.notify();
+    }
+
+    /// Closes a proposal tab; the proposal itself stays until it is
+    /// accepted or rejected.
+    fn close_proposal(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.proposals.len() {
+            return;
+        }
+        self.proposals.remove(index);
+        let active = match self.active_proposal {
+            Some(active) if active == index => {
+                // The tab to the left, or the main diff.
+                index
+                    .checked_sub(1)
+                    .or((!self.proposals.is_empty()).then_some(0))
+            }
+            Some(active) if active > index => Some(active - 1),
+            other => other,
+        };
+        self.activate_tab(active, cx);
+    }
+
+    fn proposal_event(
+        &mut self,
+        view: Entity<ProposalView>,
+        event: &ProposalEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ProposalEvent::RevealComment(id) => {
+                let id = *id;
+                self.activate_tab(None, cx);
+                self.update_main_diff(cx, |view, cx| view.reveal_comment(id, cx));
+                if let Some(list) = self.comment_list.clone() {
+                    list.update(cx, |list, cx| list.select(id, cx));
+                }
+            }
+            ProposalEvent::Notice { message, is_error } => {
+                self.notice = Some(Notice {
+                    message: message.clone(),
+                    is_error: *is_error,
+                });
+                cx.notify();
+            }
+            ProposalEvent::AcceptRequested(run_id) => {
+                // Accept (integration worktree, commit message, CAS ref
+                // update) lands with #24.
+                tracing::debug!(run = %run_id, "accept requested");
+                self.notice = Some(Notice {
+                    message: "Accept is not available yet (#24); the proposal stays open.".into(),
+                    is_error: false,
+                });
+                cx.notify();
+            }
+            ProposalEvent::Replied {
+                comment_id, run_id, ..
+            } => {
+                // Starting the follow-up run (`--resume` in the same
+                // worktree) lands with #23; the reply is in the thread.
+                tracing::debug!(comment = %comment_id, run = %run_id, "proposal reply saved");
+                if let Some(session) = self.session.clone() {
+                    let comments = session.read(cx).comments().clone();
+                    comments.update(cx, |comments, cx| comments.reload(cx));
+                }
+                self.notice = Some(Notice {
+                    message: "Reply saved in the thread. Follow-up runs are not available yet \
+                              (#23)."
+                        .into(),
+                    is_error: false,
+                });
+                cx.notify();
+            }
+            ProposalEvent::Rejected(_) => {
+                if let Some(index) = self.proposals.iter().position(|tab| tab.view == view) {
+                    self.close_proposal(index, cx);
+                }
+                self.notice = Some(Notice {
+                    message: "Proposal rejected: its worktree is deleted and the comment is open \
+                              again."
+                        .into(),
+                    is_error: false,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// `a` outside a proposal tab: there is nothing to accept here.
+    fn accept(&mut self, _: &Accept, _: &mut Window, cx: &mut Context<Self>) {
+        self.notice = Some(Notice {
+            message: "Open a proposal (\"View proposal\" on a Proposed comment) to accept it."
+                .into(),
+            is_error: false,
+        });
+        cx.notify();
     }
 
     fn comment(&mut self, _: &Comment, _: &mut Window, cx: &mut Context<Self>) {
@@ -876,7 +1063,7 @@ impl Workspace {
             .as_ref()
             .is_some_and(|view| view.read(cx).is_reattaching())
         {
-            self.update_diff(cx, |view, cx| view.cancel_reattach(cx));
+            self.update_main_diff(cx, |view, cx| view.cancel_reattach(cx));
         } else {
             cx.propagate();
         }
@@ -950,7 +1137,7 @@ impl Workspace {
     /// [`DiffViewEvent::ActiveFileChanged`]. Without a diff view, the tree's
     /// own display order.
     fn step_file(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if let Some(view) = self.diff_view.clone() {
+        if let Some(view) = self.active_diff(cx) {
             view.update(cx, |view, cx| {
                 if delta > 0 {
                     view.next_file(cx);
@@ -1004,7 +1191,7 @@ impl Workspace {
     }
 
     /// Placeholder handler for review actions whose views land in later
-    /// issues (runs #21, accept).
+    /// issues (runs #21).
     fn not_wired_yet<A: Action>(&mut self, action: &A, _: &mut Window, _: &mut Context<Self>) {
         tracing::debug!(action = action.name(), "action not wired yet");
     }
@@ -1507,10 +1694,106 @@ impl Workspace {
             Some(_) => "Diff".into(),
             None => "Welcome".into(),
         };
-        let content = match self.session.clone() {
-            Some(session) => self.render_comparison(session.read(cx), cx),
-            None => self.render_empty_state(cx).into_any_element(),
+        let active = self
+            .active_proposal
+            .and_then(|index| self.proposals.get(index).map(|tab| (index, tab)));
+        let content = match (active, self.session.clone()) {
+            (Some((_, tab)), _) => tab.view.clone().into_any_element(),
+            (None, Some(session)) => self.render_comparison(session.read(cx), cx),
+            (None, None) => self.render_empty_state(cx).into_any_element(),
         };
+        let active_index = active.map(|(index, _)| index);
+        let tab = |id: gpui::ElementId,
+                   title: SharedString,
+                   is_active: bool,
+                   target: Option<usize>,
+                   cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .relative()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .h_full()
+                .px_3()
+                .max_w(px(320.0))
+                .border_r_1()
+                .border_color(colors.border)
+                .text_sm()
+                .cursor_pointer()
+                .when(is_active, |tab| tab.bg(colors.background))
+                .when(!is_active, |tab| {
+                    tab.hover(|style| style.bg(colors.element_hover))
+                })
+                .text_color(if is_active {
+                    colors.text
+                } else {
+                    colors.text_muted
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.activate_tab(target, cx);
+                    if target.is_none() {
+                        window.focus(&this.focus_handle, cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(title),
+                )
+                // Active-tab marker.
+                .when(is_active, |tab| {
+                    tab.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(2.0))
+                            .bg(colors.accent),
+                    )
+                })
+        };
+        let main_tab = tab(
+            "center-tab-main".into(),
+            tab_title,
+            active_index.is_none(),
+            None,
+            cx,
+        );
+        let proposal_tabs: Vec<AnyElement> = self
+            .proposals
+            .iter()
+            .enumerate()
+            .map(|(index, proposal)| {
+                let title = proposal.view.read(cx).title();
+                let close = div()
+                    .id(("center-tab-close", index))
+                    .flex_none()
+                    .px_1()
+                    .rounded_sm()
+                    .text_color(colors.text_muted)
+                    .hover(|style| style.bg(colors.element_selected))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.close_proposal(index, cx);
+                    }))
+                    .child("×");
+                tab(
+                    ("center-tab-proposal", index).into(),
+                    title,
+                    active_index == Some(index),
+                    Some(index),
+                    cx,
+                )
+                .child(close)
+                .into_any_element()
+            })
+            .collect();
         div()
             .flex()
             .flex_col()
@@ -1519,38 +1802,18 @@ impl Workspace {
             .min_h_0()
             .bg(colors.background)
             .child(
-                // Tab bar: the main diff tab; proposal tabs join it later.
+                // Tab bar: the main diff, then one tab per open proposal.
                 div()
+                    .id("center-tabs")
                     .flex()
                     .flex_none()
                     .h(px(32.0))
+                    .overflow_x_scroll()
                     .bg(colors.surface)
                     .border_b_1()
                     .border_color(colors.border)
-                    .child(
-                        div()
-                            .relative()
-                            .flex()
-                            .items_center()
-                            .h_full()
-                            .px_3()
-                            .bg(colors.background)
-                            .border_r_1()
-                            .border_color(colors.border)
-                            .text_sm()
-                            .text_color(colors.text)
-                            .child(tab_title)
-                            // Active-tab marker.
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .right_0()
-                                    .h(px(2.0))
-                                    .bg(colors.accent),
-                            ),
-                    ),
+                    .child(main_tab)
+                    .children(proposal_tabs),
             )
             .child(content)
     }
@@ -2313,6 +2576,9 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.focus_requested) {
+            window.focus(&self.focus_handle, cx);
+        }
         let theme = cx.theme().clone();
         // Rem-based spacing and text sizes scale with the UI font size, as in
         // Zed.
@@ -2401,7 +2667,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_comment_list))
             .on_action(cx.listener(Self::advance_comment_status))
             .on_action(cx.listener(Self::run))
-            .on_action(cx.listener(Self::not_wired_yet::<Accept>))
+            .on_action(cx.listener(Self::accept))
             .child(self.render_title_bar(cx))
             .children(self.render_claude_banner(cx))
             .child(body)

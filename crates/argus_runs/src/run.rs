@@ -101,6 +101,14 @@ pub enum RunUpdate {
     /// The run reached a terminal status, stored with its comment's new
     /// status.
     Finished(RunFinished),
+    /// The user rejected the run's proposal: its worktree is gone, the run
+    /// is `Rejected` and its comment back to `Open`.
+    Rejected {
+        /// The run.
+        run_id: RunId,
+        /// The comment it worked on.
+        comment_id: Option<CommentId>,
+    },
 }
 
 /// The outcome of a finished run, as published.
@@ -187,7 +195,7 @@ impl Services {
         }
     }
 
-    fn publish(&self, update: RunUpdate) {
+    pub(crate) fn publish(&self, update: RunUpdate) {
         // No subscriber is fine: nothing is showing runs.
         let _ = self.status.send(update);
     }

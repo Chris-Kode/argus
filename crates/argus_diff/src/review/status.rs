@@ -40,10 +40,11 @@ pub enum CommentEvent {
 
 impl CommentEvent {
     /// The event a finished run produces, from its final status. `None` for
-    /// a run still queued or running.
+    /// a run still queued or running, and for a rejected one (Reject applies
+    /// [`CommentEvent::Rejected`] itself).
     pub fn from_run_status(status: RunStatus) -> Option<Self> {
         match status {
-            RunStatus::Queued | RunStatus::Running => None,
+            RunStatus::Queued | RunStatus::Running | RunStatus::Rejected => None,
             RunStatus::Succeeded => Some(Self::RunSucceeded),
             RunStatus::NoChanges => Some(Self::RunEmpty),
             RunStatus::Failed => Some(Self::RunFailed),

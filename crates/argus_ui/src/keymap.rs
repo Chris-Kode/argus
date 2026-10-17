@@ -27,6 +27,10 @@ actions!(
         Run,
         /// Accept the open proposal.
         Accept,
+        /// Reject the open proposal (asks first; press again to confirm).
+        RejectProposal,
+        /// Reply to the open proposal, starting a follow-up.
+        ReplyToProposal,
         /// Open the settings sheet.
         OpenSettings,
         /// Pick a repository to open.
@@ -139,6 +143,9 @@ pub const TEXT_INPUT_CONTEXT: &str = "TextInput";
 /// Key context set on the file tree dock.
 pub const FILE_TREE_CONTEXT: &str = "FileTree";
 
+/// Key context set on a proposal tab.
+pub const PROPOSAL_CONTEXT: &str = "Proposal";
+
 /// Key context of the multi-line comment editor (set together with
 /// [`TEXT_INPUT_CONTEXT`]).
 pub const COMMENT_EDITOR_CONTEXT: &str = "CommentEditor";
@@ -148,6 +155,10 @@ const COMMENT_EDITOR: Option<&str> = Some("CommentEditor");
 
 /// Predicate for single-key navigation shortcuts.
 const NAVIGATION: Option<&str> = Some("Workspace && !TextInput");
+
+/// Predicate for a proposal tab's keys; deeper than [`NAVIGATION`], so `r`
+/// replies there instead of running.
+const PROPOSAL: Option<&str> = Some("Proposal && !TextInput");
 
 /// Predicate for the file tree's own keys (the filter box handles the arrows
 /// itself).
@@ -280,6 +291,20 @@ pub const SHORTCUTS: &[Shortcut] = &[
         "Run the comment with Claude"
     ),
     shortcut!("a", Accept, NAVIGATION, "Review", "Accept the proposal"),
+    shortcut!(
+        "x",
+        RejectProposal,
+        PROPOSAL,
+        "Review",
+        "Reject the proposal"
+    ),
+    shortcut!(
+        "r",
+        ReplyToProposal,
+        PROPOSAL,
+        "Review",
+        "Reply to the proposal"
+    ),
     shortcut!(
         "secondary-enter",
         SubmitComment,

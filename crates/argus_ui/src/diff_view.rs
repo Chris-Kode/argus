@@ -145,6 +145,8 @@ const OLD_GROUP: &str = "diff-line-old";
 const NEW_GROUP: &str = "diff-line-new";
 /// Width of the rule between the two columns of a side-by-side row.
 const SPLIT_DIVIDER_WIDTH: Pixels = px(1.0);
+/// Why a proposal diff takes no comments.
+const PROPOSAL_COMMENT_HINT: &str = "Comment on the main diff; reply here to steer Claude.";
 
 /// A resolved line selection: what a comment anchors to (spec §7.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +175,11 @@ pub enum DiffViewEvent {
     /// The file under the top of the viewport changed (file-list index);
     /// the file tree highlights it.
     ActiveFileChanged(usize),
+    /// "View proposal" on a `Proposed` comment thread.
+    ViewProposal(argus_diff::review::CommentId),
+    /// A proposal's "Open in editor" on a changed file (repository-relative
+    /// path).
+    OpenInEditor(String),
 }
 
 /// How lines are displayed; persisted in the UI settings.
@@ -475,6 +482,11 @@ pub struct DiffView {
     /// Focus target after an editor closes, so the shortcuts keep working.
     focus_handle: FocusHandle,
     focus_requested: bool,
+    /// A run's proposal: no comments, files outside the comment's scope
+    /// badged, and "Open in editor" on each file.
+    proposal: bool,
+    /// File to reveal once the file list loads (by path).
+    pending_reveal_path: Option<String>,
 }
 
 impl EventEmitter<DiffViewEvent> for DiffView {}
@@ -537,6 +549,8 @@ impl DiffView {
             render_start: 0,
             focus_handle: cx.focus_handle(),
             focus_requested: false,
+            proposal: false,
+            pending_reveal_path: None,
         };
         this.comments_changed(cx);
         this.load_list(cx);
@@ -548,6 +562,45 @@ impl DiffView {
         })
         .detach();
         this
+    }
+
+    /// The diff of a run's proposal (spec §6.5), with the same rows,
+    /// modes and highlighting as the main diff. It takes no comments (pass
+    /// a [`ReviewComments`] with no review), badges the files the session's
+    /// list marks as out of scope, and offers "Open in editor"
+    /// ([`DiffViewEvent::OpenInEditor`]) on each file that still exists.
+    pub fn new_proposal(
+        session: DiffSession,
+        target: DiffTarget,
+        options: DisplayOptions,
+        viewed: HashSet<String>,
+        comments: Entity<ReviewComments>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::new(session, target, options, viewed, comments, cx);
+        this.proposal = true;
+        this
+    }
+
+    /// The path of the file under the top of the viewport.
+    pub fn active_path(&self) -> Option<String> {
+        let ListStatus::Ready(list) = &self.status else {
+            return self.pending_reveal_path.clone();
+        };
+        let file = self.active_file?;
+        list.entries().get(file).map(|entry| entry.path.clone())
+    }
+
+    /// Scrolls `path`'s header to the top, now or once the file list loads.
+    pub fn reveal_path(&mut self, path: String, cx: &mut Context<Self>) {
+        let ListStatus::Ready(_) = &self.status else {
+            self.pending_reveal_path = Some(path);
+            return;
+        };
+        if let Some(&index) = self.path_index.get(&path) {
+            self.reveal_file(index, cx);
+            cx.notify();
+        }
     }
 
     /// The target this view diffs.
@@ -652,6 +705,9 @@ impl DiffView {
         self.status = ListStatus::Ready(list);
         self.rebuild_starts();
         self.recount_totals();
+        if let Some(path) = self.pending_reveal_path.take() {
+            self.reveal_path(path, cx);
+        }
 
         let mut updates = self.session.stats_updates();
         self.stats_task = Some(cx.spawn(async move |this, cx| {
@@ -1695,6 +1751,9 @@ impl DiffView {
         side: Option<DiffSide>,
         cx: &mut Context<Self>,
     ) {
+        if self.proposal {
+            return;
+        }
         if !self.is_selected(file, row, side) {
             self.selection = Some(Selection {
                 file,
@@ -2208,7 +2267,7 @@ impl DiffView {
             .justify_center()
             .w(COMMENT_COLUMN_WIDTH)
             .h_full()
-            .when(first_segment, |column| {
+            .when(first_segment && !self.proposal, |column| {
                 let accent = colors.accent;
                 column.child(
                     div()
@@ -2487,6 +2546,39 @@ impl DiffView {
                 .child(format!("{} → {}", old.mode(), new.mode()))
         });
         let viewed = slot.viewed;
+        let out_of_scope = self.proposal
+            && matches!(&self.status, ListStatus::Ready(list) if list.is_out_of_scope(file));
+        let scope_badge = out_of_scope.then(|| {
+            div()
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(colors.warning.opacity(0.5))
+                .bg(colors.warning.opacity(0.12))
+                .text_color(colors.warning)
+                .child("outside comment scope")
+        });
+        let open_in_editor = (self.proposal && entry.new.is_some()).then(|| {
+            let id = if sticky {
+                "diff-sticky-open"
+            } else {
+                "diff-header-open"
+            };
+            let path = entry.path.clone();
+            div()
+                .id((id, file))
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(colors.text_muted)
+                .hover(|style| style.bg(colors.element_hover))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(DiffViewEvent::OpenInEditor(path.clone()));
+                }))
+                .child("Open in editor")
+        });
         // Huge files skip highlighting; the user can still ask for it.
         let force_highlight = slot.syntax.too_large().then(|| {
             let id = if sticky {
@@ -2555,10 +2647,12 @@ impl DiffView {
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(file, cx)))
                     .child(path),
             )
+            .children(scope_badge)
             .child(div().flex_none().child(counts))
             .children(mode)
             .child(div().flex_1())
             .children(force_highlight)
+            .children(open_in_editor)
             .child(
                 div()
                     .id((id_base, file * 3 + 2))
@@ -2697,7 +2791,11 @@ impl Render for DiffView {
             }
             ListStatus::Ready(list) if list.is_empty() => {
                 return root.child(placeholder(
-                    "No changes: head has the same tree as the merge-base.",
+                    if self.proposal {
+                        "No changes: the worktree matches the commit the run started from."
+                    } else {
+                        "No changes: head has the same tree as the merge-base."
+                    },
                     cx,
                 ));
             }
