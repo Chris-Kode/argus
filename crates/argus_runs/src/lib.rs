@@ -3,10 +3,13 @@
 //!
 //! Filled in by issues #19 (prompt builder), #20 (run manager: spawn
 //! `claude -p`, parse `stream-json`, parallel runs, stop) and #21–#23 (run
-//! menu, proposal review, follow-up replies). The run defaults of the
-//! settings screen live in [`settings`]; the review rules file in
-//! [`review_rules`].
+//! menu, proposal review, follow-up replies).
+//!
+//! [`prompt`] renders the versioned prompts of comment, follow-up and
+//! resolve runs. The run defaults of the settings screen live in
+//! [`settings`]; the review rules file in [`review_rules`].
 
+pub mod prompt;
 pub mod review_rules;
 pub mod settings;
 

@@ -269,6 +269,7 @@ dependencies = [
 name = "argus_runs"
 version = "0.1.0"
 dependencies = [
+ "argus_diff",
  "argus_store",
  "serde",
  "thiserror 2.0.21",
