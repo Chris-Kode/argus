@@ -3,12 +3,12 @@
 //!
 //! The open repository and its base/head selection live in a [`RepoSession`];
 //! the title bar hosts its branch pickers, swap and Fetch buttons. Each
-//! resolved comparison gets a [`DiffView`] in the center; the file tree (#8),
-//! comments (#14) and runs (#21) plug their views into the slots rendered
-//! here. Settings, the repository list and git are read and written on the
+//! resolved comparison gets a [`DiffView`] in the center. The left dock has
+//! two tabs: the file tree (#8), with comment-count badges, and the comment
+//! list (#14); runs (#21) plug into the right or bottom dock. Settings, the repository list and git are read and written on the
 //! tokio runtime; this view only receives the results.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,8 @@ use gpui::{
 
 use crate::AppContext;
 use crate::branch_picker::{BranchPicker, PickerEvent};
+use crate::comment_list::{CommentList, CommentListEvent};
+use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
     button, disabled_button, kbd, panel_header, placeholder, primary_button, toggle_button,
 };
@@ -30,9 +32,10 @@ use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::fonts::InstalledFonts;
 use crate::jobs::BackgroundJobs;
 use crate::keymap::{
-    Accept, Comment, CycleTheme, DecreaseFontSize, Dismiss, FocusFileFilter, IncreaseFontSize,
-    NextFile, NextHunk, OpenRepository, OpenSettings, PreviousFile, PreviousHunk, ResetFontSize,
-    Run, SHORTCUT_GROUPS, SHORTCUTS, ToggleDiffMode, ToggleFileListMode, ToggleFileTree,
+    Accept, AdvanceCommentStatus, Comment, CycleTheme, DecreaseFontSize, Dismiss, FocusFileFilter,
+    IncreaseFontSize, NextComment, NextFile, NextHunk, OpenRepository, OpenSettings,
+    PreviousComment, PreviousFile, PreviousHunk, ResetFontSize, Run, SHORTCUT_GROUPS, SHORTCUTS,
+    ToggleAllComments, ToggleCommentList, ToggleDiffMode, ToggleFileListMode, ToggleFileTree,
     ToggleKeyboardShortcuts, ToggleRunPanel, ToggleRunPanelPosition, ToggleSoftWrap,
     WORKSPACE_CONTEXT,
 };
@@ -77,6 +80,16 @@ enum DockResize {
     RunPanel,
 }
 
+/// The tabs of the left dock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LeftTab {
+    /// The changed files.
+    #[default]
+    Files,
+    /// The review's comment threads.
+    Comments,
+}
+
 /// A sheet shown over the shell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sheet {
@@ -113,6 +126,11 @@ pub struct Workspace {
     session_subscriptions: Vec<Subscription>,
     /// The changed files of the session's diff (left dock).
     file_tree: Option<Entity<FileTree>>,
+    /// The comment threads of the review (left dock, second tab).
+    comment_list: Option<Entity<CommentList>>,
+    left_tab: LeftTab,
+    /// The outdated comments listed in the file tree, in its order.
+    outdated_comments: Vec<argus_diff::review::CommentId>,
     diff_view: Option<Entity<DiffView>>,
     diff_subscription: Option<Subscription>,
     /// "Viewed" marks of the last closed diff view, by (base, head), so a
@@ -163,6 +181,9 @@ impl Workspace {
             session: None,
             session_subscriptions: Vec::new(),
             file_tree: None,
+            comment_list: None,
+            left_tab: LeftTab::default(),
+            outdated_comments: Vec::new(),
             diff_view: None,
             diff_subscription: None,
             viewed_stash: None,
@@ -364,9 +385,30 @@ impl Workspace {
         let session = cx.new(|cx| RepoSession::new(record, repo, cx));
         let flat = self.settings.file_tree.flat_list;
         let file_tree = cx.new(|cx| FileTree::new(flat, cx));
+        let comments = session.read(cx).comments().clone();
+        let comment_list = cx.new(|cx| CommentList::new(comments.clone(), cx));
+        self.outdated_comments.clear();
         self.session_subscriptions = vec![
             cx.observe(&session, |_, _, cx| cx.notify()),
             cx.observe(&file_tree, |_, _, cx| cx.notify()),
+            cx.observe(&comment_list, |_, _, cx| cx.notify()),
+            cx.subscribe(
+                &comments,
+                |this, comments, event: &ReviewCommentsEvent, cx| {
+                    if let ReviewCommentsEvent::Changed(_) = event {
+                        this.sync_comment_badges(&comments, cx);
+                    }
+                },
+            ),
+            cx.subscribe(
+                &comment_list,
+                |this, _, event: &CommentListEvent, cx| match event {
+                    CommentListEvent::Open(id) => {
+                        let id = *id;
+                        this.update_diff(cx, |view, cx| view.reveal_comment(id, cx));
+                    }
+                },
+            ),
             cx.subscribe(
                 &file_tree,
                 |this, _, event: &FileTreeEvent, cx| match event {
@@ -375,8 +417,14 @@ impl Workspace {
                         this.update_diff(cx, |view, cx| view.reveal_file(index, cx));
                     }
                     FileTreeEvent::OpenOutdated(item) => {
-                        // The outdated-comment view arrives with #15.
-                        tracing::debug!(item, "open outdated comment");
+                        // Shown folded at its stored line; the re-anchoring
+                        // view arrives with #15.
+                        if let Some(&id) = this.outdated_comments.get(*item) {
+                            this.update_diff(cx, |view, cx| view.reveal_comment(id, cx));
+                            if let Some(list) = this.comment_list.clone() {
+                                list.update(cx, |list, cx| list.select(id, cx));
+                            }
+                        }
                     }
                     FileTreeEvent::ModeChanged { flat } => {
                         if this.settings.file_tree.flat_list != *flat {
@@ -411,7 +459,40 @@ impl Workspace {
         ];
         self.session = Some(session);
         self.file_tree = Some(file_tree);
+        self.comment_list = Some(comment_list);
+        self.sync_comment_badges(&comments, cx);
         cx.notify();
+    }
+
+    /// Mirrors the comments into the file tree: a count badge per file and
+    /// the "Outdated" group.
+    fn sync_comment_badges(&mut self, comments: &Entity<ReviewComments>, cx: &mut Context<Self>) {
+        let Some(file_tree) = self.file_tree.clone() else {
+            return;
+        };
+        let snapshot = comments.read(cx).comments().clone();
+        let mut counts: HashMap<SharedString, u32> = HashMap::new();
+        let mut outdated = Vec::new();
+        let mut labels = Vec::new();
+        for comment in snapshot.iter() {
+            if comment.outdated {
+                let first = comment.body_md.lines().next().unwrap_or_default();
+                labels.push(SharedString::from(format!(
+                    "{}:{} · {first}",
+                    comment.anchor.file_path, comment.anchor.start_line
+                )));
+                outdated.push(comment.id);
+            } else {
+                *counts
+                    .entry(comment.anchor.file_path.clone().into())
+                    .or_default() += 1;
+            }
+        }
+        self.outdated_comments = outdated;
+        file_tree.update(cx, |tree, cx| {
+            tree.set_comment_counts(counts, cx);
+            tree.set_outdated(labels, cx);
+        });
     }
 
     // ---- diff view ----------------------------------------------------------
@@ -444,7 +525,14 @@ impl Workspace {
             .map(|(_, _, viewed)| viewed)
             .unwrap_or_default();
         let display = self.diff_options();
-        let view = cx.new(|cx| DiffView::new(session, target, display, viewed, cx));
+        let Some(comments) = self
+            .session
+            .as_ref()
+            .map(|session| session.read(cx).comments().clone())
+        else {
+            return;
+        };
+        let view = cx.new(|cx| DiffView::new(session, target, display, viewed, comments, cx));
         self.diff_subscription =
             Some(
                 cx.subscribe(&view, |this, _, event: &DiffViewEvent, cx| match event {
@@ -454,7 +542,7 @@ impl Workspace {
                             tree.update(cx, |tree, cx| tree.set_active_file(index, cx));
                         }
                     }
-                    // Comments (#14) start from these; until then they are logged.
+                    // The view opens composers itself; logged for debugging.
                     DiffViewEvent::LinesSelected(selection) => {
                         tracing::debug!(?selection, "lines selected");
                     }
@@ -494,6 +582,59 @@ impl Workspace {
         if let Some(view) = self.diff_view.clone() {
             view.update(cx, f);
         }
+    }
+
+    fn comment(&mut self, _: &Comment, _: &mut Window, cx: &mut Context<Self>) {
+        self.update_diff(cx, |view, cx| view.comment_on_current_line(cx));
+    }
+
+    fn next_comment(&mut self, _: &NextComment, _: &mut Window, cx: &mut Context<Self>) {
+        self.update_diff(cx, |view, cx| view.next_comment(cx));
+    }
+
+    fn previous_comment(&mut self, _: &PreviousComment, _: &mut Window, cx: &mut Context<Self>) {
+        self.update_diff(cx, |view, cx| view.previous_comment(cx));
+    }
+
+    fn toggle_all_comments(
+        &mut self,
+        _: &ToggleAllComments,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_diff(cx, |view, cx| view.toggle_all_threads(cx));
+    }
+
+    fn advance_comment_status(
+        &mut self,
+        _: &AdvanceCommentStatus,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_diff(cx, |view, cx| view.advance_focused_status(cx));
+    }
+
+    /// Switches the left dock between files and comments, showing it.
+    fn toggle_comment_list(
+        &mut self,
+        _: &ToggleCommentList,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = if self.left_tab == LeftTab::Comments && self.settings.file_tree.visible {
+            LeftTab::Files
+        } else {
+            LeftTab::Comments
+        };
+        self.show_left_tab(tab, window, cx);
+    }
+
+    fn show_left_tab(&mut self, tab: LeftTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.left_tab = tab;
+        if !self.settings.file_tree.visible {
+            self.update_settings(window, cx, |settings| settings.file_tree.visible = true);
+        }
+        cx.notify();
     }
 
     fn next_hunk(&mut self, _: &NextHunk, _: &mut Window, cx: &mut Context<Self>) {
@@ -765,9 +906,7 @@ impl Workspace {
         let Some(file_tree) = self.file_tree.clone() else {
             return;
         };
-        if !self.settings.file_tree.visible {
-            self.update_settings(window, cx, |settings| settings.file_tree.visible = true);
-        }
+        self.show_left_tab(LeftTab::Files, window, cx);
         let handle = file_tree.read(cx).filter_focus_handle().clone();
         window.focus(&handle, cx);
     }
@@ -784,7 +923,7 @@ impl Workspace {
     }
 
     /// Placeholder handler for review actions whose views land in later
-    /// issues (comments #14, runs #21, accept).
+    /// issues (runs #21, accept).
     fn not_wired_yet<A: Action>(&mut self, action: &A, _: &mut Window, _: &mut Context<Self>) {
         tracing::debug!(action = action.name(), "action not wired yet");
     }
@@ -1055,6 +1194,7 @@ impl Workspace {
     }
 
     fn render_file_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tabs = self.render_left_tabs(cx);
         let colors = cx.theme().colors.clone();
         let comparison = self
             .session
@@ -1067,6 +1207,12 @@ impl Workspace {
             .as_ref()
             .is_some_and(|tree| tree.read(cx).file_list().is_some());
         let body: AnyElement = match (comparison, self.file_tree.clone()) {
+            (Some(Comparison::Ready(_)), Some(_)) if self.left_tab == LeftTab::Comments => {
+                match self.comment_list.clone() {
+                    Some(list) => list.into_any_element(),
+                    None => placeholder("No comments.", cx).into_any_element(),
+                }
+            }
             (Some(Comparison::Ready(_)), Some(tree)) => tree.into_any_element(),
             (Some(Comparison::Resolving), Some(tree)) if has_list => tree.into_any_element(),
             (comparison, _) => {
@@ -1098,8 +1244,71 @@ impl Workspace {
             .bg(colors.surface)
             .border_r_1()
             .border_color(colors.border)
+            .child(tabs)
             .child(body)
             .child(self.resize_handle(DockResize::FileTree, false, cx))
+    }
+
+    /// "Files" | "Comments n" above the left dock.
+    fn render_left_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let count = self
+            .comment_list
+            .as_ref()
+            .map_or(0, |list| list.read(cx).count());
+        let tab = |id: &'static str, label: String, tab: LeftTab, cx: &mut Context<Self>| {
+            let active = self.left_tab == tab;
+            div()
+                .id(id)
+                .relative()
+                .flex()
+                .items_center()
+                .h_full()
+                .px_3()
+                .text_sm()
+                .cursor_pointer()
+                .text_color(if active {
+                    colors.text
+                } else {
+                    colors.text_muted
+                })
+                .when(active, |tab| tab.bg(colors.background))
+                .hover(|style| style.bg(colors.element_hover))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.show_left_tab(tab, window, cx)),
+                )
+                .child(label)
+                .when(active, |tab| {
+                    tab.child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(2.0))
+                            .bg(colors.accent),
+                    )
+                })
+        };
+        let comments = if count > 0 {
+            format!("Comments {count}")
+        } else {
+            "Comments".to_owned()
+        };
+        div()
+            .flex()
+            .flex_none()
+            .h(px(30.0))
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .child(tab(
+                "left-tab-files",
+                "Files".to_owned(),
+                LeftTab::Files,
+                cx,
+            ))
+            .child(tab("left-tab-comments", comments, LeftTab::Comments, cx))
+            .into_any_element()
     }
 
     fn render_run_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1989,7 +2198,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::previous_hunk))
             .on_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::toggle_diff_mode))
-            .on_action(cx.listener(Self::not_wired_yet::<Comment>))
+            .on_action(cx.listener(Self::comment))
+            .on_action(cx.listener(Self::next_comment))
+            .on_action(cx.listener(Self::previous_comment))
+            .on_action(cx.listener(Self::toggle_all_comments))
+            .on_action(cx.listener(Self::toggle_comment_list))
+            .on_action(cx.listener(Self::advance_comment_status))
             .on_action(cx.listener(Self::not_wired_yet::<Run>))
             .on_action(cx.listener(Self::not_wired_yet::<Accept>))
             .child(self.render_title_bar(cx))

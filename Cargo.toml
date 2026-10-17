@@ -39,6 +39,9 @@ anyhow = "1.0.104"
 gix = "0.89.0"
 # The imara-diff fork maintained by gitoxide; the same crate gix diffs with.
 imara-diff = { package = "gix-imara-diff", version = "0.3.1" }
+# Markdown parsing of comment bodies (MIT). No default features: the HTML
+# renderer and its CLI are not needed.
+pulldown-cmark = { version = "0.13.4", default-features = false }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -79,5 +82,7 @@ tree-sitter-toml-ng = "0.7.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-yaml = "0.7.2"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Grapheme boundaries for the comment editor's caret.
+unicode-segmentation = "1.13.3"
 uuid = { version = "1.28.0", features = ["serde", "v7"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
