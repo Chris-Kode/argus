@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "[ \"$CLAUDE_CODE_REMOTE\" = true ] || exit 0; . \"$HOME/.cargo/env\" 2>/dev/null; cd \"$CLAUDE_PROJECT_DIR\" && { cargo fetch --locked && cargo clippy --workspace --all-targets --locked; } > /tmp/argus-warmup.log 2>&1; exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}
