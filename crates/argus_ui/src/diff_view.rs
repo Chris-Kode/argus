@@ -20,13 +20,9 @@
 //! one flat virtual index (`starts[file] + row`), so a [`uniform_list`] lays
 //! out only the rows on screen and the scroll position is plain arithmetic.
 //!
-//! Every file is drawn as a card (Panoptes #56 §5): each row paints its
-//! slice of the card outline, the header card spans the
-//! [`layout::HEADER_ROWS`] header rows (drawn from the first, overflowing
-//! into the next), and the spacer row draws the card's rounded bottom edge
-//! and the gap to the next card. Row heights stay uniform, so the 38 px
-//! header is two code rows at the default font size, and hunk headers are
-//! one row tall.
+//! Each file is drawn as a card (Panoptes #56 §5); each row paints its
+//! slice of the outline, and the spacer row draws the rounded bottom edge
+//! and gap to the next card.
 //!
 //! # Lazy loading
 //!
