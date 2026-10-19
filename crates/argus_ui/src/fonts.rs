@@ -4,12 +4,50 @@
 //! missing; it drops to a global sans-serif stack instead, which would render
 //! code in a proportional font. So Argus picks the first installed family from
 //! a preference list once, at startup or when the setting changes.
+//!
+//! IBM Plex Sans and IBM Plex Mono are compiled into the binary (SIL Open
+//! Font License 1.1, see `assets/fonts/OFL.txt`) and registered once at
+//! startup by [`register_bundled_fonts`], so they head both preference lists
+//! and Argus looks the same on every machine.
+
+use std::borrow::Cow;
 
 use gpui::{App, SharedString};
 
-/// Preferred code fonts: Zed's default first, then common system monospace
-/// fonts on macOS and Linux.
+/// The bundled UI family.
+pub const BUNDLED_UI_FAMILY: &str = "IBM Plex Sans";
+
+/// The bundled code family.
+pub const BUNDLED_CODE_FAMILY: &str = "IBM Plex Mono";
+
+/// The bundled font files, exactly as released by IBM.
+const BUNDLED_FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf"),
+    include_bytes!("../assets/fonts/IBMPlexSans-Medium.ttf"),
+    include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf"),
+    include_bytes!("../assets/fonts/IBMPlexMono-Medium.ttf"),
+    include_bytes!("../assets/fonts/IBMPlexMono-Italic.ttf"),
+];
+
+/// Registers the bundled IBM Plex fonts with the text system.
+///
+/// The bytes are compiled in, so this does no file I/O. On failure Argus
+/// keeps going and the preference lists fall back to installed fonts.
+pub fn register_bundled_fonts(cx: &App) {
+    let fonts = BUNDLED_FONTS
+        .iter()
+        .map(|bytes| Cow::Borrowed(*bytes))
+        .collect();
+    if let Err(error) = cx.text_system().add_fonts(fonts) {
+        tracing::warn!(%error, "failed to register the bundled IBM Plex fonts");
+    }
+}
+
+/// Preferred code fonts: the bundled IBM Plex Mono first, then Zed's default
+/// and common system monospace fonts on macOS and Linux.
 const CODE_FONT_PREFERENCES: &[&str] = &[
+    BUNDLED_CODE_FAMILY,
     "Zed Mono",
     "Lilex",
     "SF Mono",
@@ -25,9 +63,10 @@ const CODE_FONT_PREFERENCES: &[&str] = &[
     "Courier New",
 ];
 
-/// Preferred UI fonts. `.SystemUIFont` is GPUI's alias for the platform UI
-/// font and always resolves, so it ends the list.
-const UI_FONT_PREFERENCES: &[&str] = &["Zed Sans", "IBM Plex Sans", "Inter", ".SystemUIFont"];
+/// Preferred UI fonts: the bundled IBM Plex Sans first. `.SystemUIFont` is
+/// GPUI's alias for the platform UI font and always resolves, so it ends the
+/// list.
+const UI_FONT_PREFERENCES: &[&str] = &[BUNDLED_UI_FAMILY, "Zed Sans", "Inter", ".SystemUIFont"];
 
 /// Installed font families, listed once and reused for every resolution.
 pub struct InstalledFonts {
@@ -64,14 +103,14 @@ impl InstalledFonts {
             .unwrap_or_else(|| SharedString::new_static(preferences[0]))
     }
 
-    /// The code font: the configured family if installed, else "Zed Mono" or
-    /// the first installed system monospace font.
+    /// The code font: the configured family if installed, else the bundled
+    /// IBM Plex Mono or the first installed fallback monospace font.
     pub fn code_family(&self, user_choice: Option<&str>) -> SharedString {
         self.pick(user_choice, CODE_FONT_PREFERENCES)
     }
 
-    /// The UI font: the configured family if installed, else Zed's UI font or
-    /// the platform UI font.
+    /// The UI font: the configured family if installed, else the bundled
+    /// IBM Plex Sans or the first installed fallback UI font.
     pub fn ui_family(&self, user_choice: Option<&str>) -> SharedString {
         self.pick(user_choice, UI_FONT_PREFERENCES)
     }

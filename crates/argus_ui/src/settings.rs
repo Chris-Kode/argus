@@ -182,10 +182,9 @@ pub struct UiSettings {
     /// Panoptes (default) or One. Records written before the field existed
     /// load as Panoptes.
     pub theme_family: ThemeFamily,
-    /// UI font family override; `None` picks Zed's UI font or the system one.
+    /// UI font family override; `None` picks the bundled IBM Plex Sans.
     pub ui_font_family: Option<String>,
-    /// Code font family override; `None` picks "Zed Mono" or the system
-    /// monospace font.
+    /// Code font family override; `None` picks the bundled IBM Plex Mono.
     pub code_font_family: Option<String>,
     /// UI font size in pixels.
     pub ui_font_size: f32,
