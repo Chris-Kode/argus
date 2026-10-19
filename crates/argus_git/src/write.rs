@@ -1,11 +1,14 @@
 //! Write side of the git service, through the `git` CLI.
 //!
-//! Every write here only touches refs and config (branch creation, the
-//! compare-and-swap ref update of Accept): the user's working tree
-//! and index are never read or modified (spec §11).
+//! Writes touch refs and config (branch creation, the compare-and-swap ref
+//! update of Accept). The one exception is [`sync_checkout`], which carries a
+//! checkout of the user's along when its branch moves, and never overwrites
+//! a change of the user's (spec §11).
 
 use crate::cli::GitCli;
 use crate::error::{GitError, Result};
+use std::path::Path;
+
 use crate::read::{Repo, Sha, git};
 
 /// Creates the local branch `name` at `remote_branch` (`origin/feature`) and
@@ -78,7 +81,8 @@ pub enum RefUpdate {
 /// <expected>` (spec §5.3, safety invariant 4).
 ///
 /// Only the ref (and its reflog) changes: a checkout that has the branch
-/// checked out keeps its files and index as they are.
+/// checked out keeps its files and index as they are until
+/// [`sync_checkout`] carries it along.
 pub async fn update_branch(
     repo: &Repo,
     branch: &str,
@@ -114,6 +118,59 @@ pub async fn update_branch(
             code: output.code,
             stderr: output.stderr,
         }),
+    }
+}
+
+/// How [`sync_checkout`] went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckoutSync {
+    /// The checkout's index and files now match the new commit.
+    Updated,
+    /// The checkout was left as it was; `reason` says why (git's message,
+    /// e.g. a file with changes of the user's that the new commit changes).
+    Skipped {
+        /// Why, for the user.
+        reason: String,
+    },
+}
+
+/// Carries the checkout at `path`, whose branch was just moved from `from`
+/// to `to` by [`update_branch`], along to `to`: `git read-tree -m -u <from>
+/// <to>`, what `git checkout` does when it switches commits.
+///
+/// Only the paths that differ between `from` and `to` are written. Changes
+/// of the user's elsewhere are kept as they are; a staged or unstaged change
+/// (or an untracked file) in one of those paths makes git refuse before
+/// writing anything, and the checkout stays as it was. Does nothing when the
+/// checkout's `HEAD` is no longer `to` (the user switched branches).
+pub async fn sync_checkout(path: &Path, from: &Sha, to: &Sha) -> Result<CheckoutSync> {
+    let cli = GitCli::new(path);
+    let head = cli
+        .run_unchecked(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .await?;
+    if !head.success() || Sha::parse(head.stdout_lossy().trim()) != Some(*to) {
+        return Ok(CheckoutSync::Skipped {
+            reason: "its HEAD is no longer the moved branch".to_owned(),
+        });
+    }
+    let (from_hex, to_hex) = (from.to_hex(), to.to_hex());
+    let output = cli
+        .run_unchecked(["read-tree", "-m", "-u", from_hex.as_str(), to_hex.as_str()])
+        .await?;
+    if output.success() {
+        tracing::info!(path = %path.display(), %from, %to, "updated the checkout");
+        Ok(CheckoutSync::Updated)
+    } else {
+        tracing::info!(path = %path.display(), stderr = %output.stderr, "checkout left as is");
+        Ok(CheckoutSync::Skipped {
+            reason: output
+                .stderr
+                .lines()
+                .next()
+                .unwrap_or("git read-tree failed")
+                .trim_start_matches("error: ")
+                .to_owned(),
+        })
     }
 }
 

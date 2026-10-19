@@ -435,11 +435,13 @@ impl AcceptFlow {
                     .child(code(crate::workspace::display_path(path))),
             )
             .child(row().child(
-                "Argus will move the branch; your checkout will show the new commits as reverse \
-                 changes until you run:",
+                "Argus will move the branch and update the files the commit changes in that \
+                 checkout, like a checkout would.",
             ))
-            .child(row().child(code(format!("git reset --keep {head}"))))
-            .child(row().child("Argus never runs anything in that checkout."))
+            .child(row().child(
+                "Your own changes are never overwritten: if one is in the way, the checkout is \
+                 left as it was and Argus warns you.",
+            ))
             .into_any_element();
         let note = div()
             .text_xs()
