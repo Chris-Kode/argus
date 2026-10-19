@@ -50,7 +50,7 @@ use crate::components::{
 };
 use crate::conflict::{ConflictDialog, ConflictDialogEvent, ConflictSource};
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
-use crate::file_tree::{FileTree, FileTreeEvent};
+use crate::file_tree::{FileMarker, FileTree, FileTreeEvent};
 use crate::fonts::InstalledFonts;
 use crate::icons::{IconName, eye_mark, icon};
 use crate::jobs::BackgroundJobs;
@@ -658,17 +658,28 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Mirrors the comments into the file tree: a count badge per file and
-    /// the "Outdated" group.
+    /// Mirrors the comments into the file tree: a state marker per file (a
+    /// running run wins over a waiting proposal) and the "Outdated" group.
     fn sync_comment_badges(&mut self, comments: &Entity<ReviewComments>, cx: &mut Context<Self>) {
         let Some(file_tree) = self.file_tree.clone() else {
             return;
         };
         let snapshot = comments.read(cx).comments().clone();
-        let mut counts: HashMap<SharedString, u32> = HashMap::new();
+        let mut markers: HashMap<SharedString, FileMarker> = HashMap::new();
         let mut outdated = Vec::new();
         let mut labels = Vec::new();
         for comment in snapshot.iter() {
+            let marker = match comment.status {
+                CommentStatus::Running => Some(FileMarker::Running),
+                CommentStatus::Proposed => Some(FileMarker::Proposed),
+                _ => None,
+            };
+            if let Some(marker) = marker {
+                let slot = markers
+                    .entry(comment.anchor.file_path.clone().into())
+                    .or_insert(marker);
+                *slot = (*slot).max(marker);
+            }
             if comment.outdated {
                 let first = comment.body_md.lines().next().unwrap_or_default();
                 labels.push(SharedString::from(format!(
@@ -676,15 +687,11 @@ impl Workspace {
                     comment.anchor.file_path, comment.anchor.start_line
                 )));
                 outdated.push(comment.id);
-            } else {
-                *counts
-                    .entry(comment.anchor.file_path.clone().into())
-                    .or_default() += 1;
             }
         }
         self.outdated_comments = outdated;
         file_tree.update(cx, |tree, cx| {
-            tree.set_comment_counts(counts, cx);
+            tree.set_file_markers(markers, cx);
             tree.set_outdated(labels, cx);
         });
     }
@@ -2296,65 +2303,71 @@ impl Workspace {
             .child(self.resize_handle(DockResize::FileTree, false, cx))
     }
 
-    /// "Files" | "Comments n" above the left dock.
+    /// "Files" | "Comments n" above the left dock (Panoptes #56 §5): SM
+    /// tabs, the selected one on `element_selected`, the count in mono.
     fn render_left_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
+        let code_family = cx.theme().fonts.code_family.clone();
         let count = self
             .comment_list
             .as_ref()
             .map_or(0, |list| list.read(cx).count());
-        let tab = |id: &'static str, label: String, tab: LeftTab, cx: &mut Context<Self>| {
+        let tab = |id: &'static str,
+                   label: &'static str,
+                   count: Option<usize>,
+                   tab: LeftTab,
+                   cx: &mut Context<Self>| {
             let active = self.left_tab == tab;
             div()
                 .id(id)
-                .relative()
                 .flex()
+                .flex_none()
                 .items_center()
-                .h_full()
-                .px_3()
-                .text_sm()
+                .gap(px(6.0))
+                .h(px(24.0))
+                .px(px(10.0))
+                .rounded(radius::SM)
+                .text_size(px(12.0))
                 .cursor_pointer()
                 .text_color(if active {
                     colors.text
                 } else {
                     colors.text_muted
                 })
-                .when(active, |tab| tab.bg(colors.background))
-                .hover(|style| style.bg(colors.element_hover))
+                .when(active, |tab| tab.bg(colors.element_selected))
+                .when(!active, |tab| {
+                    tab.hover(|style| style.bg(colors.element_hover))
+                })
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.show_left_tab(tab, window, cx)),
                 )
                 .child(label)
-                .when(active, |tab| {
+                .when_some(count, |tab, count| {
                     tab.child(
                         div()
-                            .absolute()
-                            .bottom_0()
-                            .left_0()
-                            .right_0()
-                            .h(px(2.0))
-                            .bg(colors.accent),
+                            .font_family(code_family.clone())
+                            .text_size(px(11.0))
+                            .text_color(colors.text_placeholder)
+                            .child(count.to_string()),
                     )
                 })
-        };
-        let comments = if count > 0 {
-            format!("Comments {count}")
-        } else {
-            "Comments".to_owned()
         };
         div()
             .flex()
             .flex_none()
-            .h(px(30.0))
-            .border_b_1()
-            .border_color(colors.border_variant)
+            .items_center()
+            .gap(px(2.0))
+            .px_2()
+            .pt_2()
+            .pb(px(6.0))
+            .child(tab("left-tab-files", "Files", None, LeftTab::Files, cx))
             .child(tab(
-                "left-tab-files",
-                "Files".to_owned(),
-                LeftTab::Files,
+                "left-tab-comments",
+                "Comments",
+                (count > 0).then_some(count),
+                LeftTab::Comments,
                 cx,
             ))
-            .child(tab("left-tab-comments", comments, LeftTab::Comments, cx))
             .into_any_element()
     }
 

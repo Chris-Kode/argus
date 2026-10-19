@@ -15,8 +15,13 @@
 //!
 //! The diff view (#9) listens to [`FileTreeEvent::OpenFile`] and reports
 //! its scroll position back through [`FileTree::set_active_file`]; the
-//! comment UI (#14, #15) fills the badges and the "Outdated" group through
-//! [`FileTree::set_comment_counts`] and [`FileTree::set_outdated`].
+//! comment UI (#14, #15) fills the per-file state markers and the
+//! "Outdated" group through [`FileTree::set_file_markers`] and
+//! [`FileTree::set_outdated`].
+//!
+//! Rows follow Panoptes #56 §5: a letter badge, the name, an optional state
+//! marker (teal dot for a proposal, the Claude activity eye for a running
+//! run) and the +/- counts in mono.
 
 pub mod model;
 
@@ -26,14 +31,15 @@ use std::time::Instant;
 
 use argus_diff::{ChangeKind, DiffOptions, DiffSession, FileList, FileStats, StatsEvent};
 use gpui::{
-    AnyElement, ClickEvent, Context, EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent,
-    ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window, div, prelude::*, px,
-    uniform_list,
+    AnyElement, App, ClickEvent, Context, EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent,
+    Pixels, ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window, div, prelude::*,
+    px, uniform_list,
 };
 
 use crate::BackgroundJobs;
-use crate::components::toggle_button;
+use crate::components::{BadgeSize, claude_activity, letter_badge, radius, toggle_button};
 use crate::fuzzy::FuzzyQuery;
+use crate::icons::{IconName, icon};
 use crate::keymap::{
     CollapseEntry, Dismiss, ExpandEntry, FILE_TREE_CONTEXT, OpenEntry, SelectNextEntry,
     SelectPreviousEntry, TEXT_INPUT_CONTEXT,
@@ -43,14 +49,34 @@ use crate::runtime::spawn_job;
 use crate::session::DiffTarget;
 use crate::theme::{ActiveTheme, ThemeColors};
 
-use model::{KindFilter, KindGroup, Row, TreeIndex, View, kind_letter};
+use model::{KindFilter, KindGroup, Row, TreeIndex, View};
 
 /// Height of every row (`uniform_list` needs one height).
-const ROW_HEIGHT: f32 = 24.0;
+const ROW_HEIGHT: f32 = 26.0;
 /// Indentation per tree level.
 const INDENT: f32 = 12.0;
 /// Left padding of depth-0 rows.
-const ROW_PADDING: f32 = 8.0;
+const ROW_PADDING: f32 = 6.0;
+/// Size of the directory carets.
+const CARET_SIZE: Pixels = px(12.0);
+/// Size of the proposal dot.
+const PROPOSAL_DOT_SIZE: Pixels = px(6.0);
+/// Size of the Claude activity eye in a row.
+const ACTIVITY_SIZE: Pixels = px(13.0);
+/// Size of the mono +/- counts.
+const COUNTS_TEXT_SIZE: Pixels = px(11.0);
+/// Size of row labels.
+const ROW_TEXT_SIZE: Pixels = px(12.5);
+
+/// The state marker of a file row (Panoptes #56 §5). A file shows at most
+/// one; [`FileMarker::Running`] wins over [`FileMarker::Proposed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FileMarker {
+    /// One of the file's comments has a proposal waiting for review.
+    Proposed,
+    /// A run is active on one of the file's comments.
+    Running,
+}
 
 /// What the file tree reports to the workspace.
 #[derive(Clone, Debug)]
@@ -112,7 +138,7 @@ pub struct FileTree {
     list: Option<Arc<FileList>>,
     index: Arc<TreeIndex>,
     stats: Vec<Option<FileStats>>,
-    comment_counts: HashMap<SharedString, u32>,
+    markers: HashMap<SharedString, FileMarker>,
     outdated: Vec<SharedString>,
     flat: bool,
     query: String,
@@ -147,7 +173,7 @@ impl FileTree {
             list: None,
             index: Arc::new(TreeIndex::default()),
             stats: Vec::new(),
-            comment_counts: HashMap::new(),
+            markers: HashMap::new(),
             outdated: Vec::new(),
             flat,
             query: String::new(),
@@ -344,14 +370,16 @@ impl FileTree {
 
     // ---- inputs from other views ------------------------------------------
 
-    /// Comment counts by file path, shown as badges (#14).
-    pub fn set_comment_counts(
+    /// State markers by file path (#14): files without an entry show none.
+    pub fn set_file_markers(
         &mut self,
-        counts: HashMap<SharedString, u32>,
+        markers: HashMap<SharedString, FileMarker>,
         cx: &mut Context<Self>,
     ) {
-        self.comment_counts = counts;
-        cx.notify();
+        if self.markers != markers {
+            self.markers = markers;
+            cx.notify();
+        }
     }
 
     /// The outdated comments listed in the bottom group (#15); the group is
@@ -727,6 +755,7 @@ impl FileTree {
             perf::mark_painted(perf::Milestone::FileTreePainted, cx);
         }
         let colors = cx.theme().colors.clone();
+        let code_family = cx.theme().fonts.code_family.clone();
         let mut elements = Vec::with_capacity(range.len());
         for row_index in range {
             let Some(row) = self.rows.get(row_index).copied() else {
@@ -738,10 +767,11 @@ impl FileTree {
                 .flex()
                 .w_full()
                 .items_center()
-                .gap_1()
+                .gap_2()
                 .h(px(ROW_HEIGHT))
-                .pr_2()
-                .text_sm()
+                .pr(px(6.0))
+                .rounded(radius::SM)
+                .text_size(ROW_TEXT_SIZE)
                 .whitespace_nowrap()
                 .cursor_pointer()
                 .when(selected, |row| row.bg(colors.element_selected))
@@ -763,15 +793,14 @@ impl FileTree {
                         .dir(dir)
                         .map(|dir| dir.label.clone())
                         .unwrap_or_default();
+                    let caret = if expanded {
+                        IconName::CaretDown
+                    } else {
+                        IconName::CaretRight
+                    };
                     base.pl(px(ROW_PADDING + depth as f32 * INDENT))
-                        .child(
-                            div()
-                                .flex_none()
-                                .w(px(12.0))
-                                .text_xs()
-                                .text_color(colors.text_muted)
-                                .child(if expanded { "▾" } else { "▸" }),
-                        )
+                        .gap(px(6.0))
+                        .child(icon(caret, CARET_SIZE, colors.text_muted))
                         .child(
                             div()
                                 .flex_1()
@@ -782,22 +811,30 @@ impl FileTree {
                                 .child(label),
                         )
                 }
-                Row::File { index, depth } => self.render_file_row(base, index, depth, &colors),
+                Row::File { index, depth } => {
+                    self.render_file_row(base, index, depth, selected, cx)
+                }
                 Row::OutdatedHeader { count } => div()
                     .id(("file-tree-row", row_index))
                     .flex()
                     .w_full()
-                    .items_end()
-                    .justify_between()
+                    .items_center()
+                    .gap(px(6.0))
                     .h(px(ROW_HEIGHT))
-                    .px_3()
-                    .pb_0p5()
+                    .px(px(ROW_PADDING))
                     .border_t_1()
                     .border_color(colors.border_variant)
-                    .text_xs()
-                    .text_color(colors.warning)
-                    .child("OUTDATED")
-                    .child(count.to_string()),
+                    .text_size(ROW_TEXT_SIZE)
+                    .text_color(colors.text_muted)
+                    .child(icon(IconName::Warning, CARET_SIZE, colors.warning))
+                    .child(div().flex_1().child("Outdated"))
+                    .child(
+                        div()
+                            .font_family(code_family.clone())
+                            .text_size(COUNTS_TEXT_SIZE)
+                            .text_color(colors.text_placeholder)
+                            .child(count.to_string()),
+                    ),
                 Row::Outdated(item) => base
                     .pl(px(ROW_PADDING + INDENT))
                     .text_color(colors.text_muted)
@@ -820,62 +857,58 @@ impl FileTree {
         base: gpui::Stateful<gpui::Div>,
         index: usize,
         depth: usize,
-        colors: &ThemeColors,
+        selected: bool,
+        cx: &App,
     ) -> gpui::Stateful<gpui::Div> {
         let Some(file) = self.index.file(index) else {
             return base;
         };
+        let colors = &cx.theme().colors;
         let label = if self.flat {
             file.flat_label.clone()
         } else {
             file.tree_label.clone()
         };
-        let kind_color = kind_color(file.kind, colors);
-        let comments = self.comment_counts.get(&file.path).copied().unwrap_or(0);
-        // Files sit one chevron-width deeper than their directory's label.
+        let name_color = if selected {
+            colors.text
+        } else if file.kind == ChangeKind::Deleted {
+            colors.text_muted
+        } else {
+            body_text(colors)
+        };
+        // Files sit one caret-width deeper than their directory's label.
         let indent = if self.flat {
             ROW_PADDING
         } else {
             ROW_PADDING + depth as f32 * INDENT + 4.0
         };
-        base.pl(px(indent))
-            .child(
+        let marker: Option<AnyElement> = match self.markers.get(&file.path) {
+            Some(FileMarker::Running) => Some(claude_activity(ACTIVITY_SIZE, cx)),
+            Some(FileMarker::Proposed) => Some(
                 div()
                     .flex_none()
-                    .w(px(12.0))
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(kind_color)
-                    .child(kind_letter(file.kind)),
-            )
+                    .size(PROPOSAL_DOT_SIZE)
+                    .rounded_full()
+                    .bg(colors.accent)
+                    .into_any_element(),
+            ),
+            None => None,
+        };
+        base.pl(px(indent))
+            .child(letter_badge(file.kind, BadgeSize::Small, cx))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .text_color(if file.kind == ChangeKind::Deleted {
-                        colors.text_muted
-                    } else {
-                        colors.text
-                    })
+                    .text_color(name_color)
                     .child(label),
             )
-            .when(comments > 0, |row| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .px_1()
-                        .rounded_full()
-                        .bg(colors.accent)
-                        .text_xs()
-                        .text_color(colors.accent_text)
-                        .child(comments.to_string()),
-                )
-            })
+            .children(marker)
             .child(render_counts(
                 self.stats.get(index).and_then(Option::as_ref),
-                colors,
+                cx,
             ))
     }
 
@@ -968,12 +1001,12 @@ impl FileTree {
             .gap_0p5()
             .h(px(24.0))
             .px_2()
-            .rounded_md()
+            .rounded(radius::SM)
             .border_1()
             .border_color(if focused {
                 colors.accent
             } else {
-                colors.border_variant
+                colors.border
             })
             .bg(colors.background)
             .cursor_text()
@@ -1014,7 +1047,7 @@ impl FileTree {
                 .items_center()
                 .justify_center()
                 .size(px(20.0))
-                .rounded_md()
+                .rounded(radius::SM)
                 .text_xs()
                 .font_weight(gpui::FontWeight::BOLD)
                 .cursor_pointer()
@@ -1089,39 +1122,56 @@ impl FileTree {
                 )
                 .track_scroll(&self.scroll)
                 .size_full()
+                .px_2()
                 .py_1(),
             )
             .into_any_element()
     }
 }
 
-/// The colour of a change-kind letter.
+/// The colour of a change-kind letter, matching [`letter_badge`].
 fn kind_color(kind: ChangeKind, colors: &ThemeColors) -> Hsla {
     match kind {
         ChangeKind::Added => colors.diff_added_text,
         ChangeKind::Deleted => colors.diff_removed_text,
         ChangeKind::Renamed => colors.accent,
-        ChangeKind::Modified | ChangeKind::ModeChanged | ChangeKind::TypeChanged => colors.warning,
+        ChangeKind::Modified => colors.file_modified,
+        ChangeKind::ModeChanged | ChangeKind::TypeChanged => colors.text_muted,
     }
 }
 
-/// `+n −m`, or "…" while the counts are being computed.
-fn render_counts(stats: Option<&FileStats>, colors: &ThemeColors) -> impl IntoElement {
-    let counts = div().flex().flex_none().gap_1().text_xs();
+/// The name color of an unselected row: `text_muted` brightened to the body
+/// color (Panoptes #56 §5), i.e. primary text slightly sunk into the dock.
+fn body_text(colors: &ThemeColors) -> Hsla {
+    colors.text_muted.blend(colors.text.opacity(0.75))
+}
+
+/// `+n −m` in mono, or "…" while the counts are being computed. A zero side
+/// is drawn in `text_placeholder`.
+fn render_counts(stats: Option<&FileStats>, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let colors = &theme.colors;
+    let counts = div()
+        .flex()
+        .flex_none()
+        .gap_1()
+        .font_family(theme.fonts.code_family.clone())
+        .text_size(COUNTS_TEXT_SIZE);
+    let side = |count: u32, prefix: char, color: Hsla| {
+        div()
+            .text_color(if count == 0 {
+                colors.text_placeholder
+            } else {
+                color
+            })
+            .child(format!("{prefix}{count}"))
+    };
     match stats {
         None => counts.text_color(colors.text_placeholder).child("…"),
         Some(FileStats::Text { added, removed }) if *added == 0 && *removed == 0 => counts,
         Some(FileStats::Text { added, removed }) => counts
-            .child(
-                div()
-                    .text_color(colors.diff_added_text)
-                    .child(format!("+{added}")),
-            )
-            .child(
-                div()
-                    .text_color(colors.diff_removed_text)
-                    .child(format!("−{removed}")),
-            ),
+            .child(side(*added, '+', colors.diff_added_text))
+            .child(side(*removed, '−', colors.diff_removed_text)),
         Some(FileStats::Binary { .. }) => counts.text_color(colors.text_muted).child("bin"),
         Some(FileStats::TooLarge { .. }) => counts.text_color(colors.text_muted).child("large"),
         Some(FileStats::Failed(_)) => counts.text_color(colors.error).child("!"),
