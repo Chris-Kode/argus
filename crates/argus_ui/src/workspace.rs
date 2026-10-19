@@ -361,6 +361,9 @@ impl Workspace {
         if theme_changed {
             self.apply_theme(window, cx);
         }
+        if self.settings.reduce_motion != before.reduce_motion {
+            cx.set_reduce_motion(self.settings.reduce_motion);
+        }
         self.sync_diff_options(cx);
         let bottom = self.settings.run_panel.position == RunPanelPosition::Bottom;
         self.run_panel
@@ -3060,7 +3063,22 @@ impl Workspace {
                 ),
             ))
             .child(row("UI font", muted(theme.fonts.ui_family.clone())))
-            .child(row("Code font", muted(theme.fonts.code_family.clone())));
+            .child(row("Code font", muted(theme.fonts.code_family.clone())))
+            .child(row(
+                "Reduce motion",
+                toggle_button(
+                    "reduce-motion-setting",
+                    if settings.reduce_motion { "On" } else { "Off" },
+                    settings.reduce_motion,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.update_settings(window, cx, |settings| {
+                        settings.reduce_motion = !settings.reduce_motion;
+                    })
+                }))
+                .into_any_element(),
+            ));
 
         let layout = div()
             .flex()

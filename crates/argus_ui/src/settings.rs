@@ -190,6 +190,8 @@ pub struct UiSettings {
     pub ui_font_size: f32,
     /// Code font size in pixels.
     pub code_font_size: f32,
+    /// Render live-state animations (the Claude activity pulse) statically.
+    pub reduce_motion: bool,
     /// File tree dock.
     pub file_tree: FileTreeDock,
     /// Run panel dock.
@@ -217,6 +219,7 @@ impl Default for UiSettings {
             code_font_family: None,
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             code_font_size: DEFAULT_CODE_FONT_SIZE,
+            reduce_motion: false,
             file_tree: FileTreeDock::default(),
             run_panel: RunPanelDock::default(),
             diff_tab_width: DEFAULT_TAB_WIDTH,
@@ -256,7 +259,8 @@ impl UiSettings {
         self.diff_link_horizontal_scroll = defaults.diff_link_horizontal_scroll;
     }
 
-    /// Resets the Appearance section: theme mode, theme family and fonts.
+    /// Resets the Appearance section: theme mode, theme family, fonts and
+    /// reduce motion.
     pub fn reset_appearance(&mut self) {
         let defaults = Self::default();
         self.theme = defaults.theme;
@@ -265,6 +269,7 @@ impl UiSettings {
         self.code_font_family = defaults.code_font_family;
         self.ui_font_size = defaults.ui_font_size;
         self.code_font_size = defaults.code_font_size;
+        self.reduce_motion = defaults.reduce_motion;
     }
 
     /// Resets the Layout section: dock visibility, position and sizes. The
