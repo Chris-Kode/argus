@@ -318,9 +318,9 @@ pub struct ThemeFonts {
 impl Default for ThemeFonts {
     fn default() -> Self {
         Self {
-            ui_family: ".SystemUIFont".into(),
+            ui_family: crate::fonts::BUNDLED_UI_FAMILY.into(),
             ui_size: px(crate::settings::DEFAULT_UI_FONT_SIZE),
-            code_family: "Zed Mono".into(),
+            code_family: crate::fonts::BUNDLED_CODE_FAMILY.into(),
             code_size: px(crate::settings::DEFAULT_CODE_FONT_SIZE),
         }
     }

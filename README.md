@@ -334,3 +334,11 @@ and `ARGUS_PERF=1 cargo run --release -- --repo target/fixtures/huge-files
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+### Fonts
+
+Argus bundles [IBM Plex Sans and IBM Plex Mono](https://github.com/IBM/plex)
+(unmodified release files in `crates/argus_ui/assets/fonts/`) and uses them by
+default; a font chosen in Settings still wins. The fonts are licensed under the
+SIL Open Font License 1.1, see
+[crates/argus_ui/assets/fonts/OFL.txt](crates/argus_ui/assets/fonts/OFL.txt).
