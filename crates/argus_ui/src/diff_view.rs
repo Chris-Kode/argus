@@ -222,6 +222,9 @@ pub enum DiffViewEvent {
     },
     /// "View proposal" on a `Proposed` comment thread.
     ViewProposal(argus_diff::review::CommentId),
+    /// Accept in a thread's proposal inset: accept this run's proposal, as
+    /// the proposal tab's Accept does.
+    AcceptProposal(argus_store::RunId),
     /// A proposal's "Open in editor" on a changed file (repository-relative
     /// path).
     OpenInEditor(String),

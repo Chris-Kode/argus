@@ -41,10 +41,12 @@ use argus_diff::review::{
     AnchorLocation, Comment, CommentAnchor, CommentEvent, CommentId, CommentStatus, ReplyAuthor,
     ReviewKey,
 };
+use argus_git::{DiffStat, Sha};
 use argus_runs::settings::{EFFORTS, MODELS};
+use argus_store::{ReplyRun, RunId};
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, Global, Hsla, MouseButton, MouseDownEvent,
-    Pixels, SharedString, Subscription, deferred, div, prelude::*, px,
+    AnyElement, App, BoxShadow, Context, Entity, FontWeight, Global, Hsla, MouseButton,
+    MouseDownEvent, Pixels, SharedString, Subscription, Task, deferred, div, point, prelude::*, px,
 };
 
 use super::{
@@ -52,10 +54,16 @@ use super::{
     PROPOSAL_COMMENT_HINT, SPLIT_DIVIDER_WIDTH, side_index,
 };
 use crate::AppContext;
-use crate::components::{button, chip, disabled_button, primary_button, status_chip};
-use crate::followup::{self, FollowupKind};
+use crate::components::{
+    accept_button, button, button_with_icon, chip, claude_avatar, disabled_button,
+    disabled_button_with_icon, icon_button, kbd, primary_button, radius, reject_button,
+    status_chip, text_tooltip, user_avatar,
+};
+use crate::followup::FollowupKind;
+use crate::icons::{IconName, icon};
 use crate::keymap::SubmitComment;
 use crate::markdown::{self, MarkdownCache};
+use crate::runtime::spawn_job;
 use crate::session::{now_seconds, relative_time};
 use crate::text_editor::{TextEditor, TextEditorEvent};
 use crate::theme::ActiveTheme;
@@ -69,6 +77,12 @@ const MIN_CARD_WIDTH: Pixels = px(260.0);
 const REVEAL_OFFSET: usize = layout::HEADER_ROWS + 1;
 /// Space between a card and the edge of its column.
 const CARD_MARGIN: Pixels = px(8.0);
+/// Widest a thread card gets (Panoptes #56 §5).
+const MAX_CARD_WIDTH: Pixels = px(680.0);
+/// Height of a thread card's header row.
+const THREAD_HEADER_HEIGHT: Pixels = px(34.0);
+/// Hint of a thread's reply input.
+const REPLY_HINT: &str = "Ask Claude for changes";
 /// A thread menu closed this recently by a click outside it is not reopened
 /// by the same click landing on its own "⋯" button.
 const MENU_REOPEN_GUARD: Duration = Duration::from_millis(250);
@@ -207,6 +221,26 @@ pub(super) struct Threads {
     reattach: Option<Reattach>,
     /// A re-attached comment to scroll to once the snapshot has it inline.
     reveal_reattached: Option<CommentId>,
+    /// The proposal of each `Proposed` thread, for its inset.
+    proposals: HashMap<CommentId, ProposalInfo>,
+    /// Looks up the proposals not known yet; replacing it cancels a lookup
+    /// in flight.
+    proposals_task: Option<Task<()>>,
+    /// The thread whose proposal asks "Reject this proposal?".
+    confirm_reject: Option<CommentId>,
+    /// Threads whose proposal is being rejected.
+    rejecting: HashSet<CommentId>,
+}
+
+/// The proposal of a `Proposed` thread, as its inset shows it.
+pub(super) struct ProposalInfo {
+    /// `updated_at` of the comment it was looked up for; a newer comment
+    /// (new reply, new run) looks it up again.
+    updated_at: i64,
+    /// The run holding the proposal, once looked up.
+    run_id: Option<RunId>,
+    /// Its size, when the worktree could be read.
+    stat: Option<DiffStat>,
 }
 
 /// Re-attach mode: the next picked range becomes the comment's anchor.
@@ -376,6 +410,7 @@ impl DiffView {
         }
         threads.snapshot = snapshot;
         threads.by_path = by_path;
+        self.load_proposals(cx);
         self.with_scroll_anchor(|this| {
             for file in 0..this.files.len() {
                 if this.files[file].loaded().is_some() {
@@ -393,6 +428,130 @@ impl DiffView {
                 self.reveal_comment(id, cx);
             }
         }
+        cx.notify();
+    }
+
+    /// Looks up, on the tokio runtime, the proposal run and size of every
+    /// `Proposed` thread whose proposal is not known for its current state.
+    fn load_proposals(&mut self, cx: &mut Context<Self>) {
+        let proposed: HashMap<CommentId, i64> = self
+            .threads
+            .snapshot
+            .iter()
+            .filter(|comment| comment.status == CommentStatus::Proposed && !comment.outdated)
+            .map(|comment| (comment.id, comment.updated_at))
+            .collect();
+        let threads = &mut self.threads;
+        threads
+            .proposals
+            .retain(|id, info| proposed.get(id) == Some(&info.updated_at));
+        threads.rejecting.retain(|id| proposed.contains_key(id));
+        if threads
+            .confirm_reject
+            .is_some_and(|id| !proposed.contains_key(&id))
+        {
+            threads.confirm_reject = None;
+        }
+        let wanted: Vec<(CommentId, i64)> = proposed
+            .into_iter()
+            .filter(|(id, _)| {
+                threads
+                    .proposals
+                    .get(id)
+                    .is_none_or(|info| info.run_id.is_none())
+            })
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let app = cx.global::<AppContext>();
+        let (runs, store, worktrees) = (app.runs.clone(), app.store.runs(), app.worktrees.clone());
+        let job = spawn_job(cx, async move {
+            let mut found = Vec::with_capacity(wanted.len());
+            for (id, updated_at) in wanted {
+                let run_id = match runs.proposal_run(id).await {
+                    Ok(run_id) => run_id,
+                    Err(error) => {
+                        tracing::debug!(comment = %id, %error, "no proposal run for the thread");
+                        continue;
+                    }
+                };
+                let stat = match store.get(run_id).await {
+                    Ok(Some(run)) => match Sha::parse(&run.start_sha) {
+                        Some(start) => worktrees
+                            .staged_diff_stat(&run.worktree_path, &start)
+                            .await
+                            .inspect_err(|error| {
+                                tracing::debug!(run = %run_id, %error, "cannot size the proposal");
+                            })
+                            .ok(),
+                        None => None,
+                    },
+                    _ => None,
+                };
+                found.push((id, updated_at, run_id, stat));
+            }
+            found
+        });
+        self.threads.proposals_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(found) = job.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.threads.proposals_task = None;
+                for (id, updated_at, run_id, stat) in found {
+                    let current = this
+                        .comment(id)
+                        .is_some_and(|comment| comment.updated_at == updated_at);
+                    if current {
+                        this.threads.proposals.insert(
+                            id,
+                            ProposalInfo {
+                                updated_at,
+                                run_id: Some(run_id),
+                                stat,
+                            },
+                        );
+                        this.threads.heights.remove(&BlockKey::Thread(id));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Rejects a thread's proposal, as the proposal tab's Reject does: the
+    /// run manager deletes the worktree and the comment goes back to Open.
+    /// The rejection is not cut short if the view goes away.
+    fn reject_proposal(&mut self, id: CommentId, cx: &mut Context<Self>) {
+        self.threads.confirm_reject = None;
+        let Some(run_id) = self.threads.proposals.get(&id).and_then(|info| info.run_id) else {
+            return;
+        };
+        if !self.threads.rejecting.insert(id) {
+            return;
+        }
+        let app = cx.global::<AppContext>();
+        let runs = app.runs.clone();
+        let handle = app.runtime.spawn(async move { runs.reject(run_id).await });
+        cx.spawn(async move |this, cx| {
+            let error = match handle.await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+            this.update(cx, |this, cx| {
+                this.threads.rejecting.remove(&id);
+                if let Some(message) = error {
+                    tracing::warn!(%message, "cannot reject the proposal");
+                    this.hint = Some(format!("Could not reject the proposal: {message}").into());
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1056,7 +1215,7 @@ impl DiffView {
         }
         let draft = DraftKey::Reply(id);
         let text = CommentDrafts::read(cx, &draft).unwrap_or_default();
-        let slot = self.new_editor_slot(draft, text, "Reply… (Markdown)", cx);
+        let slot = self.new_editor_slot(draft, text, REPLY_HINT, cx);
         self.threads.replies.insert(id, slot);
         self.threads.heights.remove(&BlockKey::Thread(id));
         if let Some(file) = self.comment_file(id) {
@@ -1593,6 +1752,7 @@ impl DiffView {
         } else {
             (left, width)
         };
+        let width = width.min(MAX_CARD_WIDTH);
         let card = match &key {
             BlockKey::Thread(id) => match self.comment(*id) {
                 Some(comment) => self.render_thread(comment, cx),
@@ -1653,21 +1813,30 @@ impl DiffView {
             format!("Line {}", anchor.start_line)
         };
         let side = match anchor.side {
-            DiffSide::Old => "old",
-            DiffSide::New => "new",
+            DiffSide::Old => "old side",
+            DiffSide::New => "new side",
         };
 
         let chevron = div()
             .id((key.clone(), 0))
+            .flex()
             .flex_none()
-            .w(px(16.0))
-            .text_center()
-            .rounded_sm()
+            .items_center()
+            .justify_center()
+            .size(px(18.0))
+            .rounded(radius::XS)
             .cursor_pointer()
-            .text_color(colors.text_muted)
             .hover(|style| style.bg(colors.element_hover))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_thread(id, cx)))
-            .child(if collapsed { "▸" } else { "▾" });
+            .child(icon(
+                if collapsed {
+                    IconName::CaretRight
+                } else {
+                    IconName::CaretDown
+                },
+                px(12.0),
+                colors.text_muted,
+            ));
         let preview = collapsed.then(|| {
             let first = comment
                 .body_md
@@ -1695,91 +1864,87 @@ impl DiffView {
                     if count == 1 { "y" } else { "ies" }
                 ))
         });
-        // Location and age shrink first, so the menu button stays inside a
-        // narrow card.
-        let meta = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .min_w_0()
-            .overflow_hidden()
+        let location = div()
+            .id((key.clone(), 5))
+            .flex_none()
             .whitespace_nowrap()
             .text_xs()
-            .when(!collapsed, |meta| meta.flex_1())
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(colors.text_muted)
-                    .child(format!("{lines} · {side}")),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .text_color(colors.text_placeholder)
-                    .child(relative_time(comment.created_at / 1000, now)),
-            );
+            .text_color(colors.text_muted)
+            .child(lines)
+            .tooltip(text_tooltip(format!("{} ({side})", anchor.file_path)));
         let menu_button = div()
             .relative()
             .flex_none()
             .child(
-                div()
-                    .id((key.clone(), 1))
-                    .px_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_color(colors.text_muted)
+                icon_button((key.clone(), 1), IconName::DotsThree, "More actions", cx)
                     .when(menu_open, |button| button.bg(colors.element_selected))
-                    .hover(|style| style.bg(colors.element_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_menu(id, cx)))
-                    .child("⋯"),
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_menu(id, cx))),
             )
             .when(menu_open, |slot| {
                 slot.child(
                     deferred(
                         div()
                             .absolute()
-                            .top(px(22.0))
+                            .top(px(24.0))
                             .right_0()
                             .child(self.render_menu(comment, &key, cx)),
                     )
                     .with_priority(2),
                 )
             });
+        // The actions keep their size; the preview (or a spacer) gives way.
         let header = div()
             .flex()
+            .flex_none()
             .items_center()
             .gap_2()
             .min_w_0()
-            .px_2()
-            .py_1()
+            .h(THREAD_HEADER_HEIGHT)
+            .pl_2()
+            .pr_1()
             .when(!collapsed, |header| {
                 header.border_b_1().border_color(colors.border_variant)
             })
             .child(chevron)
+            .child(location)
             .child(status_chip(comment.status, colors))
             .when(comment.outdated, |header| {
                 header.child(chip("Outdated", colors.warning))
             })
-            .child(meta)
             .children(preview)
+            .when(!collapsed, |header| header.child(div().flex_1()))
             .children(replies)
             .children(self.render_run_button(comment, &key, cx))
             .when(comment.status == CommentStatus::Proposed, |header| {
                 header.child(
-                    button((key.clone(), 3), "View proposal", cx)
-                        .flex_none()
-                        .h(px(20.0))
-                        .text_xs()
-                        .text_color(colors.accent)
-                        .on_click(cx.listener(move |this, _, _, cx| this.view_proposal(id, cx))),
+                    button_with_icon(
+                        (key.clone(), 3),
+                        IconName::GitPullRequest,
+                        "View proposal",
+                        cx,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.view_proposal(id, cx))),
                 )
             })
             .child(menu_button);
 
-        let body = (!collapsed).then(|| {
-            let content = match self.threads.edits.get(&id) {
+        let proposal = self
+            .threads
+            .proposals
+            .get(&id)
+            .filter(|_| comment.status == CommentStatus::Proposed && !comment.outdated)
+            .and_then(|info| info.run_id.map(|run_id| (run_id, info.stat)));
+        // The inset goes in the Claude message of the run that produced the
+        // proposal; a run that left no message (stopped) gets its own row.
+        let inset_reply = proposal.and_then(|(run_id, _)| {
+            comment
+                .replies
+                .iter()
+                .rposition(|reply| reply.run.as_ref().is_some_and(|run| run.id == run_id))
+        });
+
+        let messages = (!collapsed).then(|| {
+            let root_body = match self.threads.edits.get(&id) {
                 Some(slot) => self.render_editor(slot, "Save", false, cx),
                 None => self.render_body(
                     &comment.body_md,
@@ -1787,55 +1952,57 @@ impl DiffView {
                     cx,
                 ),
             };
-            div().px_3().py_2().child(content)
-        });
-        let reply_list = (!collapsed && !comment.replies.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_col()
-                .children(comment.replies.iter().map(|reply| {
-                    let author = match reply.author {
-                        ReplyAuthor::User => "You",
-                        ReplyAuthor::Claude => "Claude",
-                    };
-                    // The run (model · effort) behind each Claude reply.
-                    let run = reply.run.as_ref().map(|run| {
-                        div()
-                            .text_color(colors.text_muted)
-                            .child(followup::label(&run.model, &run.effort))
-                    });
+            let root = self.render_message(
+                ReplyAuthor::User,
+                None,
+                relative_time(comment.created_at / 1000, now),
+                root_body,
+                None,
+                false,
+                cx,
+            );
+            let replies = comment
+                .replies
+                .iter()
+                .enumerate()
+                .map(|(index, reply)| {
+                    let body = self.render_body(
+                        &reply.body_md,
+                        SharedString::from(format!("reply-{}", reply.id)),
+                        cx,
+                    );
+                    let inset = proposal
+                        .filter(|_| inset_reply == Some(index))
+                        .map(|(run_id, stat)| self.render_proposal_inset(id, run_id, stat, cx));
+                    self.render_message(
+                        reply.author,
+                        reply.run.as_ref(),
+                        relative_time(reply.created_at / 1000, now),
+                        body,
+                        inset,
+                        true,
+                        cx,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let orphan_inset = match (proposal, inset_reply) {
+                (Some((run_id, stat)), None) => Some(
                     div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
                         .px_3()
                         .py_2()
                         .border_t_1()
                         .border_color(colors.border_variant)
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .text_xs()
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(colors.text)
-                                        .child(author),
-                                )
-                                .children(run)
-                                .child(
-                                    div()
-                                        .text_color(colors.text_placeholder)
-                                        .child(relative_time(reply.created_at / 1000, now)),
-                                ),
-                        )
-                        .child(self.render_body(
-                            &reply.body_md,
-                            SharedString::from(format!("reply-{}", reply.id)),
-                            cx,
-                        ))
-                }))
+                        .bg(colors.claude_soft)
+                        .child(self.render_proposal_inset(id, run_id, stat, cx)),
+                ),
+                _ => None,
+            };
+            div()
+                .flex()
+                .flex_col()
+                .child(root)
+                .children(replies)
+                .children(orphan_inset)
         });
         let session_lost = (!collapsed
             && comment.status != CommentStatus::Running
@@ -1884,6 +2051,21 @@ impl DiffView {
                 cx,
             )
         });
+        let confirm_reject = (self.threads.confirm_reject == Some(id)).then(|| {
+            confirm_bar(
+                &SharedString::from(format!("{key}-reject")),
+                "Reject this proposal? Its worktree is deleted and the comment goes back to Open.",
+                "Reject",
+                cx.listener(move |this, _, _, cx| this.reject_proposal(id, cx)),
+                "Cancel",
+                cx.listener(|this, _, _, cx| {
+                    this.threads.confirm_reject = None;
+                    cx.notify();
+                }),
+                colors.error,
+                cx,
+            )
+        });
         let reply_box = (!collapsed).then(|| {
             let followup = self.offers_followup(id);
             let content = match self.threads.replies.get(&id) {
@@ -1893,27 +2075,50 @@ impl DiffView {
                 Some(slot) => self.render_editor(slot, "Reply", false, cx),
                 None => div()
                     .id((key.clone(), 2))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(30.0))
+                    .pl_2()
+                    .pr_1p5()
+                    .rounded(radius::SM)
                     .border_1()
-                    .border_color(colors.border_variant)
+                    .border_color(colors.border)
                     .bg(colors.background)
                     .cursor_text()
-                    .text_color(colors.text_placeholder)
                     .on_click(cx.listener(move |this, _, _, cx| this.start_reply(id, cx)))
-                    .child(if followup {
-                        "Reply… (sent as a follow-up run, or as a note)"
-                    } else {
-                        "Reply…"
-                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_color(colors.text_placeholder)
+                            .child(REPLY_HINT),
+                    )
+                    .child(kbd(submit_keys(), cx))
                     .into_any_element(),
             };
             div()
+                .flex()
+                .flex_col()
+                .gap_1()
                 .px_3()
-                .py_2()
+                .pt_1p5()
+                .pb_2()
                 .border_t_1()
                 .border_color(colors.border_variant)
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(colors.text_muted)
+                        .child(if followup {
+                            "Reply · sent as a follow-up run, or as a note"
+                        } else {
+                            "Reply"
+                        }),
+                )
                 .child(content)
         });
 
@@ -1921,7 +2126,8 @@ impl DiffView {
             .id(key.clone())
             .flex()
             .flex_col()
-            .rounded_md()
+            .max_w(MAX_CARD_WIDTH)
+            .rounded(radius::LG)
             .border_1()
             .border_color(if focused {
                 colors.accent
@@ -1929,7 +2135,15 @@ impl DiffView {
                 colors.border
             })
             .bg(colors.elevated_surface)
-            .shadow_sm()
+            .shadow(vec![BoxShadow {
+                color: colors.shadow,
+                offset: point(px(0.0), px(10.0)),
+                blur_radius: px(28.0),
+                spread_radius: px(0.0),
+                inset: false,
+            }])
+            // Keeps the Claude bands inside the rounded corners.
+            .overflow_hidden()
             .text_color(colors.text)
             .cursor_default()
             .on_mouse_down(
@@ -1940,11 +2154,192 @@ impl DiffView {
                 }),
             )
             .child(header)
-            .children(body)
-            .children(reply_list)
+            .children(messages)
             .children(session_lost)
             .children(confirm)
+            .children(confirm_reject)
             .children(reply_box)
+            .into_any_element()
+    }
+
+    /// One message of a thread: a 24 px avatar beside the author, the meta
+    /// and the body. Claude's messages sit on a `claude_soft` band; `run`
+    /// adds its model, effort and duration to the meta.
+    #[allow(clippy::too_many_arguments)]
+    fn render_message(
+        &self,
+        author: ReplyAuthor,
+        run: Option<&ReplyRun>,
+        time: String,
+        body: AnyElement,
+        inset: Option<AnyElement>,
+        separated: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let colors = &theme.colors;
+        let claude = author == ReplyAuthor::Claude;
+        let (avatar, name, name_color) = if claude {
+            (claude_avatar(cx), "Claude", colors.claude_text)
+        } else {
+            (user_avatar(cx), "You", colors.text)
+        };
+        let choice = run.filter(|_| claude).map(|run| {
+            let choice = if run.effort.trim().is_empty() {
+                run.model.clone()
+            } else {
+                format!("{}, {}", run.model, run.effort)
+            };
+            div()
+                .flex_none()
+                .font_family(theme.fonts.code_family.clone())
+                .text_color(colors.text_muted)
+                .child(choice)
+        });
+        let mut when = time;
+        if let Some(ms) = run.filter(|_| claude).and_then(|run| run.duration_ms) {
+            when.push_str(" · ran ");
+            when.push_str(&format_ran(ms));
+        }
+        let meta = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_xs()
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(name_color)
+                    .child(name),
+            )
+            .children(choice)
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_color(colors.text_placeholder)
+                    .child(when),
+            );
+        div()
+            .flex()
+            .gap_2p5()
+            .px_3()
+            .py_2()
+            .when(separated, |row| {
+                row.border_t_1().border_color(colors.border_variant)
+            })
+            .when(claude, |row| row.bg(colors.claude_soft))
+            .child(avatar)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(div().flex().items_center().h(px(24.0)).child(meta))
+                    .child(body)
+                    .children(inset),
+            )
+            .into_any_element()
+    }
+
+    /// The proposal a run left, inside Claude's message: its size and the
+    /// View diff / Reject / Accept decision of the proposal tab.
+    fn render_proposal_inset(
+        &self,
+        id: CommentId,
+        run_id: RunId,
+        stat: Option<DiffStat>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let key = SharedString::from(format!("proposal-inset-{id}"));
+        let rejecting = self.threads.rejecting.contains(&id);
+        let size = stat.map(|stat| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .text_xs()
+                .child(div().text_color(colors.text_muted).child(format!(
+                    "{} file{}",
+                    stat.files,
+                    if stat.files == 1 { "" } else { "s" }
+                )))
+                .child(
+                    div()
+                        .text_color(colors.diff_added_text)
+                        .child(format!("+{}", stat.added)),
+                )
+                .child(
+                    div()
+                        .text_color(colors.diff_removed_text)
+                        .child(format!("−{}", stat.removed)),
+                )
+        });
+        let reject = if rejecting {
+            disabled_button((key.clone(), 1), "Rejecting…", cx).into_any_element()
+        } else {
+            reject_button((key.clone(), 1), cx)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.threads.confirm_reject = Some(id);
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
+        let accept = if rejecting {
+            disabled_button_with_icon((key.clone(), 2), IconName::Check, "Accept", cx)
+                .into_any_element()
+        } else {
+            accept_button((key.clone(), 2), "Accept", cx)
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(DiffViewEvent::AcceptProposal(run_id));
+                }))
+                .into_any_element()
+        };
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .mt_1()
+            .p_2()
+            .rounded(radius::MD)
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.background)
+            .child(icon(IconName::GitPullRequest, px(14.0), colors.accent))
+            .child(
+                div()
+                    .flex_none()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.text)
+                    .child("Proposal"),
+            )
+            .children(size)
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        button((key.clone(), 0), "View diff", cx).on_click(
+                            cx.listener(move |this, _, _, cx| this.view_proposal(id, cx)),
+                        ),
+                    )
+                    .child(reject)
+                    .child(accept),
+            )
             .into_any_element()
     }
 
@@ -2341,11 +2736,7 @@ impl DiffView {
                 cx,
             )
         });
-        let save_keys = crate::keymap::SHORTCUTS
-            .iter()
-            .find(|shortcut| shortcut.binding().action().as_any().is::<SubmitComment>())
-            .map(|shortcut| shortcut.display_keys())
-            .unwrap_or_default();
+        let save_keys = submit_keys();
         let save_button = if slot.saving {
             disabled_button((key.clone(), 1), "Saving…", cx).into_any_element()
         } else {
@@ -2453,6 +2844,25 @@ fn confirm_bar(
                 .on_click(on_yes),
         )
         .into_any_element()
+}
+
+/// The keys of [`SubmitComment`], for the keycap of reply inputs.
+fn submit_keys() -> String {
+    crate::keymap::SHORTCUTS
+        .iter()
+        .find(|shortcut| shortcut.binding().action().as_any().is::<SubmitComment>())
+        .map(|shortcut| shortcut.display_keys())
+        .unwrap_or_default()
+}
+
+/// A run's duration for "ran 42s" / "ran 3m 5s".
+fn format_ran(ms: i64) -> String {
+    let seconds = (ms.max(0) + 500) / 1000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
 }
 
 /// `sonnet · medium`, or just the model without an effort.
