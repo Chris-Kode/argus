@@ -292,6 +292,8 @@ pub fn run_gpui_app(
                 ThemeFonts::default(),
             ));
 
+            cx.set_reduce_motion(ui_settings.reduce_motion);
+
             keymap::bind_keys(cx);
             cx.on_action(|_: &keymap::Quit, cx| cx.quit());
             cx.set_menus([Menu::new("Argus").items([
