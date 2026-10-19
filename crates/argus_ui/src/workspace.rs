@@ -773,6 +773,12 @@ impl Workspace {
                     DiffViewEvent::ViewProposal(id) => {
                         this.open_proposal(ProposalSource::Comment(*id), cx);
                     }
+                    DiffViewEvent::AcceptProposal(run_id) => {
+                        let run_id = *run_id;
+                        tracing::debug!(run = %run_id, "accept requested from a thread");
+                        this.accept_flow
+                            .update(cx, |flow, cx| flow.accept(run_id, cx));
+                    }
                     // Only proposal diffs offer "Open in editor".
                     DiffViewEvent::OpenInEditor(_) => {}
                 }),

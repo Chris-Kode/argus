@@ -54,6 +54,7 @@ icon_names! {
     CaretRight => "caret-right.svg",
     ChatText => "chat-text.svg",
     Check => "check.svg",
+    DotsThree => "dots-three.svg",
     FolderSimple => "folder-simple.svg",
     GitBranch => "git-branch.svg",
     GitPullRequest => "git-pull-request.svg",

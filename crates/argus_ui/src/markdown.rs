@@ -495,7 +495,9 @@ fn render_text(text: &RichText, id: &SharedString, counter: &mut usize, cx: &App
                 });
             }
             if format.code {
-                style.background_color = Some(colors.element_selected.opacity(0.6));
+                // The `background` chip of inline code (Panoptes #56 §5). Text
+                // highlights cannot round their corners, so the chip is square.
+                style.background_color = Some(colors.background);
             }
             if format.link {
                 style.color = Some(colors.accent);

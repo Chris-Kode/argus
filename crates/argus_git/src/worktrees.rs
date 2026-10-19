@@ -69,6 +69,17 @@ pub struct ChangedFile {
     pub kind: ChangeKind,
 }
 
+/// The size of a staged change: files touched and lines added / removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiffStat {
+    /// Changed files (binary files included).
+    pub files: u64,
+    /// Lines added.
+    pub added: u64,
+    /// Lines removed.
+    pub removed: u64,
+}
+
 /// Everything a run changed relative to its start commit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Patch {
@@ -441,6 +452,16 @@ impl WorktreeManager {
     /// Read-only: it relies on the index a finished run left staged and does
     /// not stage anything itself.
     pub async fn staged_line_counts(&self, path: &Path, start_sha: &Sha) -> Result<(u64, u64)> {
+        let stat = self.staged_diff_stat(path, start_sha).await?;
+        Ok((stat.added, stat.removed))
+    }
+
+    /// Files changed and lines added / removed by the staged change of the
+    /// worktree at `path`, relative to `start_sha`
+    /// (`git diff --cached --numstat <start_sha>`). Binary files count as a
+    /// changed file with zero lines. Read-only, like
+    /// [`Self::staged_line_counts`].
+    pub async fn staged_diff_stat(&self, path: &Path, start_sha: &Sha) -> Result<DiffStat> {
         self.guard(path)?;
         let start = start_sha.to_hex();
         let args = [
@@ -455,9 +476,10 @@ impl WorktreeManager {
             "--",
         ];
         let output = GitCli::new(path).run(args).await?;
-        let counts = String::from_utf8_lossy(&output.stdout).lines().fold(
-            (0, 0),
-            |(added, removed), line| {
+        let stat = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .fold(DiffStat::default(), |stat, line| {
                 let mut fields = line.split('\t');
                 // Binary files report `-` for both counts.
                 let mut count = || {
@@ -468,10 +490,13 @@ impl WorktreeManager {
                 };
                 let line_added = count();
                 let line_removed = count();
-                (added + line_added, removed + line_removed)
-            },
-        );
-        Ok(counts)
+                DiffStat {
+                    files: stat.files + 1,
+                    added: stat.added + line_added,
+                    removed: stat.removed + line_removed,
+                }
+            });
+        Ok(stat)
     }
 
     /// `git commit -F -` in an Argus worktree, with `message` on stdin.
