@@ -5,6 +5,7 @@
 //! the [`AppContext`] global; colors and fonts through the [`Theme`] global.
 
 pub mod accept;
+mod assets;
 pub mod branch_picker;
 pub mod claude_settings;
 pub mod claude_status;
@@ -17,6 +18,7 @@ pub mod file_tree;
 pub mod followup;
 mod fonts;
 pub mod fuzzy;
+pub mod icons;
 pub mod jobs;
 pub mod keymap;
 pub mod markdown;
@@ -31,6 +33,8 @@ pub mod text_editor;
 pub mod text_field;
 pub mod theme;
 mod workspace;
+
+pub use assets::Assets;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -57,7 +61,10 @@ pub use run_panel::{RunPanel, RunPanelEvent};
 pub use session::{Comparison, DiffTarget, RepoSession, SessionEvent, Side};
 pub use settings::{Settings, UiSettings};
 pub use text_editor::{TextEditor, TextEditorEvent};
-pub use theme::{ActiveTheme, Appearance, SyntaxTheme, Theme, ThemeColors, ThemeFonts, ThemeMode};
+pub use theme::{
+    ActiveTheme, Appearance, EYE_PUPIL, SyntaxTheme, Theme, ThemeColors, ThemeFamily, ThemeFonts,
+    ThemeMode,
+};
 pub use workspace::Workspace;
 
 /// Application-wide handles to the services, stored as a GPUI global.
@@ -260,64 +267,75 @@ pub fn run_gpui_app(
     runs.start_detection(&runtime);
 
     argus_store::mark_ui_thread();
-    gpui_platform::application().run(move |cx: &mut App| {
-        cx.set_global(AppContext::new(
-            runtime.clone(),
-            store.clone(),
-            git.clone(),
-            worktrees.clone(),
-            runs.clone(),
-        ));
-        cx.set_global(BackgroundJobs::default());
-        if let Some(options) = launch.perf {
-            perf::install(options, launch.launched, cx);
-        }
-        // A provisional theme so views can render before the workspace
-        // resolves fonts and the window appearance.
-        cx.set_global(Theme::new(Appearance::Dark, ThemeFonts::default()));
-
-        keymap::bind_keys(cx);
-        cx.on_action(|_: &keymap::Quit, cx| cx.quit());
-        cx.set_menus([Menu::new("Argus").items([
-            MenuItem::action("Open Repository…", keymap::OpenRepository),
-            MenuItem::action("Settings…", keymap::OpenSettings),
-            MenuItem::action("Keyboard Shortcuts", keymap::ToggleKeyboardShortcuts),
-            MenuItem::separator(),
-            MenuItem::action("Quit Argus", keymap::Quit),
-        ])]);
-        // Linux and Windows keep running without windows otherwise.
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
+    gpui_platform::application()
+        .with_assets(Assets)
+        .run(move |cx: &mut App| {
+            cx.set_global(AppContext::new(
+                runtime.clone(),
+                store.clone(),
+                git.clone(),
+                worktrees.clone(),
+                runs.clone(),
+            ));
+            cx.set_global(BackgroundJobs::default());
+            if let Some(options) = launch.perf {
+                perf::install(options, launch.launched, cx);
             }
-        })
-        .detach();
+            // Before any font is resolved: the bundled IBM Plex families head
+            // both preference lists.
+            fonts::register_bundled_fonts(cx);
+            // A provisional theme so views can render before the workspace
+            // resolves fonts and the window appearance.
+            cx.set_global(Theme::new(
+                ui_settings.theme_family,
+                Appearance::Dark,
+                ThemeFonts::default(),
+            ));
 
-        let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
-        let window = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Argus".into()),
-                    // macOS draws the traffic lights over Argus' own title bar.
-                    appears_transparent: cfg!(target_os = "macos"),
-                    traffic_light_position: Some(gpui::point(px(9.0), px(10.0))),
-                }),
-                window_min_size: Some(size(px(720.0), px(480.0))),
-                ..Default::default()
-            },
-            |window, cx| {
-                let settings = ui_settings.clone();
-                let open = launch.open.clone();
-                cx.new(|cx| Workspace::new(settings, open, window, cx))
-            },
-        );
-        if let Err(error) = window {
-            tracing::error!(%error, "failed to open the Argus window");
-            cx.quit();
-            return;
-        }
+            cx.set_reduce_motion(ui_settings.reduce_motion);
 
-        cx.activate(true);
-    });
+            keymap::bind_keys(cx);
+            cx.on_action(|_: &keymap::Quit, cx| cx.quit());
+            cx.set_menus([Menu::new("Argus").items([
+                MenuItem::action("Open Repository…", keymap::OpenRepository),
+                MenuItem::action("Settings…", keymap::OpenSettings),
+                MenuItem::action("Keyboard Shortcuts", keymap::ToggleKeyboardShortcuts),
+                MenuItem::separator(),
+                MenuItem::action("Quit Argus", keymap::Quit),
+            ])]);
+            // Linux and Windows keep running without windows otherwise.
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+
+            let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
+            let window = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Argus".into()),
+                        // macOS draws the traffic lights over Argus' own title bar.
+                        appears_transparent: cfg!(target_os = "macos"),
+                        traffic_light_position: Some(gpui::point(px(9.0), px(10.0))),
+                    }),
+                    window_min_size: Some(size(px(720.0), px(480.0))),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let settings = ui_settings.clone();
+                    let open = launch.open.clone();
+                    cx.new(|cx| Workspace::new(settings, open, window, cx))
+                },
+            );
+            if let Err(error) = window {
+                tracing::error!(%error, "failed to open the Argus window");
+                cx.quit();
+                return;
+            }
+
+            cx.activate(true);
+        });
 }

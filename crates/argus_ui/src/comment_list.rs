@@ -97,6 +97,24 @@ impl CommentList {
         self.snapshot.len()
     }
 
+    /// Number of threads in `status` (whatever the filter).
+    pub fn status_count(&self, status: CommentStatus) -> usize {
+        self.snapshot
+            .iter()
+            .filter(|comment| comment.status == status)
+            .count()
+    }
+
+    /// Sets the filter to show `status` only (the status-bar counters).
+    pub fn show_only(&mut self, status: CommentStatus, cx: &mut Context<Self>) {
+        self.hidden = STATUSES
+            .into_iter()
+            .filter(|other| *other != status)
+            .collect();
+        self.rebuild_rows();
+        cx.notify();
+    }
+
     /// Marks `id` as the selected row (the thread shown in the diff).
     pub fn select(&mut self, id: CommentId, cx: &mut Context<Self>) {
         self.selected = Some(id);

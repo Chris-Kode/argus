@@ -15,10 +15,14 @@
 //! # Rows
 //!
 //! Each file is a block of uniform-height rows ([`argus_diff::layout::Row`]):
-//! its header, then hunk headers, lines and context expanders. Rows of all
-//! files form one flat virtual index (`starts[file] + row`), so a
-//! [`uniform_list`] lays out only the rows on screen and the scroll position
-//! is plain arithmetic.
+//! its header, then hunk headers, lines and context expanders, followed by
+//! one spacer row the view adds ([`SPACER_ROWS`]). Rows of all files form
+//! one flat virtual index (`starts[file] + row`), so a [`uniform_list`] lays
+//! out only the rows on screen and the scroll position is plain arithmetic.
+//!
+//! Each file is drawn as a card (Panoptes #56 §5); each row paints its
+//! slice of the outline, and the spacer row draws the rounded bottom edge
+//! and gap to the next card.
 //!
 //! # Lazy loading
 //!
@@ -90,6 +94,7 @@ use argus_diff::layout::{
     self, DisplayLine, Expand, FileRows, GapExpansion, LayoutOptions, Row, RowKey, RowLine,
     ViewMode,
 };
+use argus_diff::review::CommentStatus;
 use argus_diff::{
     ChangeKind, DiffContent, DiffSession, FileDiff, FileEntry, FileList, FileStats, LineKind,
     LoadMode, Side as DiffSide, StatsEvent, TextDiff,
@@ -99,7 +104,7 @@ use argus_highlight::{
     JobControl, Language, Outcome, Priority, Span,
 };
 use gpui::{
-    AnyElement, Context, DispatchPhase, Entity, EventEmitter, FocusHandle, FontWeight,
+    AnyElement, BoxShadow, Context, DispatchPhase, Entity, EventEmitter, FocusHandle, FontWeight,
     HighlightStyle, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     ScrollWheelEvent, SharedString, StyledText, Subscription, Task, UniformListScrollHandle,
     Window, canvas, div, point, prelude::*, px, uniform_list,
@@ -107,7 +112,11 @@ use gpui::{
 
 use crate::AppContext;
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
-use crate::components::{button, placeholder, toggle_button};
+use crate::components::{
+    BadgeSize, button, chip, claude_activity, kbd, letter_badge, muted_button_with_icon,
+    placeholder, radius, toggle_button,
+};
+use crate::icons::{IconName, icon};
 use crate::jobs::BackgroundJobs;
 use crate::keymap::ToggleSoftWrap;
 use crate::perf;
@@ -132,7 +141,29 @@ const MIN_THUMB_HEIGHT: f32 = 24.0;
 /// Soft wrap never goes narrower than this many columns.
 const MIN_WRAP_COLUMNS: u32 = 20;
 /// Height of the toolbar above the rows.
-const TOOLBAR_HEIGHT: Pixels = px(32.0);
+const TOOLBAR_HEIGHT: Pixels = px(34.0);
+/// Rows of a file header card (see [`layout::HEADER_ROWS`]).
+const HEADER_ROWS: usize = layout::HEADER_ROWS;
+/// Rows after each file's last row: the bottom edge of its card and the
+/// gap to the next card. Not part of the layout rows; the view adds them.
+const SPACER_ROWS: usize = 1;
+/// Space between the file cards and the left and right edges of the list.
+/// The right one holds the scrollbar.
+const CARD_INSET: Pixels = px(12.0);
+/// Outline width of a file card.
+const CARD_BORDER: Pixels = px(1.0);
+/// Space between two file cards.
+const CARD_GAP: Pixels = px(10.0);
+/// Width of the hunk-header and selection rails.
+const RAIL_WIDTH: Pixels = px(2.0);
+/// Size of the status markers in the comment column.
+const MARKER_DOT: Pixels = px(8.0);
+/// The `accent_soft` halo around a Proposed marker.
+const MARKER_HALO: Pixels = px(3.0);
+/// The Running marker (the Claude activity eye).
+const MARKER_ACTIVITY: Pixels = px(12.0);
+/// Icon size in file card headers.
+const HEADER_ICON_SIZE: Pixels = px(14.0);
 /// Width of the column holding the hover "+" comment button.
 const COMMENT_COLUMN_WIDTH: Pixels = px(20.0);
 /// Padding around a line-number cell.
@@ -187,6 +218,9 @@ pub enum DiffViewEvent {
     },
     /// "View proposal" on a `Proposed` comment thread.
     ViewProposal(argus_diff::review::CommentId),
+    /// Accept in a thread's proposal inset: accept this run's proposal, as
+    /// the proposal tab's Accept does.
+    AcceptProposal(argus_store::RunId),
     /// A proposal's "Open in editor" on a changed file (repository-relative
     /// path).
     OpenInEditor(String),
@@ -343,9 +377,15 @@ impl FileSlot {
         }
     }
 
-    /// Rows the file takes in the list.
+    /// Rows the file takes in the list: its layout rows (only the header
+    /// when collapsed) and the card spacer after them.
     fn len(&self) -> usize {
-        if self.collapsed { 1 } else { self.full_len }
+        let rows = if self.collapsed {
+            HEADER_ROWS
+        } else {
+            self.full_len
+        };
+        rows + SPACER_ROWS
     }
 
     fn loaded(&self) -> Option<&LoadedFile> {
@@ -860,7 +900,7 @@ impl DiffView {
                 self.relayout(|this| {
                     let slot = &mut this.files[file];
                     slot.state = FileState::Failed(message.into());
-                    slot.full_len = 2;
+                    slot.full_len = HEADER_ROWS + 1;
                 });
             }
         }
@@ -1458,7 +1498,7 @@ impl DiffView {
             ViewMode::Split => {
                 // Unlinked: the column under the pointer scrolls.
                 let split = self.split_columns();
-                let middle = self.list_bounds().origin.x + split.half;
+                let middle = self.list_bounds().origin.x + CARD_INSET + CARD_BORDER + split.half;
                 let side = usize::from(event.position.x >= middle);
                 (split.code, side..side + 1)
             }
@@ -1502,7 +1542,9 @@ impl DiffView {
                 .iter()
                 .map(|&row| row as usize)
                 .collect(),
-            FileState::Pending | FileState::Evicted if slot.full_len > 1 => vec![1],
+            FileState::Pending | FileState::Evicted if slot.full_len > HEADER_ROWS => {
+                vec![HEADER_ROWS]
+            }
             _ => Vec::new(),
         }
     }
@@ -1554,7 +1596,7 @@ impl DiffView {
         if self.files.is_empty() {
             return;
         }
-        let below_header = self.top_row() + 1;
+        let below_header = self.top_row() + HEADER_ROWS;
         for file in self.file_at(self.top_row())..self.files.len() {
             let start = self.starts[file];
             if let Some(row) = self
@@ -1563,7 +1605,7 @@ impl DiffView {
                 .map(|row| start + row)
                 .find(|&row| row > below_header)
             {
-                self.scroll_to_row(row - 1, cx);
+                self.scroll_to_row(row - HEADER_ROWS, cx);
                 return;
             }
         }
@@ -1575,7 +1617,7 @@ impl DiffView {
         if self.files.is_empty() {
             return;
         }
-        let below_header = self.top_row() + 1;
+        let below_header = self.top_row() + HEADER_ROWS;
         for file in (0..=self.file_at(self.top_row())).rev() {
             let start = self.starts[file];
             if let Some(row) = self
@@ -1585,7 +1627,7 @@ impl DiffView {
                 .map(|row| start + row)
                 .find(|&row| row < below_header)
             {
-                self.scroll_to_row(row - 1, cx);
+                self.scroll_to_row(row - HEADER_ROWS, cx);
                 return;
             }
         }
@@ -1706,9 +1748,11 @@ impl DiffView {
                 let row = self.row_at(event.position.y);
                 let start = self.starts[selection.file];
                 let len = self.files[selection.file].len();
-                // Stay within the file; headers and expanders in between are
-                // caught when the selection is resolved.
-                let head = row.clamp(start + 1, start + len.saturating_sub(1).max(1)) - start;
+                // Stay within the file's body (not its header or the card
+                // spacer); hunk headers and expanders in between are caught
+                // when the selection is resolved.
+                let last = len.saturating_sub(SPACER_ROWS + 1).max(HEADER_ROWS);
+                let head = row.clamp(start + HEADER_ROWS, start + last) - start;
                 // Over a comment block, the line it hangs under.
                 let head = self.line_row_at_or_above(selection.file, head);
                 if head != selection.head {
@@ -1835,13 +1879,19 @@ impl DiffView {
         }
     }
 
+    /// Inner width of a file card: the list minus the insets (the right one
+    /// holds the scrollbar) and the card outline.
+    fn card_width(&self) -> Pixels {
+        (self.list_bounds().size.width - CARD_INSET * 2.0 - CARD_BORDER * 2.0).max(Pixels::ZERO)
+    }
+
     fn columns(&self) -> Columns {
         let char_width = self.metrics.char_width;
         let number = char_width * self.gutter_digits as f32 + NUMBER_PADDING;
         let gutter = number * 2.0;
         let sign = char_width * 2.0;
-        let width = self.list_bounds().size.width;
-        let code = (width - gutter - COMMENT_COLUMN_WIDTH - sign - CODE_PADDING - SCROLLBAR_WIDTH)
+        let width = self.card_width();
+        let code = (width - gutter - COMMENT_COLUMN_WIDTH - sign - CODE_PADDING)
             .max(char_width * MIN_WRAP_COLUMNS as f32);
         Columns {
             number,
@@ -1856,8 +1906,8 @@ impl DiffView {
         let char_width = self.metrics.char_width;
         let number = char_width * self.gutter_digits as f32 + NUMBER_PADDING;
         let sign = char_width * 2.0;
-        let width = self.list_bounds().size.width;
-        let half = ((width - SCROLLBAR_WIDTH - SPLIT_DIVIDER_WIDTH) / 2.0).max(Pixels::ZERO);
+        let width = self.card_width();
+        let half = ((width - SPLIT_DIVIDER_WIDTH) / 2.0).max(Pixels::ZERO);
         let code = (half - number - COMMENT_COLUMN_WIDTH - sign - CODE_PADDING)
             .max(char_width * MIN_WRAP_COLUMNS as f32);
         SplitColumns {
@@ -1905,46 +1955,99 @@ impl DiffView {
         if !self.proposal && perf::enabled(cx) {
             let shows_lines = range.clone().any(|row| {
                 let file = self.file_at(row);
-                row > self.starts[file] && self.files[file].loaded().is_some()
+                row >= self.starts[file] + HEADER_ROWS && self.files[file].loaded().is_some()
             });
             if shows_lines {
                 perf::mark_painted(perf::Milestone::FirstDiffPainted, cx);
             }
         }
+        let border = cx.theme().colors.border;
+        let row_height = self.metrics.row_height;
+        // Every body row of a file is a slice of its card: the list inset,
+        // then the card outline on both sides.
+        let slice = move |clip: bool, content: Option<AnyElement>| {
+            div()
+                .h(row_height)
+                .w_full()
+                .px(CARD_INSET)
+                .child(
+                    div()
+                        .relative()
+                        .size_full()
+                        .border_l(CARD_BORDER)
+                        .border_r(CARD_BORDER)
+                        .border_color(border)
+                        .when(clip, |slice| slice.overflow_hidden())
+                        .children(content),
+                )
+                .into_any_element()
+        };
         range
             .map(|row| {
                 let file = self.file_at(row);
                 let local = row - self.starts[file];
                 let entry = &list.entries()[file];
-                if let Some(Row::Inline { item, part }) = self.files[file]
+                let slot = &self.files[file];
+                if local + SPACER_ROWS >= slot.len() {
+                    return self.render_card_end(file, cx);
+                }
+                if local < HEADER_ROWS {
+                    // The header card spans the header rows; it is drawn
+                    // from the first one and overflows into the others.
+                    // When that row is above the viewport the sticky header
+                    // covers the rest.
+                    return div()
+                        .relative()
+                        .h(row_height)
+                        .w_full()
+                        .px(CARD_INSET)
+                        .when(local == 0, |wrapper| {
+                            wrapper.child(self.render_file_header(file, entry, false, cx))
+                        })
+                        .into_any_element();
+                }
+                if let Some(Row::Inline { item, part }) = slot
                     .loaded()
                     .and_then(|loaded| loaded.rows.rows.get(local).copied())
                 {
                     // A comment block overflows its row; it is drawn once,
                     // from its first visible row.
                     let first_visible = part == 0 || row == self.render_start;
-                    return div()
-                        .relative()
-                        .h(self.metrics.row_height)
-                        .w_full()
-                        .when(first_visible, |wrapper| {
-                            wrapper.child(self.render_inline_block(file, item as usize, part, cx))
-                        })
-                        .into_any_element();
+                    let block = first_visible
+                        .then(|| self.render_inline_block(file, item as usize, part, cx));
+                    return slice(false, block);
                 }
-                let element = if local == 0 {
-                    self.render_file_header(file, entry, false, cx)
-                } else {
-                    self.render_body_row(file, entry, local, row, columns, cx)
-                };
-                div()
-                    .h(self.metrics.row_height)
-                    .w_full()
-                    .overflow_hidden()
-                    .child(element)
-                    .into_any_element()
+                let element = self.render_body_row(file, entry, local, row, columns, cx);
+                slice(true, Some(element))
             })
             .collect()
+    }
+
+    /// The row after a file's last row: the rounded bottom edge of its card
+    /// (an expanded file; a collapsed card is closed by its header) and the
+    /// gap to the next card.
+    fn render_card_end(&self, file: usize, cx: &mut Context<Self>) -> AnyElement {
+        let colors = &cx.theme().colors;
+        let row_height = self.metrics.row_height;
+        let cap = (row_height - CARD_GAP).max(px(4.0));
+        div()
+            .h(row_height)
+            .w_full()
+            .px(CARD_INSET)
+            .when(!self.files[file].collapsed, |row| {
+                row.child(
+                    div()
+                        .w_full()
+                        .h(cap)
+                        .border_l(CARD_BORDER)
+                        .border_r(CARD_BORDER)
+                        .border_b(CARD_BORDER)
+                        .border_color(colors.border)
+                        .rounded_b(radius::LG.min(cap))
+                        .bg(colors.background),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_body_row(
@@ -1961,30 +2064,54 @@ impl DiffView {
         match &slot.state {
             FileState::Loaded(loaded) => match loaded.rows.rows.get(local) {
                 Some(&Row::HunkHeader { hunk }) => {
-                    let header = loaded
-                        .diff
-                        .text()
+                    let text = loaded.diff.text();
+                    let header = text
                         .and_then(|text| text.hunks().get(hunk as usize))
                         .map(|hunk| hunk.header())
                         .unwrap_or_default();
+                    // A bounded look-back over the source, at most a few
+                    // hundred lines per header on screen.
+                    let function = text
+                        .and_then(|text| text.hunk_function(hunk as usize))
+                        .map(|name| name.to_owned());
                     div()
+                        .relative()
                         .flex()
+                        .items_center()
+                        .gap_2()
                         .size_full()
-                        .bg(colors.accent.opacity(0.08))
+                        .bg(colors.hunk_header_background)
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left_0()
+                                .w(RAIL_WIDTH)
+                                .bg(colors.accent_border),
+                        )
                         .child(
                             div()
                                 .flex_none()
-                                .h_full()
-                                .w(columns.gutter + COMMENT_COLUMN_WIDTH)
-                                .bg(colors.accent.opacity(0.12)),
+                                .w(columns.gutter + COMMENT_COLUMN_WIDTH + columns.sign),
                         )
                         .child(
                             div()
-                                .pl(columns.sign + CODE_PADDING)
-                                .text_color(colors.text_muted)
+                                .flex_none()
+                                .pl(CODE_PADDING)
+                                .text_color(colors.text_placeholder)
                                 .whitespace_nowrap()
                                 .child(header),
                         )
+                        .children(function.map(|function| {
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_color(colors.text_muted)
+                                .child(function)
+                        }))
                         .into_any_element()
                 }
                 Some(&Row::Expander { gap }) => {
@@ -2004,7 +2131,7 @@ impl DiffView {
                     div().into_any_element()
                 }
             },
-            FileState::Failed(_) if local == 1 => {
+            FileState::Failed(_) if local == HEADER_ROWS => {
                 self.render_notice(file, entry, slot, columns, cx)
             }
             FileState::Failed(_) => div().into_any_element(),
@@ -2014,7 +2141,7 @@ impl DiffView {
                 .size_full()
                 .bg(colors.surface.opacity(0.35))
                 .child(div().w(columns.gutter + COMMENT_COLUMN_WIDTH).h_full())
-                .when(local == 1, |row| {
+                .when(local == HEADER_ROWS, |row| {
                     row.child(
                         div()
                             .pl(columns.sign + CODE_PADDING)
@@ -2058,7 +2185,7 @@ impl DiffView {
                 .children(value.filter(|_| first_segment).map(|n| n.to_string()))
         };
         let gutter = self
-            .gutter(("diff-gutter", row), selected, cx)
+            .gutter(("diff-gutter", row), line.kind, selected, cx)
             .w(columns.gutter)
             .on_mouse_down(
                 MouseButton::Left,
@@ -2094,12 +2221,15 @@ impl DiffView {
                     file,
                     local,
                     None,
+                    CommentMarks {
+                        status: self
+                            .comment_marker(file, DiffSide::New, line.new_line)
+                            .or_else(|| self.comment_marker(file, DiffSide::Old, line.old_line))
+                            .filter(|_| first_segment),
+                        in_range: self.in_comment_range(file, DiffSide::Old, line.old_line)
+                            || self.in_comment_range(file, DiffSide::New, line.new_line),
+                    },
                     cx,
-                )
-                .when(
-                    self.in_comment_range(file, DiffSide::Old, line.old_line)
-                        || self.in_comment_range(file, DiffSide::New, line.new_line),
-                    |column| column.bg(colors.warning.opacity(0.35)),
                 ),
             )
             .child(
@@ -2208,7 +2338,7 @@ impl DiffView {
             DiffSide::New => line.new_line,
         };
         let gutter = self
-            .gutter((gutter_id, row), selected, cx)
+            .gutter((gutter_id, row), line.kind, selected, cx)
             .w(columns.number)
             .on_mouse_down(
                 MouseButton::Left,
@@ -2248,11 +2378,14 @@ impl DiffView {
                     file,
                     local,
                     Some(side),
+                    CommentMarks {
+                        status: self
+                            .comment_marker(file, side, number)
+                            .filter(|_| first_segment),
+                        in_range: self.in_comment_range(file, side, number),
+                    },
                     cx,
-                )
-                .when(self.in_comment_range(file, side, number), |column| {
-                    column.bg(colors.warning.opacity(0.35))
-                }),
+                ),
             )
             .child(
                 div()
@@ -2266,32 +2399,51 @@ impl DiffView {
     }
 
     /// The clickable line-number gutter of a line row, without its numbers.
+    /// Numbers are `text_placeholder` on context rows and the diff number
+    /// colors on added and removed rows; a selected row gets an `accent`
+    /// number and a 2 px `accent` rail at its left edge.
     fn gutter(
         &self,
         id: (&'static str, usize),
+        kind: LineKind,
         selected: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let colors = &cx.theme().colors;
+        let number_color = if selected {
+            colors.accent
+        } else {
+            match kind {
+                LineKind::Added => colors.diff_added_number,
+                LineKind::Removed => colors.diff_removed_number,
+                LineKind::Context => colors.text_placeholder,
+            }
+        };
         div()
             .id(id)
+            .relative()
             .flex()
             .flex_none()
             .h_full()
-            .bg(if selected {
-                colors.accent.opacity(0.35)
-            } else {
-                colors.background.opacity(0.4)
-            })
-            .text_color(if selected {
-                colors.text
-            } else {
-                colors.text_placeholder
-            })
+            .bg(colors.background.opacity(0.4))
+            .text_color(number_color)
             .cursor_pointer()
+            .when(selected, |gutter| {
+                gutter.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .w(RAIL_WIDTH)
+                        .bg(colors.accent),
+                )
+            })
     }
 
-    /// The column holding the hover "+" comment button of a line row.
+    /// The comment column of a line row: the status marker of a thread
+    /// ending on the line (Panoptes #56 §3), a quiet rail along commented
+    /// ranges, and the hover "+" comment button over them.
     #[allow(clippy::too_many_arguments)]
     fn comment_column(
         &self,
@@ -2301,41 +2453,83 @@ impl DiffView {
         file: usize,
         local: usize,
         side: Option<DiffSide>,
+        marks: CommentMarks,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let colors = cx.theme().colors.clone();
+        let marker: Option<AnyElement> = marks.status.and_then(|status| match status {
+            CommentStatus::Open => Some(
+                div()
+                    .size(MARKER_DOT)
+                    .rounded_full()
+                    .bg(colors.text_muted)
+                    .into_any_element(),
+            ),
+            CommentStatus::Running => Some(claude_activity(MARKER_ACTIVITY, cx)),
+            CommentStatus::Proposed => Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(MARKER_DOT + MARKER_HALO * 2.0)
+                    .rounded_full()
+                    .bg(colors.accent_soft)
+                    .child(div().size(MARKER_DOT).rounded_full().bg(colors.accent))
+                    .into_any_element(),
+            ),
+            CommentStatus::Resolved => {
+                Some(icon(IconName::Check, MARKER_ACTIVITY, colors.text_muted).into_any_element())
+            }
+            CommentStatus::Dismissed => None,
+        });
         div()
+            .relative()
             .flex()
             .flex_none()
             .items_center()
             .justify_center()
             .w(COMMENT_COLUMN_WIDTH)
             .h_full()
+            .when(marks.in_range && marker.is_none(), |column| {
+                column.child(div().w(RAIL_WIDTH).h_full().bg(colors.border))
+            })
+            .children(marker)
             .when(first_segment && !self.proposal, |column| {
                 let accent = colors.accent;
                 column.child(
                     div()
-                        .id(id)
-                        .invisible()
-                        .group_hover(group, |style| style.visible())
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .size(px(16.0))
-                        .rounded_sm()
-                        .bg(accent)
-                        .text_color(colors.accent_text)
-                        .font_weight(FontWeight::BOLD)
-                        .cursor_pointer()
-                        .hover(move |style| style.bg(accent.opacity(0.85)))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.request_comment(file, local, side, cx);
-                            }),
-                        )
-                        .child("+"),
+                        .child(
+                            div()
+                                .id(id)
+                                .invisible()
+                                .group_hover(group, |style| style.visible())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(16.0))
+                                .rounded(radius::XS)
+                                .bg(accent)
+                                .text_color(colors.accent_text)
+                                .font_weight(FontWeight::BOLD)
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(accent.opacity(0.85)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.request_comment(file, local, side, cx);
+                                    }),
+                                )
+                                .child("+"),
+                        ),
                 )
             })
     }
@@ -2394,7 +2588,7 @@ impl DiffView {
             .overflow_hidden()
             .pl(CODE_PADDING)
             .whitespace_nowrap()
-            .when(selected, |code| code.bg(colors.accent.opacity(0.1)))
+            .when(selected, |code| code.bg(colors.accent_soft))
             .child(div().relative().left(-shift).child(code))
     }
 
@@ -2528,6 +2722,10 @@ impl DiffView {
             .into_any_element()
     }
 
+    /// The header card of a file (Panoptes #56 §5): caret, letter badge,
+    /// path, counts, thread count, extras and the Viewed toggle, on
+    /// `surface` across the [`HEADER_ROWS`] rows. A collapsed file is this
+    /// card alone, closed on all sides; the sticky copy uses the same look.
     fn render_file_header(
         &self,
         file: usize,
@@ -2538,33 +2736,24 @@ impl DiffView {
         let theme = cx.theme().clone();
         let colors = &theme.colors;
         let slot = &self.files[file];
+        let collapsed = slot.collapsed;
         let id_base = if sticky { "diff-sticky" } else { "diff-header" };
-        let (badge, badge_color) = match entry.kind {
-            ChangeKind::Added => ("A", colors.diff_added_text),
-            ChangeKind::Deleted => ("D", colors.diff_removed_text),
-            ChangeKind::Modified => ("M", colors.warning),
-            ChangeKind::Renamed => ("R", colors.accent),
-            ChangeKind::ModeChanged => ("M", colors.text_muted),
-            ChangeKind::TypeChanged => ("T", colors.warning),
-        };
-        let path = match &entry.old_path {
-            Some(old) => format!("{old} → {}", entry.path),
-            None => entry.path.clone(),
+        let code_size = theme.fonts.code_size;
+        let mono = |text: String, color: Hsla| {
+            div()
+                .flex_none()
+                .font_family(theme.fonts.code_family.clone())
+                .text_size(code_size)
+                .text_color(color)
+                .child(text)
         };
         let counts: AnyElement = match &slot.stats {
             Some(FileStats::Text { added, removed }) => div()
                 .flex()
+                .flex_none()
                 .gap_1()
-                .child(
-                    div()
-                        .text_color(colors.diff_added_text)
-                        .child(format!("+{added}")),
-                )
-                .child(
-                    div()
-                        .text_color(colors.diff_removed_text)
-                        .child(format!("−{removed}")),
-                )
+                .child(mono(format!("+{added}"), colors.diff_added_text))
+                .child(mono(format!("−{removed}"), colors.diff_removed_text))
                 .into_any_element(),
             Some(FileStats::Binary { .. }) => div()
                 .text_color(colors.text_muted)
@@ -2586,23 +2775,37 @@ impl DiffView {
         let mode = entry.mode_change().map(|(old, new)| {
             div()
                 .flex_none()
+                .px_1p5()
+                .rounded(radius::SM)
+                .border_1()
+                .border_color(colors.border)
+                .font_family(theme.fonts.code_family.clone())
+                .text_xs()
                 .text_color(colors.text_muted)
                 .child(format!("{} → {}", old.mode(), new.mode()))
+        });
+        let threads = self.thread_count(file);
+        let thread_count = (threads > 0).then(|| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .text_color(colors.text_muted)
+                .child(icon(
+                    IconName::ChatText,
+                    HEADER_ICON_SIZE,
+                    colors.text_muted,
+                ))
+                .child(format!(
+                    "{threads} thread{}",
+                    if threads == 1 { "" } else { "s" }
+                ))
         });
         let viewed = slot.viewed;
         let out_of_scope = self.proposal
             && matches!(&self.status, ListStatus::Ready(list) if list.is_out_of_scope(file));
-        let scope_badge = out_of_scope.then(|| {
-            div()
-                .flex_none()
-                .px_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(colors.warning.opacity(0.5))
-                .bg(colors.warning.opacity(0.12))
-                .text_color(colors.warning)
-                .child("outside comment scope")
-        });
+        let scope_badge = out_of_scope.then(|| chip("outside comment scope", colors.warning));
         let open_in_editor = (self.proposal && entry.new.is_some()).then(|| {
             let id = if sticky {
                 "diff-sticky-open"
@@ -2610,18 +2813,11 @@ impl DiffView {
                 "diff-header-open"
             };
             let path = entry.path.clone();
-            div()
-                .id((id, file))
-                .flex_none()
-                .px_1()
-                .rounded_sm()
-                .cursor_pointer()
-                .text_color(colors.text_muted)
-                .hover(|style| style.bg(colors.element_hover))
+            muted_button_with_icon((id, file), IconName::ArrowSquareOut, "Open in editor", cx)
+                .text_xs()
                 .on_click(cx.listener(move |_, _, _, cx| {
                     cx.emit(DiffViewEvent::OpenInEditor(path.clone()));
                 }))
-                .child("Open in editor")
         });
         // Huge files skip highlighting; the user can still ask for it.
         let force_highlight = slot.syntax.too_large().then(|| {
@@ -2630,98 +2826,163 @@ impl DiffView {
             } else {
                 "diff-header-highlight"
             };
-            div()
-                .id((id, file))
-                .flex_none()
-                .px_1()
-                .rounded_sm()
-                .cursor_pointer()
-                .text_color(colors.text_muted)
-                .hover(|style| style.bg(colors.element_hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.force_highlight(file, cx)))
-                .child("Plain text (large) · Highlight")
+            muted_button_with_icon(
+                (id, file),
+                IconName::SlidersHorizontal,
+                "Plain text (large) · Highlight",
+                cx,
+            )
+            .text_xs()
+            .on_click(cx.listener(move |this, _, _, cx| this.force_highlight(file, cx)))
         });
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .size_full()
-            .px_1()
-            .bg(colors.surface)
-            .border_b_1()
-            .border_color(colors.border_variant)
-            .when(file > 0 && !sticky, |header| {
-                header.border_t_1().border_color(colors.border)
-            })
-            // Keep the controls clear of the scrollbar; the sticky copy
-            // already ends before it.
-            .when(!sticky, |header| header.pr(SCROLLBAR_WIDTH + px(4.0)))
-            .font_family(theme.fonts.ui_family.clone())
-            .text_size(theme.fonts.ui_size * 0.9)
-            .child(
+        // A folded file still shows that Claude is at work in it.
+        let running = collapsed
+            .then(|| self.running_line(file))
+            .flatten()
+            .map(|line| {
                 div()
-                    .id((id_base, file * 3))
-                    .flex_none()
-                    .w(px(18.0))
-                    .text_center()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_color(colors.text_muted)
-                    .hover(|style| style.bg(colors.element_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(file, cx)))
-                    .child(if slot.collapsed { "▸" } else { "▾" }),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(badge_color)
-                    .child(badge),
-            )
-            .child(
-                div()
-                    .id((id_base, file * 3 + 1))
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .font_family(theme.fonts.code_family.clone())
-                    .text_color(colors.text)
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(file, cx)))
-                    .child(path),
-            )
-            .children(scope_badge)
-            .child(div().flex_none().child(counts))
-            .children(mode)
-            .child(div().flex_1())
-            .children(force_highlight)
-            .children(open_in_editor)
-            .child(
-                div()
-                    .id((id_base, file * 3 + 2))
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap_1()
-                    .px_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_color(if viewed {
-                        colors.text
-                    } else {
-                        colors.text_muted
+                    .gap_1p5()
+                    .text_color(colors.claude_text)
+                    .child(claude_activity(HEADER_ICON_SIZE, cx))
+                    .child(format!("Claude is working on line {line}"))
+            });
+        let viewed_toggle = div()
+            .id((id_base, file * 3 + 2))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1p5()
+            .h(px(24.0))
+            .px_2()
+            .rounded(radius::SM)
+            .cursor_pointer()
+            .text_color(if viewed {
+                colors.text
+            } else {
+                colors.text_muted
+            })
+            .hover(|style| style.bg(colors.element_hover))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_viewed(file, cx)))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(14.0))
+                    .rounded(radius::XS)
+                    .border_1()
+                    .when(viewed, |check| {
+                        check
+                            .border_color(colors.accent)
+                            .bg(colors.accent)
+                            .child(icon(IconName::Check, px(11.0), colors.accent_text))
                     })
-                    .hover(|style| style.bg(colors.element_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_viewed(file, cx)))
-                    .child(if viewed { "☑" } else { "☐" })
-                    .child("Viewed"),
+                    .when(!viewed, |check| check.border_color(colors.border)),
             )
+            .child("Viewed");
+        let caret = div()
+            .id((id_base, file * 3))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(22.0))
+            .rounded(radius::SM)
+            .cursor_pointer()
+            .hover(|style| style.bg(colors.element_hover))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(file, cx)))
+            .child(icon(
+                if collapsed {
+                    IconName::CaretRight
+                } else {
+                    IconName::CaretDown
+                },
+                HEADER_ICON_SIZE,
+                colors.text_muted,
+            ));
+        let path = div()
+            .id((id_base, file * 3 + 1))
+            .flex()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .font_family(theme.fonts.code_family.clone())
+            .text_size(code_size)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(file, cx)))
+            .when_some(entry.old_path.as_ref(), |path, old| {
+                path.child(path_parts(old, colors.text_placeholder, colors.text_muted))
+                    .child(
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .text_color(colors.text_placeholder)
+                            .child("→"),
+                    )
+            })
+            .child(path_parts(
+                &entry.path,
+                colors.text_placeholder,
+                colors.text,
+            ));
+        let header_height = self.metrics.row_height * HEADER_ROWS as f32;
+        div()
+            .relative()
+            .flex()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .h(header_height)
+            .pl_2()
+            .pr_2()
+            .bg(colors.surface)
+            .border_color(colors.border)
+            .border_t(CARD_BORDER)
+            .border_l(CARD_BORDER)
+            .border_r(CARD_BORDER)
+            .when(collapsed, |header| {
+                header.border_b(CARD_BORDER).rounded(radius::LG)
+            })
+            .when(!collapsed, |header| {
+                // The outline stays `border`; the line under the header is
+                // the quieter separator inside the card.
+                header.rounded_t(radius::LG).child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(CARD_BORDER)
+                        .bg(colors.border_variant),
+                )
+            })
+            .font_family(theme.fonts.ui_family.clone())
+            .text_size(theme.fonts.ui_size * 0.92)
+            .child(caret)
+            .child(letter_badge(entry.kind, BadgeSize::Large, cx))
+            .child(path)
+            .children(scope_badge)
+            .child(counts)
+            .children(mode)
+            .children(thread_count)
+            .child(div().flex_1())
+            .children(running)
+            .children(force_highlight)
+            .children(open_in_editor)
+            .child(viewed_toggle)
             .into_any_element()
     }
 
+    /// The 34 px row above the cards: `base...head`, the file count, the
+    /// totals, the selection hint, then the comment summary, soft wrap and
+    /// the navigation shortcuts.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors.clone();
+        let theme = cx.theme().clone();
+        let colors = &theme.colors;
         let summary: SharedString = match &self.status {
             ListStatus::Loading => "Listing changed files…".into(),
             ListStatus::Failed(_) => "No diff".into(),
@@ -2731,6 +2992,31 @@ impl DiffView {
             }
         };
         let (added, removed) = self.totals;
+        let mono = |text: String, color: Hsla| {
+            div()
+                .flex_none()
+                .font_family(theme.fonts.code_family.clone())
+                .text_size(theme.fonts.code_size)
+                .text_color(color)
+                .child(text)
+        };
+        let hint = |keys: &'static [&'static str], label: &'static str| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_0p5()
+                .text_xs()
+                .text_color(colors.text_placeholder)
+                .children(keys.iter().map(|key| kbd(*key, cx)))
+                .child(div().pl_0p5().child(label))
+        };
+        let mut hints = vec![hint(&["j", "k"], "Files"), hint(&["n", "p"], "Hunks")];
+        if !self.proposal {
+            hints.push(hint(&["c"], "Comment"));
+        }
+        let comments = self.render_comments_toolbar(cx);
+        let range = format!("{}...{}", self.target.base, self.target.head);
         div()
             .flex()
             .flex_none()
@@ -2738,7 +3024,7 @@ impl DiffView {
             .justify_between()
             .gap_2()
             .h(TOOLBAR_HEIGHT)
-            .px_2()
+            .px(CARD_INSET)
             .border_b_1()
             .border_color(colors.border_variant)
             .text_sm()
@@ -2748,18 +3034,19 @@ impl DiffView {
                     .items_center()
                     .gap_2()
                     .min_w_0()
-                    .child(div().text_color(colors.text_muted).child(summary))
+                    // Without a hint to ellipsize, the summary keeps its
+                    // width and the shortcut hints give way.
+                    .when(self.hint.is_none(), |left| left.flex_none())
+                    .child(mono(range, colors.text).whitespace_nowrap())
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(colors.text_muted)
+                            .child(summary),
+                    )
                     .when(matches!(self.status, ListStatus::Ready(_)), |row| {
-                        row.child(
-                            div()
-                                .text_color(colors.diff_added_text)
-                                .child(format!("+{added}")),
-                        )
-                        .child(
-                            div()
-                                .text_color(colors.diff_removed_text)
-                                .child(format!("−{removed}")),
-                        )
+                        row.child(mono(format!("+{added}"), colors.diff_added_text))
+                            .child(mono(format!("−{removed}"), colors.diff_removed_text))
                     })
                     .children(self.hint.clone().map(|hint| {
                         div()
@@ -2780,16 +3067,27 @@ impl DiffView {
             .child(
                 div()
                     .flex()
-                    .flex_none()
+                    .min_w_0()
+                    .overflow_hidden()
                     .items_center()
-                    .gap_1()
-                    .children(self.render_comments_toolbar(cx))
+                    .gap_2()
+                    .children(comments)
                     .child(
                         toggle_button("diff-soft-wrap", "Soft wrap", self.options.soft_wrap, cx)
                             .text_xs()
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(Box::new(ToggleSoftWrap), cx)
                             }),
+                    )
+                    // The hints give way first when the toolbar is narrow.
+                    .child(
+                        div()
+                            .flex()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .items_center()
+                            .gap_2()
+                            .children(hints),
                     ),
             )
     }
@@ -2881,9 +3179,21 @@ impl Render for DiffView {
             cx.emit(DiffViewEvent::ActiveFileChanged(top_file));
         }
         let sticky = self.render_file_header(top_file, &list.entries()[top_file], true, cx);
-        // The next file's header pushes the sticky one up as it arrives.
-        let next_header = self.starts[top_file + 1] as f64 * self.row_height() - self.scroll_top();
-        let sticky_top = px((next_header - self.row_height()).min(0.0) as f32);
+        // The sticky header sits on the file's own header until that scrolls
+        // away, then the bottom of the card (its spacer row) pushes it up.
+        let header_height = self.row_height() * HEADER_ROWS as f64;
+        let card_top = self.starts[top_file] as f64 * self.row_height() - scroll_top;
+        let card_end =
+            (self.starts[top_file + 1] - SPACER_ROWS) as f64 * self.row_height() - scroll_top;
+        let stuck = card_top < 0.0;
+        let sticky_top = px(card_top.max(0.0).min(card_end - header_height) as f32);
+        let sticky_shadow = BoxShadow {
+            color: colors.shadow,
+            offset: point(px(0.0), px(2.0)),
+            blur_radius: px(6.0),
+            spread_radius: px(0.0),
+            inset: false,
+        };
         let scrollbar = self.scrollbar().map(|geometry| {
             let dragging = matches!(self.drag, Some(Drag::Scrollbar { .. }));
             div()
@@ -2960,10 +3270,11 @@ impl Render for DiffView {
                     div()
                         .absolute()
                         .top(sticky_top)
-                        .left_0()
-                        .right(SCROLLBAR_WIDTH)
-                        .h(row_height)
-                        .shadow_sm()
+                        .left(CARD_INSET)
+                        .right(CARD_INSET)
+                        .h(row_height * HEADER_ROWS as f32)
+                        .rounded_t(radius::LG)
+                        .when(stuck, |sticky| sticky.shadow(vec![sticky_shadow]))
                         .block_mouse_except_scroll()
                         .child(sticky),
                 )
@@ -2971,6 +3282,15 @@ impl Render for DiffView {
                 .children(drag_listener),
         )
     }
+}
+
+/// What the comment column of a line shows besides the hover "+".
+#[derive(Clone, Copy, Debug, Default)]
+struct CommentMarks {
+    /// Status of the thread hanging under the line.
+    status: Option<CommentStatus>,
+    /// The line is inside a commented range.
+    in_range: bool,
 }
 
 /// Colors and sign of a line by its kind.
@@ -3085,6 +3405,35 @@ fn highlight_runs(
             Some((start..end, style))
         })
         .collect()
+}
+
+/// A path with its directory in `dir_color` and its file name in
+/// `name_color`.
+fn path_parts(path: &str, dir_color: Hsla, name_color: Hsla) -> gpui::Div {
+    let (dir, name) = match path.rfind('/') {
+        Some(at) => path.split_at(at + 1),
+        None => ("", path),
+    };
+    div()
+        .flex()
+        .min_w_0()
+        .overflow_hidden()
+        .when(!dir.is_empty(), |parts| {
+            parts.child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_color(dir_color)
+                    .child(dir.to_owned()),
+            )
+        })
+        .child(
+            div()
+                .flex_none()
+                .text_color(name_color)
+                .child(name.to_owned()),
+        )
 }
 
 /// Why a text file shows no hunks.

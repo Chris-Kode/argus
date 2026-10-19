@@ -1,12 +1,16 @@
 //! The run panel (spec §3.1, §6.3): the runs of the open repository, each
 //! with its live log.
 //!
-//! - **List.** Active runs first, then recent ones, newest first. A row shows
-//!   the comment's first line, `file:line`, `model · effort`, the status, the
-//!   elapsed time, the turns and the cost once known, and Stop while the run
-//!   is live. The header totals the active runs and the cost of the runs
-//!   shown. Clicking a row selects it and asks the workspace to scroll the
-//!   diff to its comment ([`RunPanelEvent::OpenComment`]).
+//! - **List.** Active runs first, then recent ones, newest first. Each run
+//!   is a card styled by its state (Panoptes #56 §3, §5): a running run is
+//!   gold with the pulsing eye, its elapsed time and its latest steps; a
+//!   run ready to review is teal with its `+n −m`; failed runs carry an
+//!   `error` label and the quiet states stay neutral. A card shows the
+//!   comment's first line, `file:line`, `model · effort`, the turns and the
+//!   cost once known, and Stop while the run is live. The header shows the
+//!   number of runs listed. Clicking a card selects it and asks the
+//!   workspace to scroll the diff to its comment
+//!   ([`RunPanelEvent::OpenComment`]).
 //! - **Log.** The selected run's events are folded into rows by
 //!   [`RunLog`]: a stored log is rebuilt on the tokio runtime, then live
 //!   events are appended as they stream. The log is a virtualized [`list`],
@@ -15,25 +19,30 @@
 //! - **Actions.** View the prompt, reveal the worktree in the file manager,
 //!   or open a terminal in it.
 //!
-//! Every storage read, log rebuild and process spawn runs on the tokio
-//! runtime; this view only receives results.
+//! Every storage read, log rebuild, git read and process spawn runs on the
+//! tokio runtime; this view only receives results.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use argus_runs::stream::StreamEvent;
+use argus_git::Sha;
+use argus_runs::log::tool_label;
+use argus_runs::stream::{AssistantContent, StreamEvent, UserContent};
 use argus_runs::{LogEntry, RunLog, RunStreamEvent, RunUpdate};
 use argus_store::{CommentId, RepoId, RunId, RunListing, RunStatus};
 use gpui::{
     AnyElement, Context, EventEmitter, FollowMode, FontWeight, Hsla, ListAlignment, ListState,
-    SharedString, Task, UniformListScrollHandle, Window, div, list, prelude::*, px, uniform_list,
+    SharedString, Task, Window, div, list, prelude::*, px,
 };
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::AppContext;
-use crate::components::{button, disabled_button, placeholder, toggle_button};
+use crate::components::{
+    button, claude_activity, disabled_button, icon_button, placeholder, radius, toggle_button,
+};
+use crate::icons::{IconName, icon};
 use crate::jobs::BackgroundJobs;
 use crate::markdown::{self, MarkdownCache};
 use crate::runtime::spawn_job;
@@ -41,11 +50,19 @@ use crate::theme::{ActiveTheme, ThemeColors};
 
 /// Recent runs listed per repository.
 const RECENT_RUNS: usize = 200;
-/// Height of a run row (`uniform_list` needs one height).
-const ROW_HEIGHT: f32 = 46.0;
-/// Most rows the run list takes before it scrolls, when a log is shown
-/// under it.
-const LIST_ROWS_WITH_LOG: f32 = 4.5;
+/// Height the card list takes when a log is shown under it.
+const LIST_HEIGHT_WITH_LOG: f32 = 280.0;
+/// Pixels of cards rendered beyond the list's viewport.
+const CARD_OVERDRAW: f32 = 200.0;
+/// Space around the card list and between cards (Panoptes #56 §5).
+const CARD_GAP: f32 = 8.0;
+const LIST_PADDING: f32 = 10.0;
+/// Latest steps a running card shows.
+const LIVE_STEPS: usize = 4;
+/// Text sizes of a card (Panoptes #56 §5).
+const TITLE_TEXT: f32 = 12.5;
+const LABEL_TEXT: f32 = 12.0;
+const MONO_TEXT: f32 = 11.0;
 /// Live events applied per repaint at most; the rest follow at once.
 const EVENT_BATCH: usize = 512;
 /// Pixels rendered beyond the log's viewport, so short scrolls do not
@@ -85,6 +102,65 @@ struct LiveStats {
     cost_usd: Option<f64>,
 }
 
+/// One tool call of a live run, for its card.
+#[derive(Clone, Debug)]
+struct Step {
+    id: String,
+    label: String,
+    finished: bool,
+    failed: bool,
+}
+
+/// The latest steps of a live run, folded from its stream. Only the last
+/// [`LIVE_STEPS`] are kept; the full log is the detail view's.
+#[derive(Clone, Debug, Default)]
+struct LiveSteps {
+    cwd: Option<String>,
+    steps: VecDeque<Step>,
+}
+
+impl LiveSteps {
+    /// Applies one event; returns whether the steps changed.
+    fn push(&mut self, event: &StreamEvent) -> bool {
+        let mut changed = false;
+        match event {
+            StreamEvent::System(init) => self.cwd = init.cwd.clone(),
+            StreamEvent::Assistant(message) => {
+                for block in &message.content {
+                    if let AssistantContent::ToolUse { id, name, input } = block {
+                        self.steps.push_back(Step {
+                            id: id.clone(),
+                            label: tool_label(name, input, self.cwd.as_deref()),
+                            finished: false,
+                            failed: false,
+                        });
+                        if self.steps.len() > LIVE_STEPS {
+                            self.steps.pop_front();
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            StreamEvent::User(message) => {
+                for block in &message.content {
+                    if let UserContent::ToolResult(result) = block
+                        && let Some(step) = self
+                            .steps
+                            .iter_mut()
+                            .find(|step| step.id == result.tool_use_id)
+                    {
+                        step.finished = true;
+                        step.failed = result.is_error;
+                        changed = true;
+                    }
+                }
+            }
+            StreamEvent::Result(_) | StreamEvent::Unknown(_) => {}
+        }
+        changed
+    }
+}
+
 /// The selected run's log.
 struct LogView {
     run_id: RunId,
@@ -105,6 +181,11 @@ pub struct RunPanel {
     runs: Vec<RunListing>,
     live: HashMap<RunId, LiveStats>,
     stopping: HashSet<RunId>,
+    /// Latest steps of the live runs.
+    steps: HashMap<RunId, LiveSteps>,
+    /// Lines added and removed by runs ready to review; `None` when the
+    /// worktree could not be read.
+    line_counts: HashMap<RunId, Option<(u64, u64)>>,
     /// Comments whose run is being started.
     starting: HashSet<CommentId>,
     selected: Option<RunId>,
@@ -112,9 +193,11 @@ pub struct RunPanel {
     show_prompt: bool,
     /// Docked at the bottom: list and log side by side.
     horizontal: bool,
-    list_scroll: UniformListScrollHandle,
+    /// The card list; cards differ in height, so it is a measured [`list`].
+    cards: ListState,
     markdown: MarkdownCache,
     list_task: Option<Task<()>>,
+    counts_task: Option<Task<()>>,
     open_task: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
 }
@@ -190,14 +273,17 @@ impl RunPanel {
             runs: Vec::new(),
             live: HashMap::new(),
             stopping: HashSet::new(),
+            steps: HashMap::new(),
+            line_counts: HashMap::new(),
             starting: HashSet::new(),
             selected: None,
             log: None,
             show_prompt: false,
             horizontal: false,
-            list_scroll: UniformListScrollHandle::new(),
+            cards: ListState::new(0, ListAlignment::Top, px(CARD_OVERDRAW)),
             markdown: MarkdownCache::default(),
             list_task: None,
+            counts_task: None,
             open_task: None,
             _tasks: vec![updates_task, events_task, tick_task],
         }
@@ -212,6 +298,8 @@ impl RunPanel {
         }
         self.repo_id = repo_id;
         self.runs.clear();
+        self.cards.reset(0);
+        self.counts_task = None;
         self.selected = None;
         self.log = None;
         self.show_prompt = false;
@@ -333,7 +421,16 @@ impl RunPanel {
                             runs.iter()
                                 .any(|l| l.run.id == *id && l.run.status.is_active())
                         });
+                        let old = this.runs.len();
                         this.runs = runs;
+                        if old == this.runs.len() {
+                            // Same cards, maybe new states: keep the reading
+                            // position.
+                            this.cards.remeasure();
+                        } else {
+                            this.cards.splice(0..old, this.runs.len());
+                        }
+                        this.load_line_counts(cx);
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => {
@@ -355,14 +452,32 @@ impl RunPanel {
     fn on_update(&mut self, update: Option<RunUpdate>, cx: &mut Context<Self>) {
         let active = cx.global::<AppContext>().runs.active_runs().len();
         BackgroundJobs::update(cx, |jobs| jobs.active_runs = active);
-        if let Some(RunUpdate::Finished(finished)) = &update {
-            self.stopping.remove(&finished.run_id);
+        let live = cx.global::<AppContext>().runs.active_runs();
+        self.steps.retain(|run_id, _| live.contains(run_id));
+        match &update {
+            Some(RunUpdate::Finished(finished)) => {
+                self.stopping.remove(&finished.run_id);
+                self.line_counts.remove(&finished.run_id);
+            }
+            Some(RunUpdate::Accepted { run_id, .. } | RunUpdate::Rejected { run_id, .. }) => {
+                self.line_counts.remove(run_id);
+            }
+            Some(RunUpdate::Started { .. }) | None => {}
         }
         self.reload(cx);
     }
 
     fn on_events(&mut self, batch: Vec<RunStreamEvent>, lagged: bool, cx: &mut Context<Self>) {
+        let mut stepped = HashSet::new();
         for event in &batch {
+            if self
+                .steps
+                .entry(event.run_id)
+                .or_default()
+                .push(&event.event)
+            {
+                stepped.insert(event.run_id);
+            }
             let stats = self.live.entry(event.run_id).or_default();
             match event.event.as_ref() {
                 StreamEvent::Assistant(_) => stats.turns += 1,
@@ -372,6 +487,15 @@ impl RunPanel {
                 }
                 _ => {}
             }
+        }
+        // A card gained a step line: measure it again.
+        for (index, _) in self
+            .runs
+            .iter()
+            .enumerate()
+            .filter(|(_, listing)| stepped.contains(&listing.run.id))
+        {
+            self.cards.remeasure_items(index..index + 1);
         }
         if let Some(view) = self.log.as_mut() {
             let run_id = view.run_id;
@@ -461,6 +585,59 @@ impl RunPanel {
         });
     }
 
+    /// Counts the lines of the runs ready to review that are not counted
+    /// yet, on the tokio runtime; replacing the task cancels a count in
+    /// flight.
+    fn load_line_counts(&mut self, cx: &mut Context<Self>) {
+        let wanted: Vec<(RunId, PathBuf, Option<Sha>)> = self
+            .runs
+            .iter()
+            .filter(|listing| listing.run.status == RunStatus::Succeeded)
+            .filter(|listing| !self.line_counts.contains_key(&listing.run.id))
+            .map(|listing| {
+                (
+                    listing.run.id,
+                    listing.run.worktree_path.clone(),
+                    Sha::parse(&listing.run.start_sha),
+                )
+            })
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let worktrees = cx.global::<AppContext>().worktrees.clone();
+        let job = spawn_job(cx, async move {
+            let mut counts = Vec::with_capacity(wanted.len());
+            for (run_id, path, start_sha) in wanted {
+                let count = match start_sha {
+                    Some(start_sha) => {
+                        match worktrees.staged_line_counts(&path, &start_sha).await {
+                            Ok(count) => Some(count),
+                            Err(error) => {
+                                tracing::debug!(run = %run_id, %error, "cannot count the run's lines");
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                counts.push((run_id, count));
+            }
+            counts
+        });
+        self.counts_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(counts) = job.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.counts_task = None;
+                this.line_counts.extend(counts);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn toggle_entry(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(view) = self.log.as_mut() {
             if !view.expanded.remove(&index) {
@@ -529,161 +706,299 @@ impl RunPanel {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors.clone();
-        let active = self
-            .runs
-            .iter()
-            .filter(|listing| listing.run.status.is_active())
-            .count();
+        let theme = cx.theme().clone();
+        let colors = &theme.colors;
         let cost: f64 = self.runs.iter().filter_map(|l| self.cost(l)).sum();
-        let mut totals = vec![format!("{active} active")];
-        if cost > 0.0 {
-            totals.push(format_cost(cost));
-        }
         div()
             .flex()
             .flex_none()
             .items_center()
-            .justify_between()
+            .gap_2()
             .h(px(32.0))
             .px_3()
             .border_b_1()
             .border_color(colors.border_variant)
-            .text_xs()
-            .child(div().text_color(colors.text_muted).child("RUNS"))
             .child(
                 div()
-                    .text_color(if active > 0 {
-                        colors.text
-                    } else {
-                        colors.text_muted
-                    })
-                    .child(totals.join(" · ")),
+                    .text_size(px(TITLE_TEXT))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.text)
+                    .child("Runs"),
             )
+            .when(self.repo_id.is_some(), |header| {
+                header.child(
+                    div()
+                        .font_family(theme.fonts.code_family.clone())
+                        .text_size(px(MONO_TEXT))
+                        .text_color(colors.text_placeholder)
+                        .child(self.runs.len().to_string()),
+                )
+            })
+            .child(div().flex_1())
+            .when(cost > 0.0, |header| {
+                header.child(
+                    div()
+                        .font_family(theme.fonts.code_family.clone())
+                        .text_size(px(MONO_TEXT))
+                        .text_color(colors.text_placeholder)
+                        .child(format_cost(cost)),
+                )
+            })
             .into_any_element()
     }
 
-    fn render_rows(
-        &mut self,
-        range: std::ops::Range<usize>,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let colors = cx.theme().colors.clone();
-        let now = now_ms();
-        range
-            .filter_map(|index| {
-                let listing = self.runs.get(index)?;
-                let run = &listing.run;
-                let id = run.id;
-                let comment_id = run.comment_id;
-                let selected = self.selected == Some(id);
-                let (status, color) = run_status_style(run.status, &colors);
-                let snippet = listing
-                    .body_md
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .unwrap_or_default()
-                    .to_owned();
-                let location = if comment_id.is_some() {
-                    format!("{}:{}", listing.file_path, listing.start_line)
-                } else {
-                    listing.file_path.clone()
-                };
-                let mut meta = vec![
-                    location,
-                    if run.effort.is_empty() {
-                        run.model.clone()
-                    } else {
-                        format!("{} · {}", run.model, run.effort)
-                    },
-                    format_elapsed(elapsed_ms(run, now)),
-                ];
-                if let Some(turns) = self.turns(listing) {
-                    meta.push(format!("{turns} turn{}", if turns == 1 { "" } else { "s" }));
-                }
-                if let Some(cost) = self.cost(listing) {
-                    meta.push(format_cost(cost));
-                }
-                let stop = run.status.is_active().then(|| {
-                    if self.stopping.contains(&id) {
-                        disabled_button(("run-stop", index), "Stopping…", cx)
-                            .h(px(20.0))
-                            .text_xs()
-                            .into_any_element()
-                    } else {
-                        button(("run-stop", index), "Stop", cx)
-                            .h(px(20.0))
-                            .text_xs()
-                            .text_color(colors.error)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.stop(id, cx);
-                            }))
-                            .into_any_element()
-                    }
-                });
-                Some(
+    /// One run card, with its share of the list's padding and gaps.
+    fn render_card(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(listing) = self.runs.get(index) else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme().clone();
+        let colors = &theme.colors;
+        let mono = theme.fonts.code_family.clone();
+        let run = &listing.run;
+        let id = run.id;
+        let comment_id = run.comment_id;
+        let status = run.status;
+        let selected = self.selected == Some(id);
+        let style = card_style(status, colors);
+
+        let snippet = listing
+            .body_md
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .to_owned();
+        let location = if comment_id.is_some() {
+            format!("{}:{}", listing.file_path, listing.start_line)
+        } else {
+            listing.file_path.clone()
+        };
+        let mut meta = Vec::new();
+        meta.push(if run.effort.is_empty() {
+            run.model.clone()
+        } else {
+            format!("{} · {}", run.model, run.effort)
+        });
+        if let Some(turns) = self.turns(listing) {
+            meta.push(format!("{turns} turn{}", if turns == 1 { "" } else { "s" }));
+        }
+        if let Some(cost) = self.cost(listing) {
+            meta.push(format_cost(cost));
+        }
+        let elapsed = format_elapsed(elapsed_ms(run, now_ms()));
+        let line_counts = (status == RunStatus::Succeeded)
+            .then(|| self.line_counts.get(&id).copied().flatten())
+            .flatten();
+
+        let status_icon = match status {
+            RunStatus::Running => claude_activity(px(14.0), cx),
+            // Starting: the eye, still and muted (motion is for live work).
+            RunStatus::Queued => {
+                icon(IconName::ArgusEyeMono, px(14.0), style.label).into_any_element()
+            }
+            RunStatus::Succeeded => {
+                icon(IconName::GitPullRequest, px(13.0), style.label).into_any_element()
+            }
+            RunStatus::Failed => icon(IconName::Warning, px(13.0), style.label).into_any_element(),
+            RunStatus::NoChanges => icon(IconName::Check, px(12.0), style.label).into_any_element(),
+            RunStatus::Stopped | RunStatus::Rejected => {
+                icon(IconName::X, px(12.0), style.label).into_any_element()
+            }
+        };
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .child(status_icon)
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(LABEL_TEXT))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(style.label)
+                    .child(style.text),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(mono.clone())
+                    .text_size(px(MONO_TEXT))
+                    .text_color(style.secondary)
+                    .child(elapsed),
+            );
+        let summary = div()
+            .min_w_0()
+            .overflow_hidden()
+            .text_ellipsis()
+            .whitespace_nowrap()
+            .text_size(px(TITLE_TEXT))
+            .text_color(style.summary)
+            .child(snippet);
+        let location_row = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .min_w_0()
+            .font_family(mono.clone())
+            .text_size(px(MONO_TEXT))
+            .child(
+                div()
+                    .flex_none()
+                    .max_w_full()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_color(style.secondary)
+                    .child(location),
+            )
+            .when_some(line_counts, |row, (added, removed)| {
+                row.child(
                     div()
-                        .id(("run-row", index))
+                        .flex_none()
+                        .text_color(colors.diff_added_text)
+                        .child(format!("+{added}")),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(colors.diff_removed_text)
+                        .child(format!("−{removed}")),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_color(colors.text_placeholder)
+                    .child(meta.join(" · ")),
+            );
+
+        let steps = (status == RunStatus::Running).then(|| {
+            let steps = self
+                .steps
+                .get(&id)
+                .map(|live| live.steps.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let inset = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded(radius::MD)
+                .bg(colors.background)
+                .font_family(mono.clone())
+                .text_size(px(MONO_TEXT))
+                .text_color(colors.text_muted);
+            if steps.is_empty() {
+                return inset
+                    .child(
+                        div()
+                            .text_color(colors.text_placeholder)
+                            .child("Waiting for Claude…"),
+                    )
+                    .into_any_element();
+            }
+            inset
+                .children(steps.into_iter().map(|step| {
+                    let (name, color) = match (step.finished, step.failed) {
+                        (true, true) => (IconName::Warning, colors.error),
+                        (true, false) => (IconName::Check, colors.text_muted),
+                        (false, _) => (IconName::CaretRight, colors.text),
+                    };
+                    div()
                         .flex()
-                        .flex_col()
-                        .w_full()
-                        .justify_center()
-                        .h(px(ROW_HEIGHT))
-                        .px_3()
-                        .gap_0p5()
-                        .cursor_pointer()
-                        .border_b_1()
-                        .border_color(colors.border_variant)
-                        .when(selected, |row| row.bg(colors.element_selected))
-                        .hover(|style| style.bg(colors.element_hover))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select(id, cx);
-                            if let Some(comment_id) = comment_id {
-                                cx.emit(RunPanelEvent::OpenComment(comment_id));
-                            }
-                        }))
+                        .items_center()
+                        .gap(px(6.0))
+                        .min_w_0()
+                        .text_color(color)
+                        .child(icon(name, px(11.0), color))
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .min_w_0()
-                                .text_sm()
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_xs()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(color)
-                                        .child(status),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .text_color(colors.text)
-                                        .child(snippet),
-                                )
-                                .children(stop),
-                        )
-                        .child(
-                            div()
+                                .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .whitespace_nowrap()
-                                .text_xs()
-                                .text_color(colors.text_muted)
-                                .child(meta.join(" · ")),
+                                .child(step.label),
                         )
-                        .into_any_element(),
-                )
+                }))
+                .into_any_element()
+        });
+
+        let stop = status.is_active().then(|| {
+            let label = if status == RunStatus::Queued {
+                "Cancel"
+            } else {
+                "Stop"
+            };
+            let control = if self.stopping.contains(&id) {
+                disabled_button(("run-stop", index), "Stopping…", cx)
+                    .h(px(22.0))
+                    .text_size(px(LABEL_TEXT))
+                    .into_any_element()
+            } else {
+                button(("run-stop", index), label, cx)
+                    .h(px(22.0))
+                    .text_size(px(LABEL_TEXT))
+                    .text_color(colors.text_muted)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.stop(id, cx);
+                    }))
+                    .into_any_element()
+            };
+            // Ghost buttons pad their label; line it up with the text above.
+            div().flex().ml(px(-8.0)).child(control)
+        });
+
+        let border = if selected {
+            colors.accent
+        } else {
+            style.border
+        };
+        let card = div()
+            .id(("run-card", index))
+            .flex()
+            .flex_col()
+            .gap(px(if status == RunStatus::Running {
+                8.0
+            } else {
+                6.0
+            }))
+            .px(px(12.0))
+            .py(px(10.0))
+            .min_w_0()
+            .rounded(radius::LG)
+            .border_1()
+            .border_color(border)
+            .cursor_pointer()
+            .when_some(style.fill, |card, fill| card.bg(fill))
+            .when(style.fill.is_none(), |card| {
+                card.hover(|style| style.bg(colors.element_hover))
             })
-            .collect()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.select(id, cx);
+                if let Some(comment_id) = comment_id {
+                    cx.emit(RunPanelEvent::OpenComment(comment_id));
+                }
+            }))
+            .child(header)
+            .child(summary)
+            .child(location_row)
+            .children(steps)
+            .children(stop);
+        let last = index + 1 == self.runs.len();
+        div()
+            .px(px(LIST_PADDING))
+            .when(index == 0, |item| item.pt(px(LIST_PADDING)))
+            .pb(px(if last { LIST_PADDING } else { CARD_GAP }))
+            .child(card)
+            .into_any_element()
     }
 
     fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -697,12 +1012,10 @@ impl RunPanel {
             };
             return placeholder(text, cx).into_any_element();
         }
-        uniform_list(
-            "run-list-rows",
-            self.runs.len(),
-            cx.processor(|this, range, _, cx| this.render_rows(range, cx)),
-        )
-        .track_scroll(&self.list_scroll)
+        let this = cx.entity();
+        list(self.cards.clone(), move |index, _, cx| {
+            this.update(cx, |this, cx| this.render_card(index, cx))
+        })
         .flex_1()
         .min_h_0()
         .into_any_element()
@@ -777,10 +1090,7 @@ impl RunPanel {
                         }))
                 }))
                 .child(
-                    button("run-close-log", "✕", cx)
-                        .h(px(20.0))
-                        .text_xs()
-                        .text_color(colors.text_muted)
+                    icon_button("run-close-log", IconName::X, "Close the log", cx)
                         .on_click(cx.listener(|this, _, _, cx| this.close_log(cx))),
                 );
 
@@ -810,12 +1120,10 @@ impl RunPanel {
                 .unwrap_or_else(|| "Loading…".to_owned());
             div()
                 .id("run-prompt")
-                .flex_1()
-                .min_h_0()
+                .size_full()
                 .overflow_y_scroll()
                 .p_3()
                 .text_xs()
-                .font_family(cx.theme().fonts.code_family.clone())
                 .text_color(colors.text)
                 .child(prompt)
                 .into_any_element()
@@ -839,10 +1147,26 @@ impl RunPanel {
             list(view.state.clone(), move |index, _, cx| {
                 this.update(cx, |this, cx| this.render_entry(index, cx))
             })
-            .flex_1()
-            .min_h_0()
+            .size_full()
+            .py_1()
             .into_any_element()
         };
+        // The log and the prompt sit in the same inset as a running card's
+        // steps, in the code font.
+        let body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .m_2()
+            .overflow_hidden()
+            .rounded(radius::MD)
+            .bg(colors.background)
+            .border_1()
+            .border_color(colors.border_variant)
+            .font_family(cx.theme().fonts.code_family.clone())
+            .child(body);
 
         div()
             .flex()
@@ -984,8 +1308,8 @@ impl RunPanel {
                         .py_1p5()
                         .rounded_md()
                         .border_1()
-                        .border_color(colors.accent.opacity(0.5))
-                        .bg(colors.accent.opacity(0.06))
+                        .border_color(colors.accent_border)
+                        .bg(colors.accent_soft)
                         .child(
                             div()
                                 .flex()
@@ -1044,9 +1368,7 @@ impl Render for RunPanel {
                 .border_color(colors.border_variant),
             (true, false) => list_pane
                 .flex_none()
-                .h(px(
-                    ROW_HEIGHT * LIST_ROWS_WITH_LOG.min(self.runs.len().max(1) as f32)
-                ))
+                .h(px(LIST_HEIGHT_WITH_LOG))
                 .border_b_1()
                 .border_color(colors.border_variant),
         };
@@ -1117,12 +1439,15 @@ fn expandable(
                 .text_xs()
                 .hover(|style| style.bg(colors.element_hover))
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_entry(index, cx)))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(colors.text_muted)
-                        .child(if expanded { "▾" } else { "▸" }),
-                )
+                .child(icon(
+                    if expanded {
+                        IconName::CaretDown
+                    } else {
+                        IconName::CaretRight
+                    },
+                    px(12.0),
+                    colors.text_muted,
+                ))
                 .child(
                     div()
                         .min_w_0()
@@ -1184,16 +1509,61 @@ fn detail_block(text: &str, colors: &ThemeColors, font: &SharedString) -> gpui::
         .child(shown)
 }
 
-/// The label and color of a run status.
-fn run_status_style(status: RunStatus, colors: &ThemeColors) -> (&'static str, Hsla) {
+/// How a run card looks in each state (Panoptes #56 §3, §5).
+struct CardStyle {
+    text: &'static str,
+    /// Status label and icon.
+    label: Hsla,
+    border: Hsla,
+    fill: Option<Hsla>,
+    /// The comment summary.
+    summary: Hsla,
+    /// `file:line` and the elapsed time.
+    secondary: Hsla,
+}
+
+fn card_style(status: RunStatus, colors: &ThemeColors) -> CardStyle {
+    let quiet = |text, label| CardStyle {
+        text,
+        label,
+        border: colors.border_variant,
+        fill: None,
+        summary: colors.text_muted,
+        secondary: colors.text_placeholder,
+    };
     match status {
-        RunStatus::Queued => ("Starting", colors.text_muted),
-        RunStatus::Running => ("Running", colors.warning),
-        RunStatus::Succeeded => ("Proposed", colors.status_proposed),
-        RunStatus::NoChanges => ("No changes", colors.text_muted),
-        RunStatus::Failed => ("Failed", colors.error),
-        RunStatus::Stopped => ("Stopped", colors.text_placeholder),
-        RunStatus::Rejected => ("Rejected", colors.text_placeholder),
+        RunStatus::Queued => CardStyle {
+            summary: colors.text,
+            secondary: colors.text_muted,
+            ..quiet("Starting", colors.text_muted)
+        },
+        RunStatus::Running => CardStyle {
+            text: "Running",
+            label: colors.claude_text,
+            border: colors.claude_border,
+            fill: Some(colors.claude_soft),
+            summary: colors.text,
+            secondary: colors.text_muted,
+        },
+        RunStatus::Succeeded => CardStyle {
+            text: "Ready to review",
+            label: colors.accent,
+            border: colors.accent_border,
+            fill: None,
+            summary: colors.text,
+            secondary: colors.text_muted,
+        },
+        RunStatus::Failed => CardStyle {
+            text: "Failed",
+            label: colors.error,
+            border: colors.border,
+            fill: None,
+            summary: colors.text,
+            secondary: colors.text_muted,
+        },
+        RunStatus::NoChanges => quiet("No changes", colors.text_muted),
+        RunStatus::Stopped => quiet("Stopped", colors.text_placeholder),
+        RunStatus::Rejected => quiet("Rejected", colors.text_placeholder),
     }
 }
 

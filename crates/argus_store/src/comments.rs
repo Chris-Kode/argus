@@ -116,11 +116,13 @@ pub struct ReplyRun {
     pub model: String,
     /// Thinking effort it used (empty for Claude's default).
     pub effort: String,
+    /// Wall-clock duration of the run, once it finished.
+    pub duration_ms: Option<i64>,
 }
 
 /// Columns of [`reply_from_row`], for `comment_replies r LEFT JOIN runs u`.
-const REPLY_COLUMNS: &str =
-    "r.id, r.comment_id, r.author, r.body_md, r.created_at, u.id, u.model, u.effort";
+const REPLY_COLUMNS: &str = "r.id, r.comment_id, r.author, r.body_md, r.created_at, u.id, u.model, u.effort, \
+     u.duration_ms";
 
 const COLUMNS: &str = "id, repo_id, base_ref, head_ref, file_path, old_file_path, side, \
      start_line, end_line, context_hash, anchor_sha, snippet, body_md, status, outdated, \
@@ -162,6 +164,7 @@ fn reply_from_row(row: &Row<'_>) -> rusqlite::Result<Reply> {
                 id,
                 model: row.get(6)?,
                 effort: row.get(7)?,
+                duration_ms: row.get(8)?,
             }),
             None => None,
         },
@@ -495,13 +498,14 @@ impl CommentStore {
                 let run = match run_id {
                     Some(id) => conn
                         .query_row(
-                            "SELECT model, effort FROM runs WHERE id = ?1",
+                            "SELECT model, effort, duration_ms FROM runs WHERE id = ?1",
                             [id],
                             |row| {
                                 Ok(ReplyRun {
                                     id,
                                     model: row.get(0)?,
                                     effort: row.get(1)?,
+                                    duration_ms: row.get(2)?,
                                 })
                             },
                         )

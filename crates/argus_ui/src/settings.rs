@@ -14,7 +14,7 @@ use argus_runs::ClaudeSettings;
 use argus_store::SettingsStore;
 use serde::{Deserialize, Serialize};
 
-use crate::theme::ThemeMode;
+use crate::theme::{ThemeFamily, ThemeMode};
 
 /// Settings key holding the JSON-encoded [`UiSettings`].
 pub const UI_SETTINGS_KEY: &str = "ui";
@@ -179,15 +179,19 @@ impl Default for RunPanelDock {
 pub struct UiSettings {
     /// System, dark or light.
     pub theme: ThemeMode,
-    /// UI font family override; `None` picks Zed's UI font or the system one.
+    /// Panoptes (default) or One. Records written before the field existed
+    /// load as Panoptes.
+    pub theme_family: ThemeFamily,
+    /// UI font family override; `None` picks the bundled IBM Plex Sans.
     pub ui_font_family: Option<String>,
-    /// Code font family override; `None` picks "Zed Mono" or the system
-    /// monospace font.
+    /// Code font family override; `None` picks the bundled IBM Plex Mono.
     pub code_font_family: Option<String>,
     /// UI font size in pixels.
     pub ui_font_size: f32,
     /// Code font size in pixels.
     pub code_font_size: f32,
+    /// Render live-state animations (the Claude activity pulse) statically.
+    pub reduce_motion: bool,
     /// File tree dock.
     pub file_tree: FileTreeDock,
     /// Run panel dock.
@@ -210,10 +214,12 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             theme: ThemeMode::System,
+            theme_family: ThemeFamily::Panoptes,
             ui_font_family: None,
             code_font_family: None,
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             code_font_size: DEFAULT_CODE_FONT_SIZE,
+            reduce_motion: false,
             file_tree: FileTreeDock::default(),
             run_panel: RunPanelDock::default(),
             diff_tab_width: DEFAULT_TAB_WIDTH,
@@ -253,14 +259,17 @@ impl UiSettings {
         self.diff_link_horizontal_scroll = defaults.diff_link_horizontal_scroll;
     }
 
-    /// Resets the Appearance section: theme and fonts.
+    /// Resets the Appearance section: theme mode, theme family, fonts and
+    /// reduce motion.
     pub fn reset_appearance(&mut self) {
         let defaults = Self::default();
         self.theme = defaults.theme;
+        self.theme_family = defaults.theme_family;
         self.ui_font_family = defaults.ui_font_family;
         self.code_font_family = defaults.code_font_family;
         self.ui_font_size = defaults.ui_font_size;
         self.code_font_size = defaults.code_font_size;
+        self.reduce_motion = defaults.reduce_motion;
     }
 
     /// Resets the Layout section: dock visibility, position and sizes. The

@@ -30,8 +30,8 @@ pub use conflicts::{ConflictMarker, ConflictedApply, RebaseStep, RebaseStop};
 pub use error::{GitError, Result};
 pub use read::{Branch, BranchKind, Checkout, Repo, RepoId, Sha};
 pub use worktrees::{
-    ApplyOutcome, ChangeKind, ChangedFile, CommitOutcome, Patch, RebaseOutcome, ReconcileReport,
-    Worktree, WorktreeManager,
+    ApplyOutcome, ChangeKind, ChangedFile, CommitOutcome, DiffStat, Patch, RebaseOutcome,
+    ReconcileReport, Worktree, WorktreeManager,
 };
 
 /// Handle to the git service.

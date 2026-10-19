@@ -483,6 +483,30 @@ impl TextDiff {
         &self.hunks
     }
 
+    /// The enclosing function (or other definition) of hunk `hunk`, for
+    /// its header: the nearest line above the hunk, on the old side like
+    /// git (the new side for added files), that starts a definition. A
+    /// definition is a line starting with a letter, `_` or `$` (git's
+    /// default rule) or an indented line starting with a common definition
+    /// keyword. Looks back at most [`FUNCTION_LOOKBACK`] lines, so the cost
+    /// per header is bounded. Trimmed, without a trailing `{`.
+    pub fn hunk_function(&self, hunk: usize) -> Option<&str> {
+        let hunk = self.hunks.get(hunk)?;
+        let (source, start) = if hunk.old_start > 0 && self.old.line_count() > 0 {
+            (&self.old, hunk.old_start)
+        } else {
+            (&self.new, hunk.new_start)
+        };
+        let first = start.saturating_sub(FUNCTION_LOOKBACK).max(1);
+        (first..start).rev().find_map(|line| {
+            let text = source.line(line)?;
+            is_definition(text).then(|| {
+                let trimmed = text.trim();
+                trimmed.strip_suffix('{').unwrap_or(trimmed).trim_end()
+            })
+        })
+    }
+
     /// Every hunk line, in order; each hunk owns a contiguous range.
     pub fn lines(&self) -> &[DiffLine] {
         &self.lines
@@ -784,4 +808,55 @@ fn push_merged(ranges: &mut Vec<Range<usize>>, range: Range<usize>) {
         Some(last) if last.end >= range.start => last.end = last.end.max(range.end),
         _ => ranges.push(range),
     }
+}
+
+/// Lines [`TextDiff::hunk_function`] looks back at most.
+pub const FUNCTION_LOOKBACK: u32 = 400;
+
+/// Keywords that start a definition on an indented line.
+const DEFINITION_KEYWORDS: &[&str] = &[
+    "fn ",
+    "pub fn ",
+    "pub(crate) fn ",
+    "pub(super) fn ",
+    "async fn ",
+    "pub async fn ",
+    "unsafe fn ",
+    "const fn ",
+    "pub const fn ",
+    "impl ",
+    "impl<",
+    "def ",
+    "async def ",
+    "class ",
+    "function ",
+    "async function ",
+    "export function ",
+    "export default function ",
+    "func ",
+    "public ",
+    "private ",
+    "protected ",
+    "static ",
+    "struct ",
+    "enum ",
+    "trait ",
+    "interface ",
+    "module ",
+    "mod ",
+    "pub mod ",
+];
+
+/// Whether `line` starts a definition (see [`TextDiff::hunk_function`]).
+fn is_definition(line: &str) -> bool {
+    let Some(first) = line.chars().next() else {
+        return false;
+    };
+    if first.is_alphabetic() || first == '_' || first == '$' {
+        return true;
+    }
+    let trimmed = line.trim_start();
+    DEFINITION_KEYWORDS
+        .iter()
+        .any(|keyword| trimmed.starts_with(keyword))
 }

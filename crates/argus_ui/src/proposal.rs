@@ -50,9 +50,13 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::AppContext;
 use crate::comments::ReviewComments;
-use crate::components::{button, disabled_button, kbd, placeholder, primary_button};
+use crate::components::{
+    accept_button, button, disabled_button, disabled_button_with_icon, kbd, placeholder,
+    primary_button, reject_button, reply_button, status_chip,
+};
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
 use crate::followup::{self, FollowupKind};
+use crate::icons::IconName;
 use crate::keymap::{Accept, PROPOSAL_CONTEXT, RejectProposal, ReplyToProposal, SHORTCUTS};
 use crate::markdown::{self, Markdown, MarkdownCache};
 use crate::runtime::spawn_job;
@@ -1024,6 +1028,7 @@ impl ProposalView {
                         .gap_2()
                         .min_w_0()
                         .child(label("COMMENT"))
+                        .child(status_chip(comment.status, colors))
                         .child(location),
                 )
                 .child(body)
@@ -1189,8 +1194,7 @@ impl ProposalView {
         } else if running {
             disabled_button("proposal-reject", "Reject", cx).into_any_element()
         } else {
-            button("proposal-reject", "Reject", cx)
-                .text_color(colors.error)
+            reject_button("proposal-reject", cx)
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.confirm_reject = true;
                     cx.notify();
@@ -1206,19 +1210,23 @@ impl ProposalView {
             )
             .into_any_element()
         } else if busy {
-            disabled_button("proposal-accept", accept_label, cx).into_any_element()
-        } else if blocked {
-            disabled_button("proposal-accept", "Accept (conflict markers remain)", cx)
+            disabled_button_with_icon("proposal-accept", IconName::Check, accept_label, cx)
                 .into_any_element()
+        } else if blocked {
+            disabled_button_with_icon(
+                "proposal-accept",
+                IconName::Check,
+                "Accept (conflict markers remain)",
+                cx,
+            )
+            .into_any_element()
         } else {
-            primary_button("proposal-accept", accept_label, cx)
-                .h(px(24.0))
-                .gap_1()
+            accept_button("proposal-accept", accept_label, cx)
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(Accept), cx))
                 .child(kbd(shortcut_keys::<Accept>(), cx))
                 .into_any_element()
         };
-        let reply = button("proposal-reply", "Reply", cx)
+        let reply = reply_button("proposal-reply", cx)
             .on_click(cx.listener(|this, _, _, cx| this.open_reply(cx)))
             .child(kbd(shortcut_keys::<ReplyToProposal>(), cx));
         let editor = button("proposal-open-editor", "Open in editor", cx)
@@ -1272,8 +1280,8 @@ impl ProposalView {
                     .px_3()
                     .py_1()
                     .border_b_1()
-                    .border_color(colors.accent.opacity(0.4))
-                    .bg(colors.accent.opacity(0.08))
+                    .border_color(colors.accent_border)
+                    .bg(colors.accent_soft)
                     .text_sm()
                     .text_color(colors.accent)
                     .child(

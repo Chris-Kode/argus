@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use argus_diff::layout::ViewMode;
-use argus_diff::review::CommentChange;
+use argus_diff::review::{CommentChange, CommentStatus};
 use argus_runs::ClaudeStatus;
 use argus_store::{Repo, StorageService};
 use gpui::{
@@ -43,21 +43,25 @@ use crate::claude_status::observe_claude_status;
 use crate::comment_list::{CommentList, CommentListEvent};
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
-    button, disabled_button, kbd, panel_header, placeholder, primary_button, section_header,
-    text_tooltip, toggle_button,
+    button, claude_activity, disabled_button, disabled_ghost_button_with_icon,
+    disabled_icon_button, icon_button, kbd, muted_button_with_icon, panel_header, placeholder,
+    primary_button, primary_button_with_icon, radius, section_header, segmented, text_tooltip,
+    toggle_button, toggle_icon_button,
 };
 use crate::conflict::{ConflictDialog, ConflictDialogEvent, ConflictSource};
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
-use crate::file_tree::{FileTree, FileTreeEvent};
+use crate::file_tree::{FileMarker, FileTree, FileTreeEvent};
 use crate::fonts::InstalledFonts;
+use crate::icons::{IconName, eye_mark, icon};
 use crate::jobs::BackgroundJobs;
 use crate::keymap::{
     Accept, AdvanceCommentStatus, Comment, CycleTheme, DecreaseFontSize, Dismiss, FocusFileFilter,
-    IncreaseFontSize, NextComment, NextFile, NextHunk, OpenRepository, OpenSettings,
-    PreviousComment, PreviousFile, PreviousHunk, ResetFontSize, Run, SHORTCUT_GROUPS, SHORTCUTS,
-    ToggleAllComments, ToggleCommentList, ToggleDiffMode, ToggleFileListMode, ToggleFileTree,
-    ToggleKeyboardShortcuts, ToggleRunPanel, ToggleRunPanelPosition, ToggleSoftWrap,
-    WORKSPACE_CONTEXT,
+    IncreaseFontSize, NextComment, NextFile, NextHunk, OpenRecent1, OpenRecent2, OpenRecent3,
+    OpenRecent4, OpenRecent5, OpenRecent6, OpenRecent7, OpenRecent8, OpenRecent9, OpenRepository,
+    OpenSettings, PreviousComment, PreviousFile, PreviousHunk, ResetFontSize, Run, SHORTCUT_GROUPS,
+    SHORTCUTS, ToggleAllComments, ToggleCommentList, ToggleDiffMode, ToggleFileListMode,
+    ToggleFileTree, ToggleKeyboardShortcuts, ToggleRunPanel, ToggleRunPanelPosition,
+    ToggleSoftWrap, WELCOME_CONTEXT, WORKSPACE_CONTEXT,
 };
 use crate::perf;
 use crate::proposal::{ProposalEvent, ProposalSource, ProposalView};
@@ -72,13 +76,19 @@ use crate::settings::{
     DEFAULT_RUN_PANEL_HEIGHT, DEFAULT_RUN_PANEL_WIDTH, DEFAULT_UI_FONT_SIZE, DiffViewMode,
     MIN_DOCK_SIZE, RunPanelPosition, UiSettings, clamp_font_size, clamp_tab_width,
 };
-use crate::theme::{ActiveTheme, Theme, ThemeFonts, ThemeMode};
+use crate::theme::{ActiveTheme, Theme, ThemeFamily, ThemeFonts, ThemeMode};
 use crate::{AppContext, OpenRequest};
 
 /// Height of the title bar.
-const TITLE_BAR_HEIGHT: Pixels = px(36.0);
+const TITLE_BAR_HEIGHT: Pixels = px(40.0);
+/// Tooltip of the title-bar swap button.
+const SWAP_TOOLTIP: &str = "Swap base and head";
 /// Height of the status bar.
-const STATUS_BAR_HEIGHT: Pixels = px(26.0);
+const STATUS_BAR_HEIGHT: Pixels = px(28.0);
+/// Text size of the status bar.
+const STATUS_TEXT_SIZE: Pixels = px(11.5);
+/// Icon size of the status-bar counters.
+const STATUS_ICON_SIZE: Pixels = px(12.0);
 /// Space kept for the center area when docks grow.
 const MIN_CENTER_SIZE: f32 = 240.0;
 /// Width of the invisible grab area of a dock resize handle.
@@ -86,8 +96,13 @@ const RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 /// Settings are written this long after the last change, so a dock drag
 /// produces one write instead of one per mouse move.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
-/// How many recent repositories the empty state lists.
-const RECENT_REPOS_SHOWN: usize = 10;
+/// How many recent repositories the empty state lists; each gets a number
+/// key, `1`-`9`.
+const RECENT_REPOS_SHOWN: usize = 9;
+/// Size of the eye mark on the welcome screen.
+const WELCOME_MARK_SIZE: f32 = 56.0;
+/// Size of the "Argus" wordmark on the welcome screen.
+const WELCOME_WORDMARK_SIZE: f32 = 30.0;
 /// A picker closed this recently by a click outside it is not reopened by
 /// the same click landing on its own title-bar button.
 const PICKER_REOPEN_GUARD: Duration = Duration::from_millis(250);
@@ -142,6 +157,29 @@ struct ProposalTab {
 }
 
 /// The open branch picker and its subscription.
+/// What the right part of the Push split button shows.
+#[derive(Clone, Copy)]
+enum PushDetail {
+    /// No right part.
+    None,
+    /// `↑ahead ↓behind` against the upstream.
+    Counts(u32, u32),
+    /// The head branch has no upstream yet.
+    NoUpstream,
+}
+
+/// The resolved state of the Push split button.
+struct PushButtonState {
+    /// Whether clicking it starts a Push (or toggles the progress popover).
+    enabled: bool,
+    /// The left part's label: "Push" or "Pushing…".
+    label: &'static str,
+    /// The right part.
+    detail: PushDetail,
+    /// Why it is enabled or disabled.
+    tooltip: String,
+}
+
 struct OpenPicker {
     picker: Entity<BranchPicker>,
     _subscription: Subscription,
@@ -336,7 +374,7 @@ impl Workspace {
             code_size: px(self.settings.code_font_size),
         };
         let appearance = self.settings.theme.resolve(window.appearance());
-        cx.set_global(Theme::new(appearance, fonts));
+        cx.set_global(Theme::new(self.settings.theme_family, appearance, fonts));
         cx.refresh_windows();
     }
 
@@ -353,12 +391,16 @@ impl Workspace {
             return;
         }
         let theme_changed = self.settings.theme != before.theme
+            || self.settings.theme_family != before.theme_family
             || self.settings.ui_font_family != before.ui_font_family
             || self.settings.code_font_family != before.code_font_family
             || self.settings.ui_font_size != before.ui_font_size
             || self.settings.code_font_size != before.code_font_size;
         if theme_changed {
             self.apply_theme(window, cx);
+        }
+        if self.settings.reduce_motion != before.reduce_motion {
+            cx.set_reduce_motion(self.settings.reduce_motion);
         }
         self.sync_diff_options(cx);
         let bottom = self.settings.run_panel.position == RunPanelPosition::Bottom;
@@ -622,17 +664,28 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Mirrors the comments into the file tree: a count badge per file and
-    /// the "Outdated" group.
+    /// Mirrors the comments into the file tree: a state marker per file (a
+    /// running run wins over a waiting proposal) and the "Outdated" group.
     fn sync_comment_badges(&mut self, comments: &Entity<ReviewComments>, cx: &mut Context<Self>) {
         let Some(file_tree) = self.file_tree.clone() else {
             return;
         };
         let snapshot = comments.read(cx).comments().clone();
-        let mut counts: HashMap<SharedString, u32> = HashMap::new();
+        let mut markers: HashMap<SharedString, FileMarker> = HashMap::new();
         let mut outdated = Vec::new();
         let mut labels = Vec::new();
         for comment in snapshot.iter() {
+            let marker = match comment.status {
+                CommentStatus::Running => Some(FileMarker::Running),
+                CommentStatus::Proposed => Some(FileMarker::Proposed),
+                _ => None,
+            };
+            if let Some(marker) = marker {
+                let slot = markers
+                    .entry(comment.anchor.file_path.clone().into())
+                    .or_insert(marker);
+                *slot = (*slot).max(marker);
+            }
             if comment.outdated {
                 let first = comment.body_md.lines().next().unwrap_or_default();
                 labels.push(SharedString::from(format!(
@@ -640,15 +693,11 @@ impl Workspace {
                     comment.anchor.file_path, comment.anchor.start_line
                 )));
                 outdated.push(comment.id);
-            } else {
-                *counts
-                    .entry(comment.anchor.file_path.clone().into())
-                    .or_default() += 1;
             }
         }
         self.outdated_comments = outdated;
         file_tree.update(cx, |tree, cx| {
-            tree.set_comment_counts(counts, cx);
+            tree.set_file_markers(markers, cx);
             tree.set_outdated(labels, cx);
         });
     }
@@ -723,6 +772,12 @@ impl Workspace {
                     }
                     DiffViewEvent::ViewProposal(id) => {
                         this.open_proposal(ProposalSource::Comment(*id), cx);
+                    }
+                    DiffViewEvent::AcceptProposal(run_id) => {
+                        let run_id = *run_id;
+                        tracing::debug!(run = %run_id, "accept requested from a thread");
+                        this.accept_flow
+                            .update(cx, |flow, cx| flow.accept(run_id, cx));
                     }
                     // Only proposal diffs offer "Open in editor".
                     DiffViewEvent::OpenInEditor(_) => {}
@@ -1380,6 +1435,27 @@ impl Workspace {
 
     // ---- actions ------------------------------------------------------------
 
+    /// Whether the welcome screen is what the window shows: no repository,
+    /// no proposal tab and no sheet over it.
+    fn is_welcome_shown(&self) -> bool {
+        self.session.is_none() && self.active_proposal.is_none() && self.sheet.is_none()
+    }
+
+    /// Opens the recent repository at `index` (the `1`-`9` keys of the
+    /// welcome screen). Does nothing once a repository is open or opening.
+    fn open_recent(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.is_welcome_shown() || self.open_task.is_some() {
+            return;
+        }
+        let RecentRepos::Loaded(repos) = &self.recent else {
+            return;
+        };
+        if let Some(repo) = repos.iter().take(RECENT_REPOS_SHOWN).nth(index) {
+            let path = repo.path.clone();
+            self.open_path(path, cx);
+        }
+    }
+
     fn open_repository(&mut self, _: &OpenRepository, _: &mut Window, cx: &mut Context<Self>) {
         self.sheet = None;
         self.close_picker(cx);
@@ -1735,6 +1811,9 @@ impl Workspace {
 
     // ---- rendering ----------------------------------------------------------
 
+    /// The title bar (Panoptes #56 §5): the breadcrumb group (eye mark,
+    /// repo, base, swap, head) on the left; the diff mode segmented control,
+    /// Fetch and the Push split button on the right.
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
         let session = self.session.as_ref().map(|session| session.read(cx));
@@ -1744,44 +1823,84 @@ impl Workspace {
 
         let branch_controls = session.map(|session| {
             let loaded = matches!(session.branches(), BranchList::Loaded(_));
+            let swap = if loaded {
+                icon_button("title-swap", IconName::ArrowsLeftRight, SWAP_TOOLTIP, cx).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.close_picker(cx);
+                        this.update_session(cx, |session, cx| session.swap(cx));
+                    }),
+                )
+            } else {
+                disabled_icon_button("title-swap", IconName::ArrowsLeftRight, SWAP_TOOLTIP, cx)
+            };
             div()
                 .flex()
                 .items_center()
                 .gap_0p5()
                 .min_w_0()
+                .child(
+                    div()
+                        .flex_none()
+                        .px_0p5()
+                        .text_color(colors.text_placeholder)
+                        .child("/"),
+                )
                 .child(self.render_branch_button(Side::Base, session, loaded, cx))
-                .child(if loaded {
-                    button("title-swap", "⇄", cx)
-                        .text_color(colors.text_muted)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.close_picker(cx);
-                            this.update_session(cx, |session, cx| session.swap(cx));
-                        }))
-                } else {
-                    disabled_button("title-swap", "⇄", cx)
-                })
+                .child(swap.w(px(22.0)))
                 .child(self.render_branch_button(Side::Head, session, loaded, cx))
         });
 
+        let breadcrumb = div()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .min_w_0()
+            .h(px(28.0))
+            .pl_2()
+            .pr(px(3.0))
+            .rounded(radius::MD)
+            .bg(colors.surface)
+            .border_1()
+            .border_color(colors.border_variant)
+            .child(eye_mark(px(16.0), cx))
+            .child(
+                button("title-repo", repo_label, cx)
+                    .h(px(22.0))
+                    .px_1p5()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(OpenRepository.boxed_clone(), cx)
+                    }),
+            )
+            .children(branch_controls);
+
         let fetch = match session {
-            Some(session) if session.is_fetching() => {
-                disabled_button("title-fetch", "Fetching…", cx)
-            }
+            Some(session) if session.is_fetching() => disabled_ghost_button_with_icon(
+                "title-fetch",
+                IconName::ArrowLineDown,
+                "Fetching…",
+                cx,
+            ),
             Some(session) if session.has_remotes() => {
-                button("title-fetch", "Fetch", cx).on_click(cx.listener(|this, _, _, cx| {
-                    this.update_session(cx, |session, cx| session.fetch(cx));
-                }))
+                muted_button_with_icon("title-fetch", IconName::ArrowLineDown, "Fetch", cx)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.update_session(cx, |session, cx| session.fetch(cx));
+                    }))
             }
-            _ => disabled_button("title-fetch", "Fetch", cx),
-        };
-        let side_by_side = self.settings.diff_view_mode == DiffViewMode::SideBySide;
-        let diff_mode = toggle_button("title-diff-mode", "Side by side", side_by_side, cx)
-            .text_color(if side_by_side {
-                colors.text
-            } else {
-                colors.text_muted
-            })
-            .on_click(|_, window, cx| window.dispatch_action(ToggleDiffMode.boxed_clone(), cx));
+            _ => {
+                disabled_ghost_button_with_icon("title-fetch", IconName::ArrowLineDown, "Fetch", cx)
+            }
+        }
+        .h(px(28.0));
+
+        let split = usize::from(self.settings.diff_view_mode == DiffViewMode::SideBySide);
+        let diff_mode = segmented("title-diff-mode", ["Unified", "Split"], split, cx).on_select(
+            move |index, window, cx| {
+                if index != split {
+                    window.dispatch_action(ToggleDiffMode.boxed_clone(), cx);
+                }
+            },
+        );
         let push = self.render_push_button(session, cx);
 
         div()
@@ -1793,126 +1912,222 @@ impl Workspace {
             .justify_between()
             .h(TITLE_BAR_HEIGHT)
             .pl(TRAFFIC_LIGHTS_WIDTH)
-            .pr_2()
+            .pr(px(10.0))
             .gap_2()
             .bg(colors.title_bar)
             .border_b_1()
-            .border_color(colors.border)
+            .border_color(colors.border_variant)
             .on_click(|event, window, _| {
                 if event.click_count() == 2 && cfg!(target_os = "macos") {
                     window.titlebar_double_click();
                 }
             })
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .min_w_0()
-                    .child(
-                        button("title-repo", repo_label, cx)
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(OpenRepository.boxed_clone(), cx)
-                            }),
-                    )
-                    .children(branch_controls),
-            )
+            .child(breadcrumb)
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap_1()
+                    .gap_1p5()
                     .child(diff_mode)
                     .child(fetch)
                     .child(push),
             )
     }
 
-    /// The Push button and its state (spec §5.4): `Push ↑ahead ↓behind`,
-    /// disabled with a tooltip when there is nothing to do or an Accept is
-    /// in flight, "No upstream" to offer `git push -u`, "Pushing…" (which
-    /// toggles the progress popover) while a Push runs.
+    /// The Push split button and its state (spec §5.4): `Push | ↑ahead
+    /// ↓behind`, disabled with a tooltip when there is nothing to do or an
+    /// Accept is in flight, `Push | No upstream` to offer `git push -u`,
+    /// "Pushing…" (which toggles the progress popover) while a Push runs.
     fn render_push_button(&self, session: Option<&RepoSession>, cx: &Context<Self>) -> AnyElement {
-        let disabled = |label: String, tooltip: String| {
-            disabled_button("title-push", label, cx)
-                .tooltip(text_tooltip(tooltip))
-                .into_any_element()
+        let state = |enabled: bool, label: &'static str, detail: PushDetail, tooltip: String| {
+            PushButtonState {
+                enabled,
+                label,
+                detail,
+                tooltip,
+            }
         };
-        let enabled = |label: String, tooltip: String| {
-            button("title-push", label, cx)
-                .tooltip(text_tooltip(tooltip))
-                .on_click(cx.listener(|this, _, _, cx| this.start_push(cx)))
-                .into_any_element()
-        };
-        if self.push_flow.read(cx).is_running() {
-            return enabled("Pushing…".to_owned(), "Show the push progress".to_owned());
-        }
-        let Some(session) = session else {
-            return disabled("Push".to_owned(), "Open a repository first.".to_owned());
-        };
-        let Some(head) = session.local_head() else {
-            return disabled(
-                "Push".to_owned(),
-                "Pick a local head branch to push.".to_owned(),
-            );
-        };
-        let counts = session
-            .upstream()
-            .map(|status| format!("Push ↑{} ↓{}", status.ahead, status.behind));
-        if self.accept_flow.read(cx).is_busy() {
-            return disabled(
-                counts.unwrap_or_else(|| "Push".to_owned()),
-                "An Accept is in progress; Push is available once it lands.".to_owned(),
-            );
-        }
-        if !session.head_has_upstream() {
-            if !session.has_remotes() {
-                return disabled(
-                    "Push · No upstream".to_owned(),
-                    "This repository has no remote to push to.".to_owned(),
+        let state = 'state: {
+            if self.push_flow.read(cx).is_running() {
+                let detail = session
+                    .and_then(RepoSession::upstream)
+                    .map_or(PushDetail::None, |status| {
+                        PushDetail::Counts(status.ahead, status.behind)
+                    });
+                break 'state state(
+                    true,
+                    "Pushing…",
+                    detail,
+                    "Show the push progress".to_owned(),
                 );
             }
-            return enabled(
-                "Push · No upstream".to_owned(),
-                format!(
-                    "`{}` has no upstream: push it with `git push -u`.",
-                    head.name
+            let Some(session) = session else {
+                break 'state state(
+                    false,
+                    "Push",
+                    PushDetail::None,
+                    "Open a repository first.".to_owned(),
+                );
+            };
+            let Some(head) = session.local_head() else {
+                break 'state state(
+                    false,
+                    "Push",
+                    PushDetail::None,
+                    "Pick a local head branch to push.".to_owned(),
+                );
+            };
+            let counts = session.upstream().map_or(PushDetail::None, |status| {
+                PushDetail::Counts(status.ahead, status.behind)
+            });
+            if self.accept_flow.read(cx).is_busy() {
+                break 'state state(
+                    false,
+                    "Push",
+                    counts,
+                    "An Accept is in progress; Push is available once it lands.".to_owned(),
+                );
+            }
+            if !session.head_has_upstream() {
+                if !session.has_remotes() {
+                    break 'state state(
+                        false,
+                        "Push",
+                        PushDetail::NoUpstream,
+                        "This repository has no remote to push to.".to_owned(),
+                    );
+                }
+                break 'state state(
+                    true,
+                    "Push",
+                    PushDetail::NoUpstream,
+                    format!(
+                        "`{}` has no upstream: push it with `git push -u`.",
+                        head.name
+                    ),
+                );
+            }
+            match session.upstream() {
+                Some(status) if status.ahead == 0 && status.behind == 0 => state(
+                    false,
+                    "Push",
+                    counts,
+                    format!(
+                        "Nothing to push: `{}` is up to date with `{}`.",
+                        head.name, status.upstream
+                    ),
                 ),
-            );
-        }
-        match session.upstream() {
-            Some(status) if status.ahead == 0 && status.behind == 0 => disabled(
-                counts.unwrap_or_default(),
-                format!(
-                    "Nothing to push: `{}` is up to date with `{}`.",
-                    head.name, status.upstream
+                Some(status) if status.ahead == 0 => state(
+                    true,
+                    "Push",
+                    counts,
+                    format!(
+                        "`{}` is behind `{}`: pull it (rebase) and push what is left.",
+                        head.name, status.upstream
+                    ),
                 ),
-            ),
-            Some(status) if status.ahead == 0 => enabled(
-                counts.unwrap_or_default(),
-                format!(
-                    "`{}` is behind `{}`: pull it (rebase) and push what is left.",
-                    head.name, status.upstream
+                Some(status) => state(
+                    true,
+                    "Push",
+                    counts,
+                    format!(
+                        "Push `{}` to `{}`; pulls with rebase first when the remote is ahead. \
+                         Never forced.",
+                        head.name, status.upstream
+                    ),
                 ),
-            ),
-            Some(status) => enabled(
-                counts.unwrap_or_default(),
-                format!(
-                    "Push `{}` to `{}`; pulls with rebase first when the remote is ahead. \
-                     Never forced.",
-                    head.name, status.upstream
+                None => state(
+                    true,
+                    "Push",
+                    PushDetail::None,
+                    format!("Push `{}` to its upstream.", head.name),
                 ),
-            ),
-            None => enabled(
-                "Push".to_owned(),
-                format!("Push `{}` to its upstream.", head.name),
-            ),
-        }
+            }
+        };
+        self.render_push_split_button(state, cx)
     }
 
-    /// A `base ▾` / `head ▾` button, with its picker popover when open.
+    /// Draws a [`PushButtonState`]: the `arrow-line-up` + label part and,
+    /// when there is a detail, a second part after a divider.
+    fn render_push_split_button(&self, state: PushButtonState, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let colors = &theme.colors;
+        let (label_color, detail_color, ahead_color) = if state.enabled {
+            (colors.text, colors.text_muted, colors.accent)
+        } else {
+            (
+                colors.text_placeholder,
+                colors.text_placeholder,
+                colors.text_placeholder,
+            )
+        };
+        let main = div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .h_full()
+            .px(px(9.0))
+            .text_color(label_color)
+            .child(icon(IconName::ArrowLineUp, px(14.0), label_color))
+            .child(state.label);
+        let detail_part = |content: AnyElement| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .h_full()
+                .px_2()
+                .border_l_1()
+                .border_color(colors.border)
+                .text_color(detail_color)
+                .child(content)
+        };
+        let detail = match state.detail {
+            PushDetail::None => None,
+            PushDetail::NoUpstream => Some(detail_part("No upstream".into_any_element())),
+            PushDetail::Counts(ahead, behind) => Some(detail_part(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .font_family(theme.fonts.code_family.clone())
+                    .text_size(px(11.5))
+                    .child(
+                        div()
+                            .when(ahead > 0, |this| this.text_color(ahead_color))
+                            .child(format!("↑{ahead}")),
+                    )
+                    .child(div().child(format!("↓{behind}")))
+                    .into_any_element(),
+            )),
+        };
+        div()
+            .id("title-push")
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(28.0))
+            .rounded(radius::MD)
+            .border_1()
+            .border_color(colors.border)
+            .overflow_hidden()
+            .text_sm()
+            .child(main)
+            .children(detail)
+            .tooltip(text_tooltip(state.tooltip))
+            .when(state.enabled, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(colors.element_hover))
+                    .active(|style| style.bg(colors.element_selected))
+                    .on_click(cx.listener(|this, _, _, cx| this.start_push(cx)))
+            })
+            .into_any_element()
+    }
+
+    /// A base / head branch button (`git-branch` icon + name in mono), with
+    /// its picker popover when open. The head branch is drawn in `accent`
+    /// on `accent_soft`, the base branch in `text_muted`.
     fn render_branch_button(
         &self,
         side: Side,
@@ -1920,54 +2135,71 @@ impl Workspace {
         enabled: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let colors = &cx.theme().colors;
+        let theme = cx.theme();
+        let colors = &theme.colors;
         let id = match side {
             Side::Base => "title-base",
             Side::Head => "title-head",
         };
         let (label, placeholder): (SharedString, bool) = match session.selected(side) {
-            Some(name) => (format!("{name} ▾").into(), false),
-            None => ("pick ▾".into(), true),
+            Some(name) => (name.to_string().into(), false),
+            None => ("pick".into(), true),
         };
         let picker = self
             .picker
             .as_ref()
             .filter(|open| open.picker.read(cx).side() == side)
             .map(|open| open.picker.clone());
-        let trigger = if enabled {
-            button(id, label, cx)
-                .max_w(px(260.0))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .when(placeholder, |button| button.text_color(colors.text_muted))
-                .when(picker.is_some(), |button| {
-                    button.bg(colors.element_selected)
-                })
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.toggle_picker(side, window, cx);
-                }))
+        let color = if !enabled || placeholder {
+            colors.text_placeholder
         } else {
-            disabled_button(id, label, cx)
+            match side {
+                Side::Base => colors.text_muted,
+                Side::Head => colors.accent,
+            }
         };
+        let fill = match side {
+            Side::Head if enabled && !placeholder => Some(colors.accent_soft),
+            _ => None,
+        };
+        let trigger = div()
+            .id(id)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(5.0))
+            .h(px(22.0))
+            .max_w(px(260.0))
+            .px_1p5()
+            .rounded(radius::SM)
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .font_family(theme.fonts.code_family.clone())
+            .text_size(px(12.0))
+            .text_color(color)
+            .when_some(fill, |this, fill| this.bg(fill))
+            .child(icon(IconName::GitBranch, px(13.0), color))
+            .child(div().min_w_0().overflow_hidden().child(label))
+            .tooltip(text_tooltip(match side {
+                Side::Base => "Base branch",
+                Side::Head => "Head branch",
+            }))
+            .when(enabled, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(colors.element_hover))
+                    .active(|style| style.bg(colors.element_selected))
+                    .when(picker.is_some(), |this| this.bg(colors.element_selected))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle_picker(side, window, cx);
+                    }))
+            });
         div()
             .relative()
             .min_w_0()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors.text_placeholder)
-                            .child(side.label()),
-                    )
-                    .child(trigger),
-            )
+            .child(trigger)
             .when_some(picker, |slot, picker| {
                 slot.child(
-                    deferred(div().absolute().top(px(30.0)).left_0().child(picker))
+                    deferred(div().absolute().top(px(28.0)).left_0().child(picker))
                         .with_priority(1),
                 )
             })
@@ -2104,65 +2336,71 @@ impl Workspace {
             .child(self.resize_handle(DockResize::FileTree, false, cx))
     }
 
-    /// "Files" | "Comments n" above the left dock.
+    /// "Files" | "Comments n" above the left dock (Panoptes #56 §5): SM
+    /// tabs, the selected one on `element_selected`, the count in mono.
     fn render_left_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
+        let code_family = cx.theme().fonts.code_family.clone();
         let count = self
             .comment_list
             .as_ref()
             .map_or(0, |list| list.read(cx).count());
-        let tab = |id: &'static str, label: String, tab: LeftTab, cx: &mut Context<Self>| {
+        let tab = |id: &'static str,
+                   label: &'static str,
+                   count: Option<usize>,
+                   tab: LeftTab,
+                   cx: &mut Context<Self>| {
             let active = self.left_tab == tab;
             div()
                 .id(id)
-                .relative()
                 .flex()
+                .flex_none()
                 .items_center()
-                .h_full()
-                .px_3()
-                .text_sm()
+                .gap(px(6.0))
+                .h(px(24.0))
+                .px(px(10.0))
+                .rounded(radius::SM)
+                .text_size(px(12.0))
                 .cursor_pointer()
                 .text_color(if active {
                     colors.text
                 } else {
                     colors.text_muted
                 })
-                .when(active, |tab| tab.bg(colors.background))
-                .hover(|style| style.bg(colors.element_hover))
+                .when(active, |tab| tab.bg(colors.element_selected))
+                .when(!active, |tab| {
+                    tab.hover(|style| style.bg(colors.element_hover))
+                })
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.show_left_tab(tab, window, cx)),
                 )
                 .child(label)
-                .when(active, |tab| {
+                .when_some(count, |tab, count| {
                     tab.child(
                         div()
-                            .absolute()
-                            .bottom_0()
-                            .left_0()
-                            .right_0()
-                            .h(px(2.0))
-                            .bg(colors.accent),
+                            .font_family(code_family.clone())
+                            .text_size(px(11.0))
+                            .text_color(colors.text_placeholder)
+                            .child(count.to_string()),
                     )
                 })
-        };
-        let comments = if count > 0 {
-            format!("Comments {count}")
-        } else {
-            "Comments".to_owned()
         };
         div()
             .flex()
             .flex_none()
-            .h(px(30.0))
-            .border_b_1()
-            .border_color(colors.border_variant)
+            .items_center()
+            .gap(px(2.0))
+            .px_2()
+            .pt_2()
+            .pb(px(6.0))
+            .child(tab("left-tab-files", "Files", None, LeftTab::Files, cx))
             .child(tab(
-                "left-tab-files",
-                "Files".to_owned(),
-                LeftTab::Files,
+                "left-tab-comments",
+                "Comments",
+                (count > 0).then_some(count),
+                LeftTab::Comments,
                 cx,
             ))
-            .child(tab("left-tab-comments", comments, LeftTab::Comments, cx))
             .into_any_element()
     }
 
@@ -2367,52 +2605,67 @@ impl Workspace {
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
+        let message = |text: SharedString, color: gpui::Hsla| {
+            div()
+                .py_1()
+                .text_sm()
+                .text_color(color)
+                .child(text)
+                .into_any_element()
+        };
         let recent: AnyElement =
             match &self.recent {
-                RecentRepos::Loading => div()
-                    .text_sm()
-                    .text_color(colors.text_placeholder)
-                    .child("Loading recent repositories…")
-                    .into_any_element(),
-                RecentRepos::Failed(message) => div()
-                    .text_sm()
-                    .text_color(colors.error)
-                    .child(format!("Could not load recent repositories: {message}"))
-                    .into_any_element(),
-                RecentRepos::Loaded(repos) if repos.is_empty() => div()
-                    .text_sm()
-                    .text_color(colors.text_placeholder)
-                    .child("No recent repositories.")
-                    .into_any_element(),
+                RecentRepos::Loading => message(
+                    "Loading recent repositories…".into(),
+                    colors.text_placeholder,
+                ),
+                RecentRepos::Failed(error) => message(
+                    format!("Could not load recent repositories: {error}").into(),
+                    colors.error,
+                ),
+                RecentRepos::Loaded(repos) if repos.is_empty() => {
+                    message("No recent repositories.".into(), colors.text_placeholder)
+                }
+                // The rows' padding hangs into the margin so their text lines up
+                // with the column while the hover fill keeps some room.
                 RecentRepos::Loaded(repos) => div()
                     .flex()
                     .flex_col()
                     .gap_0p5()
+                    .mx(px(-8.0))
                     .children(repos.iter().take(RECENT_REPOS_SHOWN).enumerate().map(
                         |(index, repo)| {
                             let path = repo.path.clone();
                             div()
                                 .id(("recent-repo", index))
                                 .flex()
-                                .flex_col()
+                                .items_center()
+                                .gap_2()
+                                .min_w_0()
+                                .h(px(28.0))
                                 .px_2()
-                                .py_1()
-                                .rounded_md()
+                                .rounded(radius::SM)
+                                .text_sm()
                                 .cursor_pointer()
                                 .hover(|style| style.bg(colors.element_hover))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open_path(path.clone(), cx)
                                 }))
+                                .child(kbd((index + 1).to_string(), cx))
                                 .child(
                                     div()
-                                        .text_sm()
+                                        .flex_none()
                                         .text_color(colors.text)
                                         .child(repo.name.clone()),
                                 )
                                 .child(
                                     div()
-                                        .text_xs()
-                                        .text_color(colors.text_muted)
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_color(colors.text_placeholder)
                                         .child(display_path(&repo.path)),
                                 )
                         },
@@ -2432,38 +2685,45 @@ impl Workspace {
                 div()
                     .flex()
                     .flex_col()
-                    .gap_4()
+                    .items_start()
+                    .gap_6()
                     .w(px(420.0))
                     .p_4()
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap_1()
+                            .items_start()
+                            .gap_3()
+                            .child(eye_mark(px(WELCOME_MARK_SIZE), cx))
                             .child(
                                 div()
-                                    .text_xl()
+                                    .text_size(px(WELCOME_WORDMARK_SIZE))
+                                    .line_height(px(WELCOME_WORDMARK_SIZE * 1.2))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(colors.text)
                                     .child("Argus"),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(colors.text_muted)
-                                    .child("Review a branch, comment on lines, and let Claude propose the fixes."),
-                            ),
+                            .child(div().text_sm().text_color(colors.text_muted).child(
+                                "Review a branch, comment on lines, and let Claude propose the fixes.",
+                            )),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(primary_button("open-repo", "Open a repository", cx).on_click(
-                                |_, window, cx| {
+                            .child(
+                                primary_button_with_icon(
+                                    "open-repo",
+                                    IconName::FolderSimple,
+                                    "Open repository",
+                                    cx,
+                                )
+                                .on_click(|_, window, cx| {
                                     window.dispatch_action(OpenRepository.boxed_clone(), cx)
-                                },
-                            ))
+                                }),
+                            )
                             .child(kbd(shortcut_text::<OpenRepository>(), cx)),
                     )
                     .child(
@@ -2471,11 +2731,13 @@ impl Workspace {
                             .flex()
                             .flex_col()
                             .gap_1()
+                            .w_full()
                             .child(
                                 div()
                                     .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(colors.text_muted)
-                                    .child("RECENT"),
+                                    .child("Recent"),
                             )
                             .child(recent),
                     ),
@@ -2485,17 +2747,15 @@ impl Workspace {
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
         let jobs = cx.global::<BackgroundJobs>().clone();
-        let job_indicator = if jobs.is_busy() {
+        let job_indicator = jobs.is_busy().then(|| {
             div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .text_color(colors.text)
-                .child(div().size(px(6.0)).rounded_full().bg(colors.accent))
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_color(colors.text_muted)
                 .child(jobs.labels().join(" · "))
-        } else {
-            div().text_color(colors.text_placeholder).child("Idle")
-        };
+        });
         let notice = self.notice.as_ref().map(|notice| {
             div()
                 .id("status-notice")
@@ -2515,6 +2775,86 @@ impl Workspace {
                 }))
         });
 
+        let dock_visible = self.settings.file_tree.visible;
+        let files = toggle_icon_button(
+            "status-files",
+            IconName::SidebarSimple,
+            with_shortcut::<ToggleFileTree>("Toggle file tree"),
+            dock_visible && self.left_tab == LeftTab::Files,
+            cx,
+        )
+        .on_click(|_, window, cx| window.dispatch_action(ToggleFileTree.boxed_clone(), cx));
+        let comments = toggle_icon_button(
+            "status-comments",
+            IconName::ChatText,
+            with_shortcut::<ToggleCommentList>("Comments"),
+            dock_visible && self.left_tab == LeftTab::Comments,
+            cx,
+        )
+        .on_click(
+            cx.listener(|this, _, window, cx| this.show_left_tab(LeftTab::Comments, window, cx)),
+        );
+        let divider = div()
+            .flex_none()
+            .w(px(1.0))
+            .h(px(14.0))
+            .mx_1()
+            .bg(colors.border_variant);
+
+        let counters = self.comment_list.as_ref().map(|list| {
+            let list = list.read(cx);
+            let open = list.status_count(CommentStatus::Open);
+            let running = list.status_count(CommentStatus::Running);
+            let proposed = list.status_count(CommentStatus::Proposed);
+            let mut counters: Vec<AnyElement> = Vec::new();
+            if open > 0 {
+                counters.push(
+                    self.status_counter(
+                        CommentStatus::Open,
+                        icon(IconName::ChatText, STATUS_ICON_SIZE, colors.text_muted)
+                            .into_any_element(),
+                        format!("{open} open"),
+                        colors.text_muted,
+                        "Show open comments",
+                        cx,
+                    ),
+                );
+            }
+            if running > 0 {
+                counters.push(self.status_counter(
+                    CommentStatus::Running,
+                    claude_activity(STATUS_ICON_SIZE, cx),
+                    format!("{running} running"),
+                    colors.claude_text,
+                    "Show running comments",
+                    cx,
+                ));
+            }
+            if proposed > 0 {
+                counters.push(
+                    self.status_counter(
+                        CommentStatus::Proposed,
+                        icon(IconName::GitPullRequest, STATUS_ICON_SIZE, colors.accent)
+                            .into_any_element(),
+                        format!("{proposed} to review"),
+                        colors.accent,
+                        "Show proposals to review",
+                        cx,
+                    ),
+                );
+            }
+            counters
+        });
+
+        let run_panel = toggle_icon_button(
+            "status-runs",
+            IconName::Sidebar,
+            with_shortcut::<ToggleRunPanel>("Toggle run panel"),
+            self.settings.run_panel.visible,
+            cx,
+        )
+        .on_click(|_, window, cx| window.dispatch_action(ToggleRunPanel.boxed_clone(), cx));
+
         div()
             .flex()
             .flex_none()
@@ -2525,58 +2865,99 @@ impl Workspace {
             .px_1()
             .bg(colors.status_bar)
             .border_t_1()
-            .border_color(colors.border)
-            .text_xs()
+            .border_color(colors.border_variant)
+            .text_size(STATUS_TEXT_SIZE)
+            .text_color(colors.text_muted)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap_0p5()
                     .min_w_0()
-                    .child(
-                        toggle_button("status-files", "Files", self.settings.file_tree.visible, cx)
-                            .h(px(20.0))
-                            .text_xs()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(ToggleFileTree.boxed_clone(), cx)
-                            }),
-                    )
-                    .children(notice),
+                    .child(files)
+                    .child(comments)
+                    .child(divider)
+                    .children(counters.into_iter().flatten())
+                    .children(notice.map(|notice| notice.ml_1())),
             )
             .child(
                 div()
                     .flex()
-                    .flex_none()
                     .items_center()
-                    .gap_2()
-                    .child(job_indicator)
+                    .gap_0p5()
+                    .min_w_0()
+                    .children(job_indicator.map(|jobs| jobs.mr_1()))
                     .child(
-                        button("status-settings", "Settings", cx)
-                            .h(px(20.0))
-                            .text_xs()
-                            .text_color(colors.text_muted)
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(OpenSettings.boxed_clone(), cx)
-                            }),
+                        icon_button(
+                            "status-settings",
+                            IconName::SlidersHorizontal,
+                            with_shortcut::<OpenSettings>("Settings"),
+                            cx,
+                        )
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(OpenSettings.boxed_clone(), cx)
+                        }),
                     )
                     .child(
-                        button("status-shortcuts", "Shortcuts", cx)
-                            .h(px(20.0))
-                            .text_xs()
-                            .text_color(colors.text_muted)
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(ToggleKeyboardShortcuts.boxed_clone(), cx)
-                            }),
+                        icon_button(
+                            "status-shortcuts",
+                            IconName::Keyboard,
+                            with_shortcut::<ToggleKeyboardShortcuts>("Keyboard shortcuts"),
+                            cx,
+                        )
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(ToggleKeyboardShortcuts.boxed_clone(), cx)
+                        }),
                     )
-                    .child(
-                        toggle_button("status-runs", "Runs", self.settings.run_panel.visible, cx)
-                            .h(px(20.0))
-                            .text_xs()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(ToggleRunPanel.boxed_clone(), cx)
-                            }),
-                    ),
+                    .child(run_panel),
             )
+    }
+
+    /// A status-bar lifecycle counter: a small ghost button that opens the
+    /// Comments tab filtered to `status` only.
+    fn status_counter(
+        &self,
+        status: CommentStatus,
+        leading: AnyElement,
+        label: String,
+        color: gpui::Hsla,
+        tooltip: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = &cx.theme().colors;
+        div()
+            .id(SharedString::from(format!("status-counter-{status}")))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .h(px(20.0))
+            .px_1p5()
+            .rounded(radius::SM)
+            .cursor_pointer()
+            .text_color(color)
+            .hover(|style| style.bg(colors.element_hover))
+            .active(|style| style.bg(colors.element_selected))
+            .tooltip(text_tooltip(tooltip))
+            .child(leading)
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.show_comments_with_status(status, window, cx)
+            }))
+            .into_any_element()
+    }
+
+    /// Opens the Comments tab with the list filtered to `status` only.
+    fn show_comments_with_status(
+        &mut self,
+        status: CommentStatus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(list) = self.comment_list.clone() {
+            list.update(cx, |list, cx| list.show_only(status, cx));
+        }
+        self.show_left_tab(LeftTab::Comments, window, cx);
     }
 
     fn render_sheet(&self, sheet: Sheet, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2802,7 +3183,8 @@ impl Workspace {
                     SHORTCUTS
                         .iter()
                         .filter(|shortcut| shortcut.group == name)
-                        .map(|shortcut| {
+                        .filter_map(|shortcut| Some((shortcut, shortcut.sheet_keys()?)))
+                        .map(|(shortcut, keys)| {
                             div()
                                 .flex()
                                 .items_center()
@@ -2812,7 +3194,7 @@ impl Workspace {
                                 .text_sm()
                                 .text_color(colors.text)
                                 .child(shortcut.description)
-                                .child(kbd(shortcut.display_keys(), cx))
+                                .child(kbd(keys, cx))
                         }),
                 )
         };
@@ -2905,6 +3287,22 @@ impl Workspace {
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.update_settings(window, cx, |settings| settings.theme = mode)
+                }))
+                .into_any_element()
+            })
+            .collect();
+        let family_buttons = ThemeFamily::ALL
+            .iter()
+            .map(|family| {
+                let family = *family;
+                toggle_button(
+                    ("theme-family", family as usize),
+                    family.label(),
+                    settings.theme_family == family,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.update_settings(window, cx, |settings| settings.theme_family = family)
                 }))
                 .into_any_element()
             })
@@ -3017,6 +3415,7 @@ impl Workspace {
                 cx,
             ))
             .child(row("Theme", segmented(theme_buttons)))
+            .child(row("Theme family", segmented(family_buttons)))
             .child(row("Active theme", muted(theme.name.clone())))
             .child(row(
                 "UI font size",
@@ -3042,7 +3441,22 @@ impl Workspace {
                 ),
             ))
             .child(row("UI font", muted(theme.fonts.ui_family.clone())))
-            .child(row("Code font", muted(theme.fonts.code_family.clone())));
+            .child(row("Code font", muted(theme.fonts.code_family.clone())))
+            .child(row(
+                "Reduce motion",
+                toggle_button(
+                    "reduce-motion-setting",
+                    if settings.reduce_motion { "On" } else { "Off" },
+                    settings.reduce_motion,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.update_settings(window, cx, |settings| {
+                        settings.reduce_motion = !settings.reduce_motion;
+                    })
+                }))
+                .into_any_element(),
+            ));
 
         let layout = div()
             .flex()
@@ -3167,7 +3581,14 @@ impl Render for Workspace {
 
         div()
             .id("workspace")
-            .key_context(WORKSPACE_CONTEXT)
+            .key_context({
+                let mut context = gpui::KeyContext::default();
+                context.add(WORKSPACE_CONTEXT);
+                if self.is_welcome_shown() {
+                    context.add(WELCOME_CONTEXT);
+                }
+                context
+            })
             .track_focus(&self.focus_handle)
             .relative()
             .flex()
@@ -3195,6 +3616,15 @@ impl Render for Workspace {
                 }),
             )
             .on_action(cx.listener(Self::open_repository))
+            .on_action(cx.listener(|this, _: &OpenRecent1, _, cx| this.open_recent(0, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent2, _, cx| this.open_recent(1, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent3, _, cx| this.open_recent(2, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent4, _, cx| this.open_recent(3, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent5, _, cx| this.open_recent(4, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent6, _, cx| this.open_recent(5, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent7, _, cx| this.open_recent(6, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent8, _, cx| this.open_recent(7, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent9, _, cx| this.open_recent(8, cx)))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::toggle_shortcuts))
             .on_action(cx.listener(Self::dismiss))
@@ -3254,6 +3684,17 @@ fn services(cx: &gpui::App) -> (StorageService, tokio::runtime::Handle) {
 /// the window is too small for both.
 fn clamp_size(size: f32, max: f32) -> f32 {
     size.min(max).max(MIN_DOCK_SIZE).round()
+}
+
+/// `label` followed by the shortcut of action `A` in parentheses, for
+/// tooltips; just `label` when the action has no binding.
+fn with_shortcut<A: Action>(label: &str) -> String {
+    let keys = shortcut_text::<A>();
+    if keys.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{label} ({keys})")
+    }
 }
 
 /// Formatted keystrokes of the shortcut bound to action `A`, for inline hints.
