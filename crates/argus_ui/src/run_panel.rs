@@ -984,8 +984,8 @@ impl RunPanel {
                         .py_1p5()
                         .rounded_md()
                         .border_1()
-                        .border_color(colors.accent.opacity(0.5))
-                        .bg(colors.accent.opacity(0.06))
+                        .border_color(colors.accent_border)
+                        .bg(colors.accent_soft)
                         .child(
                             div()
                                 .flex()
@@ -1184,12 +1184,12 @@ fn detail_block(text: &str, colors: &ThemeColors, font: &SharedString) -> gpui::
         .child(shown)
 }
 
-/// The label and color of a run status.
+/// The label and color of a run status (Panoptes #56 §3).
 fn run_status_style(status: RunStatus, colors: &ThemeColors) -> (&'static str, Hsla) {
     match status {
         RunStatus::Queued => ("Starting", colors.text_muted),
-        RunStatus::Running => ("Running", colors.warning),
-        RunStatus::Succeeded => ("Proposed", colors.status_proposed),
+        RunStatus::Running => ("Running", colors.claude),
+        RunStatus::Succeeded => ("Ready to review", colors.accent),
         RunStatus::NoChanges => ("No changes", colors.text_muted),
         RunStatus::Failed => ("Failed", colors.error),
         RunStatus::Stopped => ("Stopped", colors.text_placeholder),

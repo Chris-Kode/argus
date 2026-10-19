@@ -57,7 +57,10 @@ pub use run_panel::{RunPanel, RunPanelEvent};
 pub use session::{Comparison, DiffTarget, RepoSession, SessionEvent, Side};
 pub use settings::{Settings, UiSettings};
 pub use text_editor::{TextEditor, TextEditorEvent};
-pub use theme::{ActiveTheme, Appearance, SyntaxTheme, Theme, ThemeColors, ThemeFonts, ThemeMode};
+pub use theme::{
+    ActiveTheme, Appearance, EYE_PUPIL, SyntaxTheme, Theme, ThemeColors, ThemeFamily, ThemeFonts,
+    ThemeMode,
+};
 pub use workspace::Workspace;
 
 /// Application-wide handles to the services, stored as a GPUI global.
@@ -274,7 +277,11 @@ pub fn run_gpui_app(
         }
         // A provisional theme so views can render before the workspace
         // resolves fonts and the window appearance.
-        cx.set_global(Theme::new(Appearance::Dark, ThemeFonts::default()));
+        cx.set_global(Theme::new(
+            ui_settings.theme_family,
+            Appearance::Dark,
+            ThemeFonts::default(),
+        ));
 
         keymap::bind_keys(cx);
         cx.on_action(|_: &keymap::Quit, cx| cx.quit());

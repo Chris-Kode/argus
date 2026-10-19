@@ -2394,7 +2394,7 @@ impl DiffView {
             .overflow_hidden()
             .pl(CODE_PADDING)
             .whitespace_nowrap()
-            .when(selected, |code| code.bg(colors.accent.opacity(0.1)))
+            .when(selected, |code| code.bg(colors.accent_soft))
             .child(div().relative().left(-shift).child(code))
     }
 

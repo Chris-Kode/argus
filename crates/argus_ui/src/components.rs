@@ -141,13 +141,15 @@ pub fn placeholder(text: impl Into<SharedString>, cx: &App) -> Div {
         )
 }
 
-/// The label and color of a status (spec §7.2).
+/// The label and color of a status (spec §7.2, Panoptes #56 §3): Claude at
+/// work is `claude`, a proposal waiting for the user is `accent`, and states
+/// that need nobody's attention stay neutral.
 pub fn status_style(status: CommentStatus, colors: &ThemeColors) -> (&'static str, Hsla) {
     match status {
-        CommentStatus::Open => ("Open", colors.accent),
-        CommentStatus::Running => ("Running", colors.warning),
-        CommentStatus::Proposed => ("Proposed", colors.status_proposed),
-        CommentStatus::Resolved => ("Resolved", colors.diff_added_text),
+        CommentStatus::Open => ("Open", colors.text_muted),
+        CommentStatus::Running => ("Running", colors.claude),
+        CommentStatus::Proposed => ("Proposed", colors.accent),
+        CommentStatus::Resolved => ("Resolved", colors.text_muted),
         CommentStatus::Dismissed => ("Dismissed", colors.text_placeholder),
     }
 }

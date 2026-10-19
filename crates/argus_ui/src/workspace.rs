@@ -72,7 +72,7 @@ use crate::settings::{
     DEFAULT_RUN_PANEL_HEIGHT, DEFAULT_RUN_PANEL_WIDTH, DEFAULT_UI_FONT_SIZE, DiffViewMode,
     MIN_DOCK_SIZE, RunPanelPosition, UiSettings, clamp_font_size, clamp_tab_width,
 };
-use crate::theme::{ActiveTheme, Theme, ThemeFonts, ThemeMode};
+use crate::theme::{ActiveTheme, Theme, ThemeFamily, ThemeFonts, ThemeMode};
 use crate::{AppContext, OpenRequest};
 
 /// Height of the title bar.
@@ -336,7 +336,7 @@ impl Workspace {
             code_size: px(self.settings.code_font_size),
         };
         let appearance = self.settings.theme.resolve(window.appearance());
-        cx.set_global(Theme::new(appearance, fonts));
+        cx.set_global(Theme::new(self.settings.theme_family, appearance, fonts));
         cx.refresh_windows();
     }
 
@@ -353,6 +353,7 @@ impl Workspace {
             return;
         }
         let theme_changed = self.settings.theme != before.theme
+            || self.settings.theme_family != before.theme_family
             || self.settings.ui_font_family != before.ui_font_family
             || self.settings.code_font_family != before.code_font_family
             || self.settings.ui_font_size != before.ui_font_size
@@ -2909,6 +2910,22 @@ impl Workspace {
                 .into_any_element()
             })
             .collect();
+        let family_buttons = ThemeFamily::ALL
+            .iter()
+            .map(|family| {
+                let family = *family;
+                toggle_button(
+                    ("theme-family", family as usize),
+                    family.label(),
+                    settings.theme_family == family,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.update_settings(window, cx, |settings| settings.theme_family = family)
+                }))
+                .into_any_element()
+            })
+            .collect();
         let diff_mode_buttons = [DiffViewMode::SideBySide, DiffViewMode::Unified]
             .into_iter()
             .map(|mode| {
@@ -3017,6 +3034,7 @@ impl Workspace {
                 cx,
             ))
             .child(row("Theme", segmented(theme_buttons)))
+            .child(row("Theme family", segmented(family_buttons)))
             .child(row("Active theme", muted(theme.name.clone())))
             .child(row(
                 "UI font size",

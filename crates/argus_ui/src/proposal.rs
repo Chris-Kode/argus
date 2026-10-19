@@ -1272,8 +1272,8 @@ impl ProposalView {
                     .px_3()
                     .py_1()
                     .border_b_1()
-                    .border_color(colors.accent.opacity(0.4))
-                    .bg(colors.accent.opacity(0.08))
+                    .border_color(colors.accent_border)
+                    .bg(colors.accent_soft)
                     .text_sm()
                     .text_color(colors.accent)
                     .child(
