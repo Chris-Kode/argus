@@ -1,7 +1,8 @@
 //! Small styled building blocks shared by the shell views.
 //!
 //! Every component draws its corners from the [`radius`] scale (Panoptes #56
-//! §4); pills (`rounded_full`) are reserved for status chips and avatars.
+//! §4); pills (`rounded_full`) are reserved for status chips and gutter
+//! markers.
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use gpui::{
 };
 
 use crate::file_tree::model::kind_letter;
-use crate::icons::{IconName, eye_mark, icon};
+use crate::icons::{IconName, icon};
 use crate::theme::{ActiveTheme, ThemeColors};
 
 /// The corner-radius scale (Panoptes #56 §4). Components use these instead
@@ -320,44 +321,6 @@ pub fn reject_button(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
 /// The Reply button of a proposal: a ghost button with a speech bubble.
 pub fn reply_button(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
     button_with_icon(id, IconName::ChatText, "Reply", cx)
-}
-
-/// Side of a message avatar.
-const AVATAR_SIZE: Pixels = px(24.0);
-/// Ring width of a message avatar.
-const AVATAR_RING: Pixels = px(1.5);
-
-/// The user's avatar in a thread (Panoptes #56 §5): a 24 px `accent` ring
-/// around an 8 px `accent` dot.
-pub fn user_avatar(cx: &App) -> Div {
-    let accent = cx.theme().colors.accent;
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(AVATAR_SIZE)
-        .rounded_full()
-        .border(AVATAR_RING)
-        .border_color(accent)
-        .child(div().size(px(8.0)).rounded_full().bg(accent))
-}
-
-/// Claude's avatar in a thread (Panoptes #56 §5): a 24 px `background`
-/// circle with a `claude` ring holding the 14 px eye mark.
-pub fn claude_avatar(cx: &App) -> Div {
-    let colors = &cx.theme().colors;
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(AVATAR_SIZE)
-        .rounded_full()
-        .bg(colors.background)
-        .border(AVATAR_RING)
-        .border_color(colors.claude)
-        .child(eye_mark(px(14.0), cx))
 }
 
 /// A button for an action that is not available yet; it does not react to the

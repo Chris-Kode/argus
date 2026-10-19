@@ -2002,7 +2002,7 @@ impl DiffView {
                         .w_full()
                         .px(CARD_INSET)
                         .when(local == 0, |wrapper| {
-                            wrapper.child(self.render_file_header(file, entry, false, cx))
+                            wrapper.child(self.render_file_header(file, entry, false, false, cx))
                         })
                         .into_any_element();
                 }
@@ -2725,12 +2725,14 @@ impl DiffView {
     /// The header card of a file (Panoptes #56 §5): caret, letter badge,
     /// path, counts, thread count, extras and the Viewed toggle, on
     /// `surface` across the [`HEADER_ROWS`] rows. A collapsed file is this
-    /// card alone, closed on all sides; the sticky copy uses the same look.
+    /// card alone, closed on all sides; the sticky copy uses the same look,
+    /// with square top corners while `stuck` to the top of the view.
     fn render_file_header(
         &self,
         file: usize,
         entry: &FileEntry,
         sticky: bool,
+        stuck: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
@@ -2950,15 +2952,19 @@ impl DiffView {
             .when(!collapsed, |header| {
                 // The outline stays `border`; the line under the header is
                 // the quieter separator inside the card.
-                header.rounded_t(radius::LG).child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .h(CARD_BORDER)
-                        .bg(colors.border_variant),
-                )
+                // Stuck to the top, the card's top edge has scrolled away:
+                // square corners, or the rows scrolling under show through.
+                header
+                    .when(!stuck, |header| header.rounded_t(radius::LG))
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .h(CARD_BORDER)
+                            .bg(colors.border_variant),
+                    )
             })
             .font_family(theme.fonts.ui_family.clone())
             .text_size(theme.fonts.ui_size * 0.92)
@@ -3178,7 +3184,6 @@ impl Render for DiffView {
             self.active_file = Some(top_file);
             cx.emit(DiffViewEvent::ActiveFileChanged(top_file));
         }
-        let sticky = self.render_file_header(top_file, &list.entries()[top_file], true, cx);
         // The sticky header sits on the file's own header until that scrolls
         // away, then the bottom of the card (its spacer row) pushes it up.
         let header_height = self.row_height() * HEADER_ROWS as f64;
@@ -3186,6 +3191,7 @@ impl Render for DiffView {
         let card_end =
             (self.starts[top_file + 1] - SPACER_ROWS) as f64 * self.row_height() - scroll_top;
         let stuck = card_top < 0.0;
+        let sticky = self.render_file_header(top_file, &list.entries()[top_file], true, stuck, cx);
         let sticky_top = px(card_top.max(0.0).min(card_end - header_height) as f32);
         let sticky_shadow = BoxShadow {
             color: colors.shadow,
@@ -3273,7 +3279,7 @@ impl Render for DiffView {
                         .left(CARD_INSET)
                         .right(CARD_INSET)
                         .h(row_height * HEADER_ROWS as f32)
-                        .rounded_t(radius::LG)
+                        .when(!stuck, |sticky| sticky.rounded_t(radius::LG))
                         .when(stuck, |sticky| sticky.shadow(vec![sticky_shadow]))
                         .block_mouse_except_scroll()
                         .child(sticky),

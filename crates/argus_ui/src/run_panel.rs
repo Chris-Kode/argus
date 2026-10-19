@@ -1151,20 +1151,16 @@ impl RunPanel {
             .py_1()
             .into_any_element()
         };
-        // The log and the prompt sit in the same inset as a running card's
-        // steps, in the code font.
+        // The log and the prompt fill the panel under the toolbar, on the
+        // same background as a running card's steps, in the code font.
         let body = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .m_2()
             .overflow_hidden()
-            .rounded(radius::MD)
             .bg(colors.background)
-            .border_1()
-            .border_color(colors.border_variant)
             .font_family(cx.theme().fonts.code_family.clone())
             .child(body);
 
@@ -1299,17 +1295,16 @@ impl RunPanel {
                     .as_deref()
                     .map(|text| self.markdown.prepare(text, markdown_cache, cx));
                 let colors = &cx.theme().colors;
+                // The run's last word: a log entry under a hairline.
                 row.child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .px_2()
-                        .py_1p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.accent_border)
-                        .bg(colors.accent_soft)
+                        .mt_1()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
                         .child(
                             div()
                                 .flex()
@@ -1500,9 +1495,7 @@ fn detail_block(text: &str, colors: &ThemeColors, font: &SharedString) -> gpui::
         .px_2()
         .py_1()
         .rounded_md()
-        .bg(colors.background)
-        .border_1()
-        .border_color(colors.border_variant)
+        .bg(colors.surface)
         .font_family(font.clone())
         .text_xs()
         .text_color(colors.text)

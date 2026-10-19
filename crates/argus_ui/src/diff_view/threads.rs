@@ -45,8 +45,8 @@ use argus_git::{DiffStat, Sha};
 use argus_runs::settings::{EFFORTS, MODELS};
 use argus_store::{ReplyRun, RunId};
 use gpui::{
-    AnyElement, App, BoxShadow, Context, Entity, FontWeight, Global, Hsla, MouseButton,
-    MouseDownEvent, Pixels, SharedString, Subscription, Task, deferred, div, point, prelude::*, px,
+    AnyElement, App, Context, Entity, FontWeight, Global, Hsla, MouseButton, MouseDownEvent,
+    Pixels, SharedString, Subscription, Task, deferred, div, prelude::*, px,
 };
 
 use super::{
@@ -55,9 +55,8 @@ use super::{
 };
 use crate::AppContext;
 use crate::components::{
-    accept_button, button, button_with_icon, chip, claude_avatar, disabled_button,
-    disabled_button_with_icon, icon_button, kbd, primary_button, radius, reject_button,
-    status_chip, text_tooltip, user_avatar,
+    accept_button, button, chip, disabled_button, disabled_button_with_icon, icon_button, kbd,
+    primary_button, radius, reject_button, status_chip, text_tooltip,
 };
 use crate::followup::FollowupKind;
 use crate::icons::{IconName, icon};
@@ -1915,17 +1914,6 @@ impl DiffView {
             .when(!collapsed, |header| header.child(div().flex_1()))
             .children(replies)
             .children(self.render_run_button(comment, &key, cx))
-            .when(comment.status == CommentStatus::Proposed, |header| {
-                header.child(
-                    button_with_icon(
-                        (key.clone(), 3),
-                        IconName::GitPullRequest,
-                        "View proposal",
-                        cx,
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| this.view_proposal(id, cx))),
-                )
-            })
             .child(menu_button);
 
         let proposal = self
@@ -2100,48 +2088,20 @@ impl DiffView {
                     .child(kbd(submit_keys(), cx))
                     .into_any_element(),
             };
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .px_3()
-                .pt_1p5()
-                .pb_2()
-                .border_t_1()
-                .border_color(colors.border_variant)
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .text_color(colors.text_muted)
-                        .child(if followup {
-                            "Reply · sent as a follow-up run, or as a note"
-                        } else {
-                            "Reply"
-                        }),
-                )
-                .child(content)
+            div().px_3().py_2().child(content)
         });
 
+        // Inline in the diff, not floating over it: a border and no shadow.
         div()
             .id(key.clone())
+            .relative()
             .flex()
             .flex_col()
             .max_w(MAX_CARD_WIDTH)
-            .rounded(radius::LG)
+            .rounded(radius::MD)
             .border_1()
-            .border_color(if focused {
-                colors.accent
-            } else {
-                colors.border
-            })
+            .border_color(colors.border)
             .bg(colors.elevated_surface)
-            .shadow(vec![BoxShadow {
-                color: colors.shadow,
-                offset: point(px(0.0), px(10.0)),
-                blur_radius: px(28.0),
-                spread_radius: px(0.0),
-                inset: false,
-            }])
             // Keeps the Claude bands inside the rounded corners.
             .overflow_hidden()
             .text_color(colors.text)
@@ -2159,12 +2119,23 @@ impl DiffView {
             .children(confirm)
             .children(confirm_reject)
             .children(reply_box)
+            .when(focused, |card| {
+                card.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .w(px(2.0))
+                        .bg(colors.accent),
+                )
+            })
             .into_any_element()
     }
 
-    /// One message of a thread: a 24 px avatar beside the author, the meta
-    /// and the body. Claude's messages sit on a `claude_soft` band; `run`
-    /// adds its model, effort and duration to the meta.
+    /// One message of a thread: the author, the meta and the body. Claude's
+    /// messages sit on a `claude_soft` band; `run` adds its model, effort
+    /// and duration to the meta.
     #[allow(clippy::too_many_arguments)]
     fn render_message(
         &self,
@@ -2179,10 +2150,10 @@ impl DiffView {
         let theme = cx.theme().clone();
         let colors = &theme.colors;
         let claude = author == ReplyAuthor::Claude;
-        let (avatar, name, name_color) = if claude {
-            (claude_avatar(cx), "Claude", colors.claude_text)
+        let (name, name_color) = if claude {
+            ("Claude", colors.claude_text)
         } else {
-            (user_avatar(cx), "You", colors.text)
+            ("You", colors.text)
         };
         let choice = run.filter(|_| claude).map(|run| {
             let choice = if run.effort.trim().is_empty() {
@@ -2225,27 +2196,29 @@ impl DiffView {
                     .text_color(colors.text_placeholder)
                     .child(when),
             );
+        // The proposal is a row of the message under a hairline, not a box.
+        let inset = inset.map(|inset| {
+            div()
+                .mt_1()
+                .pt_2()
+                .border_t_1()
+                .border_color(colors.border_variant)
+                .child(inset)
+        });
         div()
             .flex()
-            .gap_2p5()
+            .flex_col()
+            .gap_1()
+            .min_w_0()
             .px_3()
             .py_2()
             .when(separated, |row| {
                 row.border_t_1().border_color(colors.border_variant)
             })
             .when(claude, |row| row.bg(colors.claude_soft))
-            .child(avatar)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_1()
-                    .child(div().flex().items_center().h(px(24.0)).child(meta))
-                    .child(body)
-                    .children(inset),
-            )
+            .child(meta)
+            .child(body)
+            .children(inset)
             .into_any_element()
     }
 
@@ -2309,12 +2282,6 @@ impl DiffView {
             .flex_wrap()
             .items_center()
             .gap_2()
-            .mt_1()
-            .p_2()
-            .rounded(radius::MD)
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.background)
             .child(icon(IconName::GitPullRequest, px(14.0), colors.accent))
             .child(
                 div()
@@ -2451,6 +2418,7 @@ impl DiffView {
     /// main part runs with the shown choice, the arrow opens the Run menu.
     /// While the comment cannot run (outdated, Claude unavailable) the
     /// button is greyed out and a click shows the reason in the hint bar.
+    /// A proposal's follow-up is sent from the reply box, so it has none.
     fn render_run_button(
         &self,
         comment: &Comment,
@@ -2460,7 +2428,8 @@ impl DiffView {
         if !matches!(
             comment.status,
             CommentStatus::Open | CommentStatus::Running | CommentStatus::Proposed
-        ) {
+        ) || self.offers_followup(comment.id)
+        {
             return None;
         }
         let colors = cx.theme().colors.clone();
@@ -2694,7 +2663,6 @@ impl DiffView {
             .border_1()
             .border_color(colors.accent_border)
             .bg(colors.elevated_surface)
-            .shadow_sm()
             .text_color(colors.text)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
@@ -2740,22 +2708,52 @@ impl DiffView {
         let save_button = if slot.saving {
             disabled_button((key.clone(), 1), "Saving…", cx).into_any_element()
         } else {
-            primary_button((key.clone(), 1), save, cx)
-                .h(px(24.0))
-                .on_click(cx.listener(move |this, _, _, cx| this.submit_editor(&save_draft, cx)))
-                .into_any_element()
+            let on_save = cx.listener(move |this, _, _, cx| this.submit_editor(&save_draft, cx));
+            // Accept stays the one primary action while a proposal waits.
+            if followup {
+                button((key.clone(), 1), save, cx)
+                    .on_click(on_save)
+                    .into_any_element()
+            } else {
+                primary_button((key.clone(), 1), save, cx)
+                    .h(px(24.0))
+                    .on_click(on_save)
+                    .into_any_element()
+            }
         };
         // A reply on a proposal: the follow-up's model and effort, and the
         // note-only alternative.
         let followup_controls = followup_id.filter(|_| !slot.saving).map(|id| {
-            // The thread's Run menu choice; the button opens the menu.
+            // The thread's Run menu choice; the button opens the menu, which
+            // opens upward since the reply box ends the thread.
             let (model, effort) = self.run_choice(id, cx);
+            let open = self.threads.run_menu == Some(id);
             (
-                button((key.clone(), 3), choice_label(&model, &effort), cx)
-                    .h(px(20.0))
-                    .text_xs()
-                    .text_color(colors.text_muted)
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_run_menu(id, cx))),
+                div()
+                    .relative()
+                    .flex_none()
+                    .child(
+                        button((key.clone(), 3), choice_label(&model, &effort), cx)
+                            .h(px(20.0))
+                            .text_xs()
+                            .text_color(colors.text_muted)
+                            .when(open, |button| button.bg(colors.element_selected))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.toggle_run_menu(id, cx)),
+                            ),
+                    )
+                    .when(open, |slot| {
+                        slot.child(
+                            deferred(
+                                div()
+                                    .absolute()
+                                    .bottom(px(24.0))
+                                    .right_0()
+                                    .child(self.render_run_menu(id, &key, cx)),
+                            )
+                            .with_priority(2),
+                        )
+                    }),
                 button((key.clone(), 2), "Add note only", cx).on_click(
                     cx.listener(move |this, _, _, cx| this.submit_editor_as(&note_draft, true, cx)),
                 ),
