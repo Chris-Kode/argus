@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Argus Panoptes: Night review window</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap" rel="stylesheet">
+<style>
+.mockup-frame{min-width:1440px}
+body{margin:0;background:#0A0F12}
+a{color:#8FA3AA}a:hover{color:#DCE6E8}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;margin:0;cursor:pointer}
+input{font:inherit}
+input::placeholder{color:#71868E}
+.mono{font-family:'IBM Plex Mono',ui-monospace,monospace}
+.row{display:flex;height:20px;line-height:20px;font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:12.5px}
+.ln{width:44px;flex:none;box-sizing:border-box;padding-right:10px;text-align:right;color:#71868E}
+.cc{width:18px;flex:none;display:flex;align-items:center;justify-content:center}
+.sg{width:16px;flex:none;text-align:center}
+.code{flex:1;white-space:pre;color:#DCE6E8}
+.kw{color:#A794F2}.fn{color:#5CC8E0}.ty{color:#46C2B0}.st{color:#9CCB7E}.pr{color:#E58F7A}.pu{color:#8FA3AA}.cm{color:#71868E;font-style:italic}
+.wa{background:rgba(63,185,138,.30);border-radius:2px}.wr{background:rgba(224,114,122,.30);border-radius:2px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.pulse{animation:pulse 1.8s ease-in-out infinite}
+@media (prefers-reduced-motion: reduce){.pulse{animation:none}}
+</style>
+</head>
+<body>
+<div class="mockup-frame">
+<div style="width: 100%; min-height: 900px; display: flex; flex-direction: column; background: #0E1417; color: #DCE6E8; font-family: 'IBM Plex Sans', system-ui, sans-serif; font-size: 13px">
+
+<!-- Title bar -->
+<header style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; min-height: 40px; padding: 0 10px 0 14px; background: #0A0F12; border-bottom: 1px solid #1A262D">
+<div style="display: flex; align-items: center; gap: 14px; min-width: 0">
+<div aria-hidden="true" style="display: flex; gap: 8px">
+<span style="width: 12px; height: 12px; border-radius: 50%; background: #3A2A2C"></span>
+<span style="width: 12px; height: 12px; border-radius: 50%; background: #3A352A"></span>
+<span style="width: 12px; height: 12px; border-radius: 50%; background: #2A3A30"></span>
+</div>
+<nav aria-label="Comparison" style="display: flex; align-items: center; gap: 2px; height: 28px; padding: 0 3px 0 8px; background: #121A1E; border: 1px solid #1A262D; border-radius: 8px; min-width: 0">
+<svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="M1.5 12C4 7 7.8 4.5 12 4.5S20 7 22.5 12C20 17 16.2 19.5 12 19.5S4 17 1.5 12Z" fill="none" stroke="#34C3B4" stroke-width="1.75"/><circle cx="12" cy="12" r="4.6" fill="#E3B04B"/><circle cx="12" cy="12" r="2.3" fill="#3E4AA8"/></svg>
+<button style="padding: 0 6px; height: 22px; border-radius: 6px; font-weight: 600">argus</button>
+<span aria-hidden="true" style="color: #71868E">/</span>
+<button style="display: flex; align-items: center; gap: 5px; padding: 0 6px; height: 22px; border-radius: 6px; color: #8FA3AA"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-6 4-12 8"/></svg><span class="mono" style="font-size: 12px">main</span></button>
+<button aria-label="Swap base and head" style="display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; color: #8FA3AA"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h15l-4-4M20 16H5l4 4"/></svg></button>
+<button style="display: flex; align-items: center; gap: 5px; padding: 0 6px; height: 22px; border-radius: 6px; background: #34C3B422; color: #34C3B4"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-6 4-12 8"/></svg><span class="mono" style="font-size: 12px">panoptes-theme</span></button>
+</nav>
+</div>
+<div style="display: flex; align-items: center; gap: 6px">
+<div role="group" aria-label="Diff layout" style="display: flex; padding: 2px; background: #121A1E; border: 1px solid #1A262D; border-radius: 8px">
+<button aria-pressed="true" style="height: 22px; padding: 0 9px; border-radius: 6px; background: #1C2E33; color: #DCE6E8; font-size: 12px">Unified</button>
+<button aria-pressed="false" style="height: 22px; padding: 0 9px; border-radius: 6px; color: #8FA3AA; font-size: 12px">Split</button>
+</div>
+<button style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 9px; border-radius: 6px; color: #8FA3AA; font-size: 12px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>Fetch</button>
+<button style="display: flex; align-items: center; height: 28px; border-radius: 6px; border: 1px solid #22313A; overflow: hidden; font-size: 12px">
+<span style="display: flex; align-items: center; gap: 6px; padding: 0 9px; height: 100%"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20V9M7 14l5-5 5 5M5 4h14"/></svg>Push</span>
+<span class="mono" style="display: flex; align-items: center; gap: 6px; padding: 0 8px; height: 100%; border-left: 1px solid #22313A; color: #8FA3AA; font-size: 11.5px"><span style="color: #34C3B4">↑2</span><span>↓0</span></span>
+</button>
+</div>
+</header>
+
+<!-- Body -->
+<div style="flex: 1; display: flex; flex-wrap: wrap; min-height: 0">
+
+<!-- File tree -->
+<aside aria-label="Files" style="flex: 1 1 240px; display: flex; flex-direction: column; background: #121A1E; border-right: 1px solid #1A262D">
+<div role="tablist" style="display: flex; gap: 2px; padding: 8px 8px 6px">
+<button role="tab" aria-selected="true" style="height: 24px; padding: 0 10px; border-radius: 6px; background: #1C2E33; font-size: 12px">Files</button>
+<button role="tab" aria-selected="false" style="display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px; border-radius: 6px; color: #8FA3AA; font-size: 12px">Comments <span class="mono" style="font-size: 11px; color: #71868E">4</span></button>
+</div>
+<div style="padding: 4px 8px 10px; display: flex; flex-direction: column; gap: 1px; font-size: 12.5px">
+<div style="display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 6px; color: #8FA3AA"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>crates/argus_ui/src</div>
+<button style="display: flex; align-items: center; gap: 8px; height: 26px; padding: 0 6px 0 22px; border-radius: 6px; background: #1C2E33; text-align: left">
+<span class="mono" style="width: 15px; height: 15px; border-radius: 4px; background: rgba(229,143,122,.16); color: #E58F7A; font-size: 10px; line-height: 15px; text-align: center; font-weight: 500">M</span>
+<span style="flex: 1">components.rs</span>
+<span title="Proposal to review" style="width: 6px; height: 6px; border-radius: 50%; background: #34C3B4"></span>
+<span class="mono" style="font-size: 11px; color: #5BCB98">+4</span><span class="mono" style="font-size: 11px; color: #EE8A8F">−4</span>
+</button>
+<button style="display: flex; align-items: center; gap: 8px; height: 26px; padding: 0 6px 0 22px; border-radius: 6px; text-align: left">
+<span class="mono" style="width: 15px; height: 15px; border-radius: 4px; background: rgba(229,143,122,.16); color: #E58F7A; font-size: 10px; line-height: 15px; text-align: center; font-weight: 500">M</span>
+<span style="flex: 1; color: #C9D6D9">run_panel.rs</span>
+<span class="mono" style="font-size: 11px; color: #5BCB98">+2</span><span class="mono" style="font-size: 11px; color: #EE8A8F">−2</span>
+</button>
+<button style="display: flex; align-items: center; gap: 8px; height: 26px; padding: 0 6px 0 22px; border-radius: 6px; text-align: left">
+<span class="mono" style="width: 15px; height: 15px; border-radius: 4px; background: rgba(229,143,122,.16); color: #E58F7A; font-size: 10px; line-height: 15px; text-align: center; font-weight: 500">M</span>
+<span style="flex: 1; color: #C9D6D9">theme.rs</span>
+<svg class="pulse" width="13" height="13" viewBox="0 0 24 24" role="img" aria-label="Claude is running"><path d="M1.5 12C4 7 7.8 4.5 12 4.5S20 7 22.5 12C20 17 16.2 19.5 12 19.5S4 17 1.5 12Z" fill="none" stroke="#E3B04B" stroke-width="2"/><circle cx="12" cy="12" r="3.6" fill="#E3B04B"/></svg>
+<span class="mono" style="font-size: 11px; color: #5BCB98">+38</span><span class="mono" style="font-size: 11px; color: #EE8A8F">−12</span>
+</button>
+<button style="display: flex; align-items: center; gap: 8px; height: 26px; padding: 0 6px 0 22px; border-radius: 6px; text-align: left">
+<span class="mono" style="width: 15px; height: 15px; border-radius: 4px; background: rgba(91,203,152,.16); color: #5BCB98; font-size: 10px; line-height: 15px; text-align: center; font-weight: 500">A</span>
+<span style="flex: 1; color: #C9D6D9">icons.rs</span>
+<span class="mono" style="font-size: 11px; color: #5BCB98">+61</span><span class="mono" style="font-size: 11px; color: #71868E">−0</span>
+</button>
+<div style="display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 6px; margin-top: 4px; color: #8FA3AA"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>crates/argus/src</div>
+<button style="display: flex; align-items: center; gap: 8px; height: 26px; padding: 0 6px 0 22px; border-radius: 6px; text-align: left">
+<span class="mono" style="width: 15px; height: 15px; border-radius: 4px; background: rgba(229,143,122,.16); color: #E58F7A; font-size: 10px; line-height: 15px; text-align: center; font-weight: 500">M</span>
+<span style="flex: 1; color: #C9D6D9">main.rs</span>
+<span class="mono" style="font-size: 11px; color: #5BCB98">+3</span><span class="mono" style="font-size: 11px; color: #EE8A8F">−1</span>
+</button>
+</div>
+</aside>
+
+<!-- Diff -->
+<main style="flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column; background: #0E1417">
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px; height: 34px; padding: 0 16px; border-bottom: 1px solid #1A262D; color: #8FA3AA; font-size: 12px">
+<span class="mono" style="color: #C9D6D9">main...panoptes-theme</span>
+<span>5 files</span>
+<span class="mono" style="color: #5BCB98">+108</span><span class="mono" style="color: #EE8A8F">−19</span>
+<span style="flex: 1"></span>
+<span style="display: flex; align-items: center; gap: 6px">Next hunk <kbd class="mono" style="padding: 0 5px; border: 1px solid #22313A; border-radius: 4px; font-size: 11px; color: #8FA3AA">n</kbd></span>
+<span style="display: flex; align-items: center; gap: 6px">Comment <kbd class="mono" style="padding: 0 5px; border: 1px solid #22313A; border-radius: 4px; font-size: 11px; color: #8FA3AA">c</kbd></span>
+</div>
+
+<div style="padding: 12px 14px 20px; display: flex; flex-direction: column; gap: 10px; overflow-x: auto">
+
+<!-- File card -->
+<section style="border: 1px solid #22313A; border-radius: 12px; overflow: hidden; background: #0E1417; min-width: 720px">
+<div style="display: flex; align-items: center; gap: 10px; height: 38px; padding: 0 12px; background: #121A1E; border-bottom: 1px solid #1A262D">
+<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#8FA3AA" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+<span class="mono" style="width: 17px; height: 17px; border-radius: 4px; background: rgba(229,143,122,.16); color: #E58F7A; font-size: 11px; line-height: 17px; text-align: center; font-weight: 500">M</span>
+<span class="mono" style="font-size: 12.5px"><span style="color: #71868E">crates/argus_ui/src/</span>components.rs</span>
+<span class="mono" style="font-size: 11.5px; color: #5BCB98">+4</span><span class="mono" style="font-size: 11.5px; color: #EE8A8F">−4</span>
+<span style="flex: 1"></span>
+<span style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #8FA3AA"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/></svg>1 thread</span>
+<label style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #8FA3AA"><input type="checkbox" style="accent-color: #34C3B4; margin: 0">Viewed</label>
+</div>
+
+<!-- Hunk header -->
+<div style="display: flex; align-items: center; height: 26px; background: #101A1E; border-bottom: 1px solid #1A262D">
+<span style="width: 2px; height: 100%; background: #34C3B473"></span>
+<span class="mono" style="padding-left: 112px; font-size: 12px; color: #71868E">@@ -141,10 +141,10 @@ <span style="color: #8FA3AA">pub fn status_style</span></span>
+</div>
+
+<div style="padding: 4px 0">
+<div class="row"><span class="ln">141</span><span class="ln">141</span><span class="cc"></span><span class="sg"></span><span class="code"><span class="cm">/// The label and color of a status (spec §7.2).</span></span></div>
+<div class="row"><span class="ln">142</span><span class="ln">142</span><span class="cc"></span><span class="sg"></span><span class="code"><span class="kw">pub fn</span> <span class="fn">status_style</span><span class="pu">(</span>status<span class="pu">:</span> <span class="ty">CommentStatus</span><span class="pu">,</span> colors<span class="pu">: &amp;</span><span class="ty">ThemeColors</span><span class="pu">) -&gt; (&amp;</span><span class="pr">'static</span> <span class="ty">str</span><span class="pu">,</span> <span class="ty">Hsla</span><span class="pu">) {</span></span></div>
+<div class="row"><span class="ln">143</span><span class="ln">143</span><span class="cc"></span><span class="sg"></span><span class="code">    <span class="kw">match</span> status <span class="pu">{</span></span></div>
+<div class="row" style="background: #2A1519"><span class="ln" style="color: #D08A8F">144</span><span class="ln"></span><span class="cc"></span><span class="sg" style="color: #EE8A8F">−</span><span class="code">        <span class="ty">CommentStatus</span><span class="pu">::</span><span class="ty">Open</span> <span class="pu">=&gt; (</span><span class="st">"Open"</span><span class="pu">,</span> colors<span class="pu">.</span><span class="pr wr">accent</span><span class="pu">),</span></span></div>
+<div class="row" style="background: #2A1519"><span class="ln" style="color: #D08A8F">145</span><span class="ln"></span><span class="cc"></span><span class="sg" style="color: #EE8A8F">−</span><span class="code">        <span class="ty">CommentStatus</span><span class="pu">::</span><span class="ty">Running</span> <span class="pu">=&gt; (</span><span class="st">"Running"</span><span class="pu">,</span> colors<span class="pu">.</span><span class="pr wr">warning</span><span class="pu">),</span></span></div>
+<div class="row" style="background: #0F2620"><span class="ln"></span><span class="ln" style="color: #6FB894">144</span><span class="cc"></span><span class="sg" style="color: #5BCB98">+</span><span class="code">        <span class="ty">CommentStatus</span><span class="pu">::</span><span class="ty">Open</span> <span class="pu">=&gt; (</span><span class="st">"Open"</span><span class="pu">,</span> colors<span class="pu">.</span><span class="pr wa">text_muted</span><span class="pu">),</span></span></div>
+<div class="row" style="background: #0F2620; box-shadow: inset 2px 0 0 #34C3B4"><span class="ln"></span><span class="ln" style="color: #34C3B4">145</span><span class="cc"><span title="Proposal to review" style="width: 8px; height: 8px; border-radius: 50%; background: #34C3B4; box-shadow: 0 0 0 3px #34C3B422"></span></span><span class="sg" style="color: #5BCB98">+</span><span class="code">        <span class="ty">CommentStatus</span><span class="pu">::</span><span class="ty">Running</span> <span class="pu">=&gt; (</span><span class="st">"Running"</span><span class="pu">,</span> colors<span class="pu">.</span><span class="pr wa">claude</span><span class="pu">),</span></span></div>
+
+<!-- Thread card -->
+<div style="padding: 8px 18px 10px 122px">
+<article style="max-width: 680px; border: 1px solid #22313A; border-radius: 12px; background: #17222A; box-shadow: 0 10px 28px rgba(3,10,12,.55); overflow: hidden">
+<header style="display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 12px; border-bottom: 1px solid #1F2D35">
+<span style="font-size: 12px; color: #8FA3AA">Line 145</span>
+<span style="padding: 1px 8px; border-radius: 999px; background: #34C3B422; border: 1px solid #34C3B473; color: #34C3B4; font-size: 11px; font-weight: 500">Proposed</span>
+<span style="flex: 1"></span>
+<button style="height: 22px; padding: 0 8px; border-radius: 6px; font-size: 12px; color: #8FA3AA">Dismiss</button>
+</header>
+
+<div style="display: flex; gap: 10px; padding: 12px 12px 10px">
+<span aria-hidden="true" style="flex: none; width: 24px; height: 24px; box-sizing: border-box; border-radius: 50%; border: 1.5px solid #34C3B4; display: flex; align-items: center; justify-content: center"><span style="width: 8px; height: 8px; border-radius: 50%; background: #34C3B4"></span></span>
+<div style="display: flex; flex-direction: column; gap: 3px; min-width: 0">
+<div style="display: flex; gap: 8px; align-items: baseline"><span style="font-weight: 600; font-size: 12.5px">You</span><span style="font-size: 11.5px; color: #71868E">4 min ago</span></div>
+<p style="margin: 0; line-height: 1.5; color: #C9D6D9">Running should use Claude's color everywhere. The run panel still paints its spinner with <code class="mono" style="font-size: 12px; padding: 0 4px; border-radius: 4px; background: #0E1417; color: #E58F7A">warning</code>, so switch that too.</p>
+</div>
+</div>
+
+<div style="display: flex; gap: 10px; padding: 10px 12px 12px; border-top: 1px solid #1F2D35; background: #E3B04B12">
+<span aria-hidden="true" style="flex: none; width: 24px; height: 24px; box-sizing: border-box; border-radius: 50%; background: #0E1417; border: 1.5px solid #E3B04B; display: flex; align-items: center; justify-content: center"><svg width="14" height="14" viewBox="0 0 24 24"><path d="M1.5 12C4 7 7.8 4.5 12 4.5S20 7 22.5 12C20 17 16.2 19.5 12 19.5S4 17 1.5 12Z" fill="none" stroke="#E3B04B" stroke-width="2"/><circle cx="12" cy="12" r="3.6" fill="#E3B04B"/><circle cx="12" cy="12" r="1.7" fill="#3E4AA8"/></svg></span>
+<div style="flex: 1; display: flex; flex-direction: column; gap: 8px; min-width: 0">
+<div style="display: flex; gap: 8px; align-items: baseline"><span style="font-weight: 600; font-size: 12.5px; color: #E3B04B">Claude</span><span class="mono" style="font-size: 11px; color: #8FA3AA">opus, high</span><span style="font-size: 11.5px; color: #71868E">2 min ago, ran 41 s</span></div>
+<p style="margin: 0; line-height: 1.5; color: #C9D6D9">Done in a separate worktree. <code class="mono" style="font-size: 12px; padding: 0 4px; border-radius: 4px; background: #0E1417; color: #DCE6E8">run_panel.rs</code> now uses <code class="mono" style="font-size: 12px; padding: 0 4px; border-radius: 4px; background: #0E1417; color: #E58F7A">colors.claude</code> for the spinner and the progress row.</p>
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 8px 8px 8px 12px; border: 1px solid #22313A; border-radius: 8px; background: #0E1417">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#8FA3AA" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-6 4-12 8"/></svg>
+<span style="font-size: 12px">Proposal</span>
+<span class="mono" style="font-size: 11.5px; color: #8FA3AA">2 files</span>
+<span class="mono" style="font-size: 11.5px; color: #5BCB98">+6</span><span class="mono" style="font-size: 11.5px; color: #EE8A8F">−4</span>
+<span style="flex: 1"></span>
+<button style="height: 26px; padding: 0 10px; border-radius: 6px; font-size: 12px; color: #C9D6D9">View diff</button>
+<button style="height: 26px; padding: 0 10px; border-radius: 6px; font-size: 12px; color: #C9D6D9; border: 1px solid #22313A">Reject</button>
+<button style="display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 12px; border-radius: 6px; font-size: 12px; font-weight: 600; background: #34C3B4; color: #06221F"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>Accept</button>
+</div>
+</div>
+</div>
+
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 8px 12px 10px; border-top: 1px solid #1F2D35">
+<label for="reply-night" style="font-size: 11.5px; color: #8FA3AA">Reply</label>
+<div style="display: flex; align-items: center; gap: 8px">
+<input id="reply-night" type="text" placeholder="Ask Claude for changes" style="flex: 1; height: 28px; padding: 0 8px; border-radius: 6px; border: 1px solid #22313A; background: #0E1417; color: #DCE6E8; font-size: 12.5px; outline: none">
+<kbd class="mono" style="padding: 0 5px; border: 1px solid #22313A; border-radius: 4px; font-size: 11px; color: #8FA3AA">⌘↵</kbd>
+</div>
+</div>
+</article>
+</div>
+
+<div class="row"><span class="ln">146</span><span class="ln">146</span><span class="cc"></span><span class="sg"></span><span class="code">        <span class="ty">CommentStatus</span><span class="pu">::</span><span class="ty">Proposed</span> <span class="pu">=&gt; (</span><span class="st">"Proposed"</span><span class="pu">,</span> colors<span class="pu">.</span><span class="pr">status_proposed</span><span class="pu">),</span></span></div>
+<div class="row"><span class="ln">147</span><span class="ln">147</span><span class="cc"></span><span class="sg"></span><span class="code">        <span class="ty">CommentStatus</span><span class="pu">::</span><span class="ty">Resolved</span> <span class="pu">=&gt; (</span><span class="st">"Resolved"</span><span class="pu">,</span> colors<span class="pu">.</span><span class="pr">diff_added_text</span><span class="pu">),</span></span></div>
+<div class="row"><span class="ln">148</span><span class="ln">148</span><span class="cc"></span><span class="sg"></span><span class="code">        <span class="ty">CommentStatus</span><span class="pu">::</span><span class="ty">Dismissed</span> <span class="pu">=&gt; (</span><span class="st">"Dismissed"</span><span class="pu">,</span> colors<span class="pu">.</span><span class="pr">text_placeholder</span><span class="pu">),</span></span></div>
+<div class="row"><span class="ln">149</span><span class="ln">149</span><span class="cc"></span><span class="sg"></span><span class="code">    <span class="pu">}</span></span></div>
+<div class="row"><span class="ln">150</span><span class="ln">150</span><span class="cc"></span><span class="sg"></span><span class="code"><span class="pu">}</span></span></div>
+</div>
+</section>
+
+<!-- Collapsed file cards -->
+<section style="display: flex; align-items: center; gap: 10px; height: 38px; padding: 0 12px; border: 1px solid #1A262D; border-radius: 12px; background: #121A1E; min-width: 720px">
+<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#8FA3AA" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+<span class="mono" style="width: 17px; height: 17px; border-radius: 4px; background: rgba(229,143,122,.16); color: #E58F7A; font-size: 11px; line-height: 17px; text-align: center; font-weight: 500">M</span>
+<span class="mono" style="font-size: 12.5px"><span style="color: #71868E">crates/argus_ui/src/</span>theme.rs</span>
+<span class="mono" style="font-size: 11.5px; color: #5BCB98">+38</span><span class="mono" style="font-size: 11.5px; color: #EE8A8F">−12</span>
+<span style="flex: 1"></span>
+<span style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #E3B04B"><svg class="pulse" width="13" height="13" viewBox="0 0 24 24" aria-hidden="true"><path d="M1.5 12C4 7 7.8 4.5 12 4.5S20 7 22.5 12C20 17 16.2 19.5 12 19.5S4 17 1.5 12Z" fill="none" stroke="#E3B04B" stroke-width="2"/><circle cx="12" cy="12" r="3.6" fill="#E3B04B"/></svg>Claude is working on line 88</span>
+</section>
+<section style="display: flex; align-items: center; gap: 10px; height: 38px; padding: 0 12px; border: 1px solid #1A262D; border-radius: 12px; background: #121A1E; min-width: 720px">
+<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#8FA3AA" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+<span class="mono" style="width: 17px; height: 17px; border-radius: 4px; background: rgba(91,203,152,.16); color: #5BCB98; font-size: 11px; line-height: 17px; text-align: center; font-weight: 500">A</span>
+<span class="mono" style="font-size: 12.5px"><span style="color: #71868E">crates/argus_ui/src/</span>icons.rs</span>
+<span class="mono" style="font-size: 11.5px; color: #5BCB98">+61</span><span class="mono" style="font-size: 11.5px; color: #71868E">−0</span>
+<span style="flex: 1"></span>
+<span style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #8FA3AA"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>Viewed</span>
+</section>
+</div>
+</main>
+
+<!-- Runs dock -->
+<aside aria-label="Runs" style="flex: 1 1 280px; display: flex; flex-direction: column; background: #121A1E; border-left: 1px solid #1A262D">
+<div style="display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 14px; border-bottom: 1px solid #1A262D">
+<h2 style="margin: 0; font-size: 12.5px; font-weight: 600">Runs</h2>
+<span class="mono" style="font-size: 11px; color: #71868E">3</span>
+</div>
+<div style="display: flex; flex-direction: column; gap: 8px; padding: 10px">
+
+<div style="display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border-radius: 12px; background: #E3B04B12; border: 1px solid #E3B04B55">
+<div style="display: flex; align-items: center; gap: 8px">
+<svg class="pulse" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><path d="M1.5 12C4 7 7.8 4.5 12 4.5S20 7 22.5 12C20 17 16.2 19.5 12 19.5S4 17 1.5 12Z" fill="none" stroke="#E3B04B" stroke-width="2"/><circle cx="12" cy="12" r="3.6" fill="#E3B04B"/></svg>
+<span style="font-size: 12px; font-weight: 600; color: #E3B04B">Running</span>
+<span style="flex: 1"></span>
+<span class="mono" style="font-size: 11px; color: #8FA3AA">0:23</span>
+</div>
+<div style="font-size: 12.5px; line-height: 1.45">Rename <code class="mono" style="font-size: 11.5px; color: #E58F7A">title_bar</code> to <code class="mono" style="font-size: 11.5px; color: #E58F7A">chrome</code></div>
+<div class="mono" style="font-size: 11px; color: #8FA3AA">theme.rs:88</div>
+<div class="mono" style="display: flex; flex-direction: column; gap: 4px; padding: 8px; border-radius: 8px; background: #0E1417; font-size: 11px; color: #8FA3AA">
+<span style="display: flex; align-items: center; gap: 6px"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>Read theme.rs</span>
+<span style="display: flex; align-items: center; gap: 6px"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>Edit theme.rs <span style="color: #5BCB98">+12</span><span style="color: #EE8A8F">−3</span></span>
+<span style="display: flex; align-items: center; gap: 6px; color: #DCE6E8"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>cargo check -p argus_ui</span>
+</div>
+<button style="align-self: flex-start; height: 22px; padding: 0 8px; margin-left: -8px; border-radius: 6px; font-size: 12px; color: #8FA3AA">Cancel</button>
+</div>
+
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 12px; border: 1px solid #34C3B473">
+<div style="display: flex; align-items: center; gap: 8px">
+<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#34C3B4" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-6 4-12 8"/></svg>
+<span style="font-size: 12px; font-weight: 600; color: #34C3B4">Ready to review</span>
+<span style="flex: 1"></span>
+<span class="mono" style="font-size: 11px; color: #8FA3AA">41 s</span>
+</div>
+<div style="font-size: 12.5px; line-height: 1.45; color: #C9D6D9">Use the Claude color for running</div>
+<div class="mono" style="font-size: 11px; color: #8FA3AA">components.rs:145 <span style="color: #5BCB98">+6</span> <span style="color: #EE8A8F">−4</span></div>
+</div>
+
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 12px; border: 1px solid #1F2D35">
+<div style="display: flex; align-items: center; gap: 8px">
+<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#8FA3AA" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>
+<span style="font-size: 12px; font-weight: 600; color: #8FA3AA">Accepted</span>
+<span style="flex: 1"></span>
+<span class="mono" style="font-size: 11px; color: #71868E">1 h</span>
+</div>
+<div style="font-size: 12.5px; line-height: 1.45; color: #8FA3AA">Fall back to Lilex before SF Mono</div>
+<div class="mono" style="font-size: 11px; color: #71868E">fonts.rs:14, a3f9e21</div>
+</div>
+
+</div>
+</aside>
+</div>
+
+<!-- Status bar -->
+<footer style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; min-height: 28px; padding: 0 6px; background: #0A0F12; border-top: 1px solid #1A262D; font-size: 11.5px; color: #8FA3AA">
+<div style="display: flex; align-items: center; gap: 2px">
+<button aria-label="Toggle files" aria-pressed="true" style="display: flex; align-items: center; justify-content: center; width: 26px; height: 22px; border-radius: 6px; background: #1C2E33; color: #DCE6E8"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg></button>
+<button aria-label="Comments" style="display: flex; align-items: center; justify-content: center; width: 26px; height: 22px; border-radius: 6px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/></svg></button>
+<span style="width: 1px; height: 14px; margin: 0 8px; background: #22313A"></span>
+<span style="display: flex; align-items: center; gap: 14px">
+<button style="display: flex; align-items: center; gap: 5px; height: 22px; padding: 0 4px; border-radius: 6px"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/></svg>2 open</button>
+<button style="display: flex; align-items: center; gap: 5px; height: 22px; padding: 0 4px; border-radius: 6px; color: #E3B04B"><svg class="pulse" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><path d="M1.5 12C4 7 7.8 4.5 12 4.5S20 7 22.5 12C20 17 16.2 19.5 12 19.5S4 17 1.5 12Z" fill="none" stroke="#E3B04B" stroke-width="2.2"/><circle cx="12" cy="12" r="3.6" fill="#E3B04B"/></svg>1 running</button>
+<button style="display: flex; align-items: center; gap: 5px; height: 22px; padding: 0 4px; border-radius: 6px; color: #34C3B4"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-6 4-12 8"/></svg>1 to review</button>
+</span>
+</div>
+<div style="display: flex; align-items: center; gap: 2px">
+<button aria-label="Settings" style="display: flex; align-items: center; justify-content: center; width: 26px; height: 22px; border-radius: 6px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg></button>
+<button aria-label="Keyboard shortcuts" style="display: flex; align-items: center; justify-content: center; width: 26px; height: 22px; border-radius: 6px"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h.01M11 10h.01M15 10h.01M7 14h10"/></svg></button>
+<button aria-label="Toggle runs" aria-pressed="true" style="display: flex; align-items: center; justify-content: center; width: 26px; height: 22px; border-radius: 6px; background: #1C2E33; color: #DCE6E8"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></button>
+</div>
+</footer>
+</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Argus Panoptes: palette and tokens</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap" rel="stylesheet">
+<style>
+.mockup-frame{min-width:1440px}
+body{margin:0}
+a{color:#8FA3AA}a:hover{color:#DCE6E8}
+.mono{font-family:'IBM Plex Mono',ui-monospace,monospace}
+</style>
+</head>
+<body>
+<div class="mockup-frame">
+<div style="width: 1440px; height: 980px; display: flex; flex-direction: column; font-family: 'IBM Plex Sans', system-ui, sans-serif; background: #0A0F12">
+
+<header style="display: flex; align-items: center; gap: 20px; height: 120px; padding: 0 40px; box-sizing: border-box; background: #0A0F12; border-bottom: 1px solid #1A262D; color: #DCE6E8">
+<svg width="56" height="56" viewBox="0 0 24 24" role="img" aria-label="Argus eye mark"><path d="M1.5 12C4 7 7.8 4.5 12 4.5S20 7 22.5 12C20 17 16.2 19.5 12 19.5S4 17 1.5 12Z" fill="none" stroke="#34C3B4" stroke-width="1.4"/><circle cx="12" cy="12" r="4.6" fill="#E3B04B"/><circle cx="12" cy="12" r="2.3" fill="#3E4AA8"/></svg>
+<div style="display: flex; flex-direction: column; gap: 4px">
+<h1 style="margin: 0; font-size: 30px; font-weight: 600; letter-spacing: -0.01em">Panoptes</h1>
+<p style="margin: 0; font-size: 15px; color: #8FA3AA">Teal is your move. Gold is Claude at work. Everything else stays quiet.</p>
+</div>
+<span style="flex: 1"></span>
+<div style="display: flex; flex-direction: column; align-items: flex-end; gap: 4px; font-size: 13px; color: #8FA3AA">
+<span>IBM Plex Sans 13, 12, 11 for UI</span>
+<span class="mono">IBM Plex Mono 12.5 for code</span>
+</div>
+</header>
+
+<div style="flex: 1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr))">
+
+<!-- Night -->
+<section style="display: flex; flex-direction: column; gap: 26px; padding: 30px 40px; background: #0E1417; color: #DCE6E8">
+<h2 style="margin: 0; font-size: 16px; font-weight: 600">Night</h2>
+
+<div style="display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px">
+<div style="display: flex; flex-direction: column; gap: 6px"><div style="height: 52px; border-radius: 8px; background: #0A0F12; border: 1px solid #22313A"></div><span style="font-size: 12px">Chrome</span><span class="mono" style="font-size: 11px; color: #8FA3AA">#0A0F12</span></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><div style="height: 52px; border-radius: 8px; background: #0E1417; border: 1px solid #22313A"></div><span style="font-size: 12px">Editor</span><span class="mono" style="font-size: 11px; color: #8FA3AA">#0E1417</span></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><div style="height: 52px; border-radius: 8px; background: #121A1E; border: 1px solid #22313A"></div><span style="font-size: 12px">Panel</span><span class="mono" style="font-size: 11px; color: #8FA3AA">#121A1E</span></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><div style="height: 52px; border-radius: 8px; background: #17222A; border: 1px solid #22313A"></div><span style="font-size: 12px">Card</span><span class="mono" style="font-size: 11px; color: #8FA3AA">#17222A</span></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><div style="height: 52px; border-radius: 8px; background: #1C2E33; border: 1px solid #22313A"></div><span style="font-size: 12px">Selected</span><span class="mono" style="font-size: 11px; color: #8FA3AA">#1C2E33</span></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><div style="height: 52px; border-radius: 8px; background: #22313A"></div><span style="font-size: 12px">Border</span><span class="mono" style="font-size: 11px; color: #8FA3AA">#22313A</span></div>
+</div>
+
+<div style="display: flex; gap: 28px; align-items: baseline">
+<span style="font-size: 22px; font-weight: 500; color: #DCE6E8">Aa <span class="mono" style="font-size: 11px; color: #8FA3AA">text #DCE6E8</span></span>
+<span style="font-size: 22px; font-weight: 500; color: #8FA3AA">Aa <span class="mono" style="font-size: 11px">muted #8FA3AA</span></span>
+<span style="font-size: 22px; font-weight: 500; color: #71868E">Aa <span class="mono" style="font-size: 11px">faint #71868E, 4.8:1</span></span>
+</div>
+
+<div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px 18px">
+<div style="display: flex; gap: 10px"><span style="flex: none; width: 26px; height: 26px; border-radius: 50%; background: #34C3B4"></span><div style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13px; font-weight: 600; color: #34C3B4">Your move</span><span class="mono" style="font-size: 11px; color: #8FA3AA">#34C3B4</span><span style="font-size: 12px; color: #8FA3AA">Focus, proposals, Accept</span></div></div>
+<div style="display: flex; gap: 10px"><span style="flex: none; width: 26px; height: 26px; border-radius: 50%; background: #E3B04B"></span><div style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13px; font-weight: 600; color: #E3B04B">Claude</span><span class="mono" style="font-size: 11px; color: #8FA3AA">#E3B04B</span><span style="font-size: 12px; color: #8FA3AA">Runs, replies, worktrees</span></div></div>
+<div style="display: flex; gap: 10px"><span style="flex: none; width: 26px; height: 26px; box-sizing: border-box; border-radius: 50%; border: 1.5px solid #8FA3AA"></span><div style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13px; font-weight: 600; color: #C9D6D9">Quiet</span><span class="mono" style="font-size: 11px; color: #8FA3AA">#8FA3AA</span><span style="font-size: 12px; color: #8FA3AA">Open, resolved, dismissed</span></div></div>
+<div style="display: flex; gap: 10px"><span style="flex: none; width: 26px; height: 26px; border-radius: 50%; background: #5BCB98"></span><div style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13px; font-weight: 600; color: #5BCB98">Added</span><span class="mono" style="font-size: 11px; color: #8FA3AA">#5BCB98 on #0F2620</span></div></div>
+<div style="display: flex; gap: 10px"><span style="flex: none; width: 26px; height: 26px; border-radius: 50%; background: #EE8A8F"></span><div style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13px; font-weight: 600; color: #EE8A8F">Removed, error</span><span class="mono" style="font-size: 11px; color: #8FA3AA">#EE8A8F on #2A1519</span></div></div>
+<div style="display: flex; gap: 10px"><span style="flex: none; width: 26px; height: 26px; border-radius: 50%; background: #E8894A"></span><div style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13px; font-weight: 600; color: #E8894A">Warning</span><span class="mono" style="font-size: 11px; color: #8FA3AA">#E8894A</span><span style="font-size: 12px; color: #8FA3AA">Outdated, conflicts</span></div></div>
+</div>
+
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 11.5px; font-weight: 500">
+<span style="padding: 2px 9px; border-radius: 999px; border: 1px solid #22313A; color: #C9D6D9">Open</span>
+<span aria-hidden="true" style="color: #71868E">→</span>
+<span style="padding: 2px 9px; border-radius: 999px; background: rgba(227,176,75,.14); border: 1px solid rgba(227,176,75,.45); color: #E3B04B">Running</span>
+<span aria-hidden="true" style="color: #71868E">→</span>
+<span style="padding: 2px 9px; border-radius: 999px; background: rgba(52,195,180,.14); border: 1px solid rgba(52,195,180,.45); color: #34C3B4">Proposed</span>
+<span aria-hidden="true" style="color: #71868E">→</span>
+<span style="display: flex; align-items: center; gap: 4px; padding: 2px 9px; border-radius: 999px; border: 1px solid #22313A; color: #8FA3AA"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>Resolved</span>
+<span style="padding: 2px 9px; margin-left: 10px; border-radius: 999px; color: #71868E; text-decoration: line-through">Dismissed</span>
+</div>
+
+<pre class="mono" style="margin: 0; padding: 14px 16px; border-radius: 8px; background: #121A1E; border: 1px solid #1A262D; font-size: 12.5px; line-height: 20px; color: #DCE6E8"><span style="color: #71868E; font-style: italic">/// Semantic tokens; views never use raw colors.</span>
+<span style="color: #A794F2">pub struct</span> <span style="color: #46C2B0">ThemeColors</span> <span style="color: #8FA3AA">{</span>
+    <span style="color: #A794F2">pub</span> <span style="color: #E58F7A">accent</span><span style="color: #8FA3AA">:</span> <span style="color: #46C2B0">Hsla</span><span style="color: #8FA3AA">,</span>  <span style="color: #71868E; font-style: italic">// your move</span>
+    <span style="color: #A794F2">pub</span> <span style="color: #E58F7A">claude</span><span style="color: #8FA3AA">:</span> <span style="color: #46C2B0">Hsla</span><span style="color: #8FA3AA">,</span>  <span style="color: #71868E; font-style: italic">// Claude at work</span>
+<span style="color: #8FA3AA">}</span></pre>
+</section>
+
+<!-- Day -->
+<section style="display: flex; flex-direction: column; gap: 26px; padding: 30px 40px; background: #F7FAFA; color: #172225">
+<h2 style="margin: 0; font-size: 16px; font-weight: 600">Day</h2>
+
+<div style="display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px">
+<div style="display: flex; flex-direction: column; gap: 6px"><div style="height: 52px; border-radius: 8px; background: #E7EDED; border: 1px solid #D1DCDD"></div><span style="font-size: 12px">Chrome</span><span class="mono" style="font-size: 11px; color: #4E5F64">#E7EDED</span></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><div style="height: 52px; border-radius: 8px; background: #F7FAFA; border: 1px solid #D1DCDD"></div><span style="font-size: 12px">Editor</span><span class="mono" style="font-size: 11px; color: #4E5F64">#F7FAFA</span></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><div style="height: 52px; border-radius: 8px; background: #EFF4F4; border: 1px solid #D1DCDD"></div><span style="font-size: 12px">Panel</span><span class="mono" style="font-size: 11px; color: #4E5F64">#EFF4F4</span></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><div style="height: 52px; border-radius: 8px; background: #FCFEFE; border: 1px solid #D1DCDD"></div><span style="font-size: 12px">Card</span><span class="mono" style="font-size: 11px; color: #4E5F64">#FCFEFE</span></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><div style="height: 52px; border-radius: 8px; background: #D7ECE9; border: 1px solid #D1DCDD"></div><span style="font-size: 12px">Selected</span><span class="mono" style="font-size: 11px; color: #4E5F64">#D7ECE9</span></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><div style="height: 52px; border-radius: 8px; background: #D1DCDD"></div><span style="font-size: 12px">Border</span><span class="mono" style="font-size: 11px; color: #4E5F64">#D1DCDD</span></div>
+</div>
+
+<div style="display: flex; gap: 28px; align-items: baseline">
+<span style="font-size: 22px; font-weight: 500; color: #172225">Aa <span class="mono" style="font-size: 11px; color: #4E5F64">text #172225</span></span>
+<span style="font-size: 22px; font-weight: 500; color: #4E5F64">Aa <span class="mono" style="font-size: 11px">muted #4E5F64</span></span>
+<span style="font-size: 22px; font-weight: 500; color: #617176">Aa <span class="mono" style="font-size: 11px">faint #617176, 4.8:1</span></span>
+</div>
+
+<div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px 18px">
+<div style="display: flex; gap: 10px"><span style="flex: none; width: 26px; height: 26px; border-radius: 50%; background: #0E8A7E"></span><div style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13px; font-weight: 600; color: #0B6F65">Your move</span><span class="mono" style="font-size: 11px; color: #4E5F64">#0E8A7E, text #0B6F65</span><span style="font-size: 12px; color: #4E5F64">Focus, proposals, Accept</span></div></div>
+<div style="display: flex; gap: 10px"><span style="flex: none; width: 26px; height: 26px; border-radius: 50%; background: #C99526"></span><div style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13px; font-weight: 600; color: #8A5E0C">Claude</span><span class="mono" style="font-size: 11px; color: #4E5F64">#C99526, text #8A5E0C</span><span style="font-size: 12px; color: #4E5F64">Runs, replies, worktrees</span></div></div>
+<div style="display: flex; gap: 10px"><span style="flex: none; width: 26px; height: 26px; box-sizing: border-box; border-radius: 50%; border: 1.5px solid #4E5F64"></span><div style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13px; font-weight: 600; color: #29373B">Quiet</span><span class="mono" style="font-size: 11px; color: #4E5F64">#4E5F64</span><span style="font-size: 12px; color: #4E5F64">Open, resolved, dismissed</span></div></div>
+<div style="display: flex; gap: 10px"><span style="flex: none; width: 26px; height: 26px; border-radius: 50%; background: #1F7F55"></span><div style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13px; font-weight: 600; color: #1F7F55">Added</span><span class="mono" style="font-size: 11px; color: #4E5F64">#1F7F55 on #E3F3EC</span></div></div>
+<div style="display: flex; gap: 10px"><span style="flex: none; width: 26px; height: 26px; border-radius: 50%; background: #B8404A"></span><div style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13px; font-weight: 600; color: #B8404A">Removed, error</span><span class="mono" style="font-size: 11px; color: #4E5F64">#B8404A on #FCE8E8</span></div></div>
+<div style="display: flex; gap: 10px"><span style="flex: none; width: 26px; height: 26px; border-radius: 50%; background: #C0651F"></span><div style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13px; font-weight: 600; color: #A9561A">Warning</span><span class="mono" style="font-size: 11px; color: #4E5F64">#C0651F, text #A9561A</span><span style="font-size: 12px; color: #4E5F64">Outdated, conflicts</span></div></div>
+</div>
+
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 11.5px; font-weight: 500">
+<span style="padding: 2px 9px; border-radius: 999px; border: 1px solid #D1DCDD; color: #29373B">Open</span>
+<span aria-hidden="true" style="color: #617176">→</span>
+<span style="padding: 2px 9px; border-radius: 999px; background: rgba(201,149,38,.12); border: 1px solid rgba(168,116,18,.40); color: #8A5E0C">Running</span>
+<span aria-hidden="true" style="color: #617176">→</span>
+<span style="padding: 2px 9px; border-radius: 999px; background: #DCEFEC; border: 1px solid rgba(14,138,126,.45); color: #0B6F65">Proposed</span>
+<span aria-hidden="true" style="color: #617176">→</span>
+<span style="display: flex; align-items: center; gap: 4px; padding: 2px 9px; border-radius: 999px; border: 1px solid #D1DCDD; color: #4E5F64"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>Resolved</span>
+<span style="padding: 2px 9px; margin-left: 10px; border-radius: 999px; color: #617176; text-decoration: line-through">Dismissed</span>
+</div>
+
+<pre class="mono" style="margin: 0; padding: 14px 16px; border-radius: 8px; background: #FCFEFE; border: 1px solid #E1E9EA; font-size: 12.5px; line-height: 20px; color: #172225"><span style="color: #617176; font-style: italic">/// Semantic tokens; views never use raw colors.</span>
+<span style="color: #6A4FC9">pub struct</span> <span style="color: #0E7F74">ThemeColors</span> <span style="color: #4E5F64">{</span>
+    <span style="color: #6A4FC9">pub</span> <span style="color: #B9532F">accent</span><span style="color: #4E5F64">:</span> <span style="color: #0E7F74">Hsla</span><span style="color: #4E5F64">,</span>  <span style="color: #617176; font-style: italic">// your move</span>
+    <span style="color: #6A4FC9">pub</span> <span style="color: #B9532F">claude</span><span style="color: #4E5F64">:</span> <span style="color: #0E7F74">Hsla</span><span style="color: #4E5F64">,</span>  <span style="color: #617176; font-style: italic">// Claude at work</span>
+<span style="color: #4E5F64">}</span></pre>
+</section>
+</div>
+
+<!-- Shape scale -->
+<footer style="display: flex; align-items: center; gap: 36px; height: 96px; padding: 0 40px; box-sizing: border-box; background: #0A0F12; border-top: 1px solid #1A262D; color: #8FA3AA; font-size: 12px">
+<h2 style="margin: 0; font-size: 13px; font-weight: 600; color: #DCE6E8">Corner radius</h2>
+<span style="display: flex; align-items: center; gap: 10px"><span style="width: 32px; height: 32px; border-radius: 4px; border: 1.5px solid #8FA3AA"></span><span><span class="mono" style="color: #DCE6E8">4</span> badges, keys, inline code</span></span>
+<span style="display: flex; align-items: center; gap: 10px"><span style="width: 32px; height: 32px; border-radius: 6px; border: 1.5px solid #8FA3AA"></span><span><span class="mono" style="color: #DCE6E8">6</span> buttons, inputs, tabs</span></span>
+<span style="display: flex; align-items: center; gap: 10px"><span style="width: 32px; height: 32px; border-radius: 8px; border: 1.5px solid #8FA3AA"></span><span><span class="mono" style="color: #DCE6E8">8</span> control groups, insets</span></span>
+<span style="display: flex; align-items: center; gap: 10px"><span style="width: 32px; height: 32px; border-radius: 12px; border: 1.5px solid #8FA3AA"></span><span><span class="mono" style="color: #DCE6E8">12</span> cards</span></span>
+<span style="display: flex; align-items: center; gap: 10px"><span style="width: 48px; height: 22px; border-radius: 999px; border: 1.5px solid #8FA3AA"></span><span><span class="mono" style="color: #DCE6E8">pill</span> status only</span></span>
+</footer>
+</div>
+</div>
+</body>
+</html>
