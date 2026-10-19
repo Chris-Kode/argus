@@ -15,8 +15,7 @@
 //!
 //! 1. Before the first Accept on a repository whose head branch is checked
 //!    out in one of the user's checkouts, [`AcceptEvent::CheckedOut`] asks
-//!    to continue; the answer is remembered per repository. That checkout is
-//!    never touched.
+//!    to continue; the answer is remembered per repository.
 //! 2. The proposal patch: `git add -A` + `git diff --cached --binary
 //!    <start_sha>` in the run's worktree. The proposal of a resolve run
 //!    ([`crate::resolve`]) must hold no conflict marker (`git diff --check`
@@ -36,15 +35,20 @@
 //!    with its output.
 //! 7. `git update-ref refs/heads/<head> <new> <old>`: a compare-and-swap.
 //!    When the branch moved meanwhile, steps 3–7 run once more on the new
-//!    tip with the message already chosen, then the Accept fails.
+//!    tip with the message already chosen, then the Accept fails. A checkout
+//!    of the user's that has the head branch checked out is carried along
+//!    ([`write::sync_checkout`]), so it does not show the commit reversed;
+//!    when a change of the user's is in the way it is left as it was, with
+//!    a warning.
 //! 8. The accept is recorded, the comment becomes `Resolved`, the run's
 //!    worktree is deleted (with the comment's other proposal worktrees,
 //!    e.g. the original proposal of an accepted resolution) and
 //!    [`RunUpdate::Accepted`] is published, so the views refresh the diff,
 //!    re-anchor comments and update the Push counts.
 //!
-//! The user's checkout (files and index) is never read or written, and
-//! nothing is pushed.
+//! Besides that carry-along, which only writes the paths the commit changed
+//! and refuses rather than overwrite a change of the user's, the user's
+//! checkout is never read or written, and nothing is pushed.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -53,7 +57,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use argus_diff::review::{Comment, CommentEvent, ReviewError, apply_event};
-use argus_git::write::{self, RefUpdate};
+use argus_git::write::{self, CheckoutSync, RefUpdate};
 use argus_git::{
     ApplyOutcome, ChangeKind, CommitOutcome, ConflictMarker, GitError, Repo, RepoId, Sha, Worktree,
     read,
@@ -624,8 +628,18 @@ async fn accept(
         match write::update_branch(&repo, &head, &commit, &old, REFLOG_REASON).await? {
             RefUpdate::Moved => {
                 stage(events, AcceptStage::Finishing);
-                let warnings =
-                    finish(env, run_id, &comment, &run_worktree, &commit, &message).await;
+                let mut warnings = Vec::new();
+                if let Some((path, CheckoutSync::Skipped { reason })) =
+                    sync_user_checkout(services, &repo, &head, &old, &commit).await
+                {
+                    warnings.push(format!(
+                        "your checkout at {} still has the previous files ({reason}); \
+                         `git status` there shows this commit reversed",
+                        path.display()
+                    ));
+                }
+                warnings
+                    .extend(finish(env, run_id, &comment, &run_worktree, &commit, &message).await);
                 return Ok(AcceptOutcome::Committed(Accepted {
                     run_id,
                     comment_id: comment.id,
@@ -862,6 +876,33 @@ pub(crate) async fn user_checkout_of(
                     .starts_with(root)
         })
         .map(|checkout| checkout.path))
+}
+
+/// Carries the checkout of the user's that has `head` checked out (if any)
+/// along after the branch moved from `from` to `to`, so it does not show the
+/// new commits reversed as uncommitted changes. Changes of the user's are
+/// never overwritten: a checkout where one is in the way is left as it was.
+/// `None` when no checkout of the user's has `head`.
+pub(crate) async fn sync_user_checkout(
+    services: &Services,
+    repo: &Repo,
+    head: &str,
+    from: &Sha,
+    to: &Sha,
+) -> Option<(PathBuf, CheckoutSync)> {
+    let path = match user_checkout_of(services, repo, head).await {
+        Ok(path) => path?,
+        Err(error) => {
+            tracing::warn!(head, %error, "cannot list the checkouts to update");
+            return None;
+        }
+    };
+    let sync = write::sync_checkout(&path, from, to)
+        .await
+        .unwrap_or_else(|error| CheckoutSync::Skipped {
+            reason: error.to_string(),
+        });
+    Some((path, sync))
 }
 
 /// The dialog's prefilled content: the fallback subject, no body.

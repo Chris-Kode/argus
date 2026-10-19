@@ -22,7 +22,9 @@
 //!    rebased commit with a compare-and-swap `git update-ref`. Before the
 //!    first such move on a repository whose head branch is checked out in a
 //!    checkout of the user's, [`PushEvent::CheckedOut`] asks to continue
-//!    (the answer is shared with Accept's).
+//!    (the answer is shared with Accept's). That checkout is then carried
+//!    along to the rebased commit, unless a change of the user's is in the
+//!    way (see [`write::sync_checkout`]).
 //! 3. `git push <remote> refs/heads/<head>:refs/heads/<branch>`: no
 //!    `--force`, no `--force-with-lease`. A rejected push (the remote moved
 //!    again) runs everything once more from step 1, then fails.
@@ -44,14 +46,14 @@
 use std::path::PathBuf;
 
 use argus_git::push::{self as git_push, FetchOutcome, PushResult, StepLog, Upstream};
-use argus_git::write::{self, RefUpdate};
+use argus_git::write::{self, CheckoutSync, RefUpdate};
 use argus_git::{ConflictMarker, GitError, RebaseOutcome, RebaseStep, Repo, Sha};
 use argus_store::{RunId, StoreError};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::accept::{
     AcceptEnv, AcceptQueues, QueueJob, acknowledge_checked_out, checked_out_acknowledged,
-    user_checkout_of,
+    sync_user_checkout, user_checkout_of,
 };
 use crate::resolve::{RebaseResolution, ResolveId};
 use crate::run::RunUpdate;
@@ -393,6 +395,38 @@ fn log(events: &mpsc::UnboundedSender<PushEvent>, entry: &StepLog) {
     let _ = events.send(PushEvent::Log(entry.clone()));
 }
 
+/// Carries the user's checkout of `head` along after the rebase moved it
+/// from `from` to `to`, and logs how it went.
+async fn sync_checkout(
+    env: &AcceptEnv,
+    repo: &Repo,
+    head: &str,
+    from: &Sha,
+    to: &Sha,
+    events: &mpsc::UnboundedSender<PushEvent>,
+) {
+    let Some((path, sync)) = sync_user_checkout(&env.services, repo, head, from, to).await else {
+        return;
+    };
+    let command = format!("git -C {} read-tree -m -u {from} {to}", path.display());
+    let entry = match sync {
+        CheckoutSync::Updated => StepLog {
+            command,
+            output: "your checkout now matches the rebased branch".to_owned(),
+            success: true,
+        },
+        CheckoutSync::Skipped { reason } => StepLog {
+            command,
+            output: format!(
+                "your checkout was left as it was ({reason}); `git status` there shows the \
+                 rebase reversed"
+            ),
+            success: false,
+        },
+    };
+    log(events, &entry);
+}
+
 /// One Push (see the module docs).
 async fn push(
     env: &AcceptEnv,
@@ -481,6 +515,7 @@ async fn push(
                 step(events, PushStep::MovingBranch);
                 match write::update_branch(repo, head, &new, &local, REFLOG_REASON).await? {
                     RefUpdate::Moved => {
+                        sync_checkout(env, repo, head, &local, &new, events).await;
                         let first = rebased.map_or(local, |(from, _)| from);
                         rebased = Some((first, new));
                         local = new;
@@ -664,7 +699,17 @@ async fn continue_push(
     )
     .await;
     match moved {
-        Ok(RefUpdate::Moved) => {}
+        Ok(RefUpdate::Moved) => {
+            sync_checkout(
+                env,
+                &request.repo,
+                head,
+                &session.expected_head,
+                &new,
+                events,
+            )
+            .await;
+        }
         Ok(RefUpdate::Stale { current }) => {
             abandon(env, id).await;
             return Err(match current {

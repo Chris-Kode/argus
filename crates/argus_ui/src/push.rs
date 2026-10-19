@@ -768,11 +768,13 @@ impl PushFlow {
                     .child(code(crate::workspace::display_path(path))),
             )
             .child(row().child(
-                "The remote is ahead, so Argus will rebase the branch on it before pushing. \
-                 Your checkout will then show the difference as changes until you run:",
+                "The remote is ahead, so Argus will rebase the branch on it before pushing, \
+                 and update the files the rebase changes in that checkout.",
             ))
-            .child(row().child(code(format!("git reset --keep {head}"))))
-            .child(row().child("Argus never runs anything in that checkout."))
+            .child(row().child(
+                "Your own changes are never overwritten: if one is in the way, the checkout is \
+                 left as it was and the push log says so.",
+            ))
             .into_any_element();
         let note = div()
             .text_xs()

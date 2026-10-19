@@ -99,8 +99,9 @@ The whole loop: comment on a line, let Claude change the code, accept the change
 push it.
 
 1. **Open a repository.** Launch Argus and press `⌘O` (or pick one from the
-   recent list). Argus reads the repository but never touches your working
-   checkout or its uncommitted changes.
+   recent list). Argus never touches your uncommitted changes. When it commits
+   to a branch you have checked out, it updates only the files that commit
+   changes in your checkout, like `git checkout` would.
 2. **Pick the branches.** Choose the base (e.g. `main`) and the head (the branch
    under review) in the title bar. The center shows the three-dot diff
    `base...head`; `j`/`k` move between files and `n`/`p` between hunks.
