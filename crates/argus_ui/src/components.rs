@@ -89,6 +89,66 @@ pub fn button_with_icon(
     ghost_button(id, Some(icon_name), label.into(), text, cx)
 }
 
+/// [`button_with_icon`] drawn in `text_muted`, for secondary chrome actions
+/// (e.g. Fetch in the title bar).
+pub fn muted_button_with_icon(
+    id: impl Into<ElementId>,
+    icon_name: IconName,
+    label: impl Into<SharedString>,
+    cx: &App,
+) -> Stateful<Div> {
+    let text = cx.theme().colors.text_muted;
+    ghost_button(id, Some(icon_name), label.into(), text, cx)
+}
+
+/// A ghost button for an action that is not available right now: same
+/// shape as [`muted_button_with_icon`] but in `text_placeholder`, without a
+/// border and without hover feedback.
+pub fn disabled_ghost_button_with_icon(
+    id: impl Into<ElementId>,
+    icon_name: IconName,
+    label: impl Into<SharedString>,
+    cx: &App,
+) -> Stateful<Div> {
+    let color = cx.theme().colors.text_placeholder;
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .h(px(24.0))
+        .px_2()
+        .rounded(radius::SM)
+        .text_sm()
+        .text_color(color)
+        .child(icon(icon_name, BUTTON_ICON_SIZE, color))
+        .child(label.into())
+}
+
+/// [`icon_button`] for an action that is not available right now: drawn in
+/// `text_placeholder`, without hover feedback. Keeps the tooltip so the
+/// icon is still named.
+pub fn disabled_icon_button(
+    id: impl Into<ElementId>,
+    icon_name: IconName,
+    tooltip: impl Into<SharedString>,
+    cx: &App,
+) -> Stateful<Div> {
+    let color = cx.theme().colors.text_placeholder;
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .w(px(26.0))
+        .h(px(22.0))
+        .rounded(radius::SM)
+        .child(icon(icon_name, BUTTON_ICON_SIZE, color))
+        .tooltip(text_tooltip(tooltip.into()))
+}
+
 /// A button rendered as selected, for toggles and segmented controls.
 pub fn toggle_button(
     id: impl Into<ElementId>,
