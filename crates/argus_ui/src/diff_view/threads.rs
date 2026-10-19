@@ -2064,14 +2064,14 @@ impl DiffView {
             );
         }
         let open = self.threads.run_menu == Some(id);
-        let accent = colors.accent;
+        let (accent_border, accent_soft) = (colors.accent_border, colors.accent_soft);
         let split = div()
             .flex()
             .items_center()
             .h(px(20.0))
             .rounded_md()
             .border_1()
-            .border_color(accent.opacity(0.6))
+            .border_color(accent_border)
             .text_xs()
             .text_color(colors.text)
             .overflow_hidden()
@@ -2084,7 +2084,7 @@ impl DiffView {
                     .px_1p5()
                     .cursor_pointer()
                     .whitespace_nowrap()
-                    .hover(move |style| style.bg(accent.opacity(0.15)))
+                    .hover(move |style| style.bg(accent_soft))
                     .on_click(cx.listener(move |this, _, _, cx| this.request_run(id, cx)))
                     .child(label),
             )
@@ -2096,10 +2096,10 @@ impl DiffView {
                     .h_full()
                     .px_1()
                     .border_l_1()
-                    .border_color(accent.opacity(0.6))
+                    .border_color(accent_border)
                     .cursor_pointer()
                     .when(open, |arrow| arrow.bg(colors.element_selected))
-                    .hover(move |style| style.bg(accent.opacity(0.15)))
+                    .hover(move |style| style.bg(accent_soft))
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_run_menu(id, cx)))
                     .child("▾"),
             );
@@ -2253,7 +2253,7 @@ impl DiffView {
             .p_2()
             .rounded_md()
             .border_1()
-            .border_color(colors.accent.opacity(0.7))
+            .border_color(colors.accent_border)
             .bg(colors.elevated_surface)
             .shadow_sm()
             .text_color(colors.text)
