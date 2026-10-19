@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use argus_diff::layout::ViewMode;
-use argus_diff::review::CommentChange;
+use argus_diff::review::{CommentChange, CommentStatus};
 use argus_runs::ClaudeStatus;
 use argus_store::{Repo, StorageService};
 use gpui::{
@@ -43,9 +43,10 @@ use crate::claude_status::observe_claude_status;
 use crate::comment_list::{CommentList, CommentListEvent};
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
-    button, disabled_button, disabled_ghost_button_with_icon, disabled_icon_button, icon_button,
-    kbd, muted_button_with_icon, panel_header, placeholder, primary_button, radius, section_header,
-    segmented, text_tooltip, toggle_button,
+    button, claude_activity, disabled_button, disabled_ghost_button_with_icon,
+    disabled_icon_button, icon_button, kbd, muted_button_with_icon, panel_header, placeholder,
+    primary_button, radius, section_header, segmented, text_tooltip, toggle_button,
+    toggle_icon_button,
 };
 use crate::conflict::{ConflictDialog, ConflictDialogEvent, ConflictSource};
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
@@ -82,7 +83,11 @@ const TITLE_BAR_HEIGHT: Pixels = px(40.0);
 /// Tooltip of the title-bar swap button.
 const SWAP_TOOLTIP: &str = "Swap base and head";
 /// Height of the status bar.
-const STATUS_BAR_HEIGHT: Pixels = px(26.0);
+const STATUS_BAR_HEIGHT: Pixels = px(28.0);
+/// Text size of the status bar.
+const STATUS_TEXT_SIZE: Pixels = px(11.5);
+/// Icon size of the status-bar counters.
+const STATUS_ICON_SIZE: Pixels = px(12.0);
 /// Space kept for the center area when docks grow.
 const MIN_CENTER_SIZE: f32 = 240.0;
 /// Width of the invisible grab area of a dock resize handle.
@@ -2672,17 +2677,15 @@ impl Workspace {
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
         let jobs = cx.global::<BackgroundJobs>().clone();
-        let job_indicator = if jobs.is_busy() {
+        let job_indicator = jobs.is_busy().then(|| {
             div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .text_color(colors.text)
-                .child(div().size(px(6.0)).rounded_full().bg(colors.accent))
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_color(colors.text_muted)
                 .child(jobs.labels().join(" · "))
-        } else {
-            div().text_color(colors.text_placeholder).child("Idle")
-        };
+        });
         let notice = self.notice.as_ref().map(|notice| {
             div()
                 .id("status-notice")
@@ -2702,6 +2705,86 @@ impl Workspace {
                 }))
         });
 
+        let dock_visible = self.settings.file_tree.visible;
+        let files = toggle_icon_button(
+            "status-files",
+            IconName::SidebarSimple,
+            with_shortcut::<ToggleFileTree>("Toggle file tree"),
+            dock_visible && self.left_tab == LeftTab::Files,
+            cx,
+        )
+        .on_click(|_, window, cx| window.dispatch_action(ToggleFileTree.boxed_clone(), cx));
+        let comments = toggle_icon_button(
+            "status-comments",
+            IconName::ChatText,
+            with_shortcut::<ToggleCommentList>("Comments"),
+            dock_visible && self.left_tab == LeftTab::Comments,
+            cx,
+        )
+        .on_click(
+            cx.listener(|this, _, window, cx| this.show_left_tab(LeftTab::Comments, window, cx)),
+        );
+        let divider = div()
+            .flex_none()
+            .w(px(1.0))
+            .h(px(14.0))
+            .mx_1()
+            .bg(colors.border_variant);
+
+        let counters = self.comment_list.as_ref().map(|list| {
+            let list = list.read(cx);
+            let open = list.status_count(CommentStatus::Open);
+            let running = list.status_count(CommentStatus::Running);
+            let proposed = list.status_count(CommentStatus::Proposed);
+            let mut counters: Vec<AnyElement> = Vec::new();
+            if open > 0 {
+                counters.push(
+                    self.status_counter(
+                        CommentStatus::Open,
+                        icon(IconName::ChatText, STATUS_ICON_SIZE, colors.text_muted)
+                            .into_any_element(),
+                        format!("{open} open"),
+                        colors.text_muted,
+                        "Show open comments",
+                        cx,
+                    ),
+                );
+            }
+            if running > 0 {
+                counters.push(self.status_counter(
+                    CommentStatus::Running,
+                    claude_activity(STATUS_ICON_SIZE, cx),
+                    format!("{running} running"),
+                    colors.claude_text,
+                    "Show running comments",
+                    cx,
+                ));
+            }
+            if proposed > 0 {
+                counters.push(
+                    self.status_counter(
+                        CommentStatus::Proposed,
+                        icon(IconName::GitPullRequest, STATUS_ICON_SIZE, colors.accent)
+                            .into_any_element(),
+                        format!("{proposed} to review"),
+                        colors.accent,
+                        "Show proposals to review",
+                        cx,
+                    ),
+                );
+            }
+            counters
+        });
+
+        let run_panel = toggle_icon_button(
+            "status-runs",
+            IconName::Sidebar,
+            with_shortcut::<ToggleRunPanel>("Toggle run panel"),
+            self.settings.run_panel.visible,
+            cx,
+        )
+        .on_click(|_, window, cx| window.dispatch_action(ToggleRunPanel.boxed_clone(), cx));
+
         div()
             .flex()
             .flex_none()
@@ -2712,58 +2795,99 @@ impl Workspace {
             .px_1()
             .bg(colors.status_bar)
             .border_t_1()
-            .border_color(colors.border)
-            .text_xs()
+            .border_color(colors.border_variant)
+            .text_size(STATUS_TEXT_SIZE)
+            .text_color(colors.text_muted)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap_0p5()
                     .min_w_0()
-                    .child(
-                        toggle_button("status-files", "Files", self.settings.file_tree.visible, cx)
-                            .h(px(20.0))
-                            .text_xs()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(ToggleFileTree.boxed_clone(), cx)
-                            }),
-                    )
-                    .children(notice),
+                    .child(files)
+                    .child(comments)
+                    .child(divider)
+                    .children(counters.into_iter().flatten())
+                    .children(notice.map(|notice| notice.ml_1())),
             )
             .child(
                 div()
                     .flex()
-                    .flex_none()
                     .items_center()
-                    .gap_2()
-                    .child(job_indicator)
+                    .gap_0p5()
+                    .min_w_0()
+                    .children(job_indicator.map(|jobs| jobs.mr_1()))
                     .child(
-                        button("status-settings", "Settings", cx)
-                            .h(px(20.0))
-                            .text_xs()
-                            .text_color(colors.text_muted)
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(OpenSettings.boxed_clone(), cx)
-                            }),
+                        icon_button(
+                            "status-settings",
+                            IconName::SlidersHorizontal,
+                            with_shortcut::<OpenSettings>("Settings"),
+                            cx,
+                        )
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(OpenSettings.boxed_clone(), cx)
+                        }),
                     )
                     .child(
-                        button("status-shortcuts", "Shortcuts", cx)
-                            .h(px(20.0))
-                            .text_xs()
-                            .text_color(colors.text_muted)
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(ToggleKeyboardShortcuts.boxed_clone(), cx)
-                            }),
+                        icon_button(
+                            "status-shortcuts",
+                            IconName::Keyboard,
+                            with_shortcut::<ToggleKeyboardShortcuts>("Keyboard shortcuts"),
+                            cx,
+                        )
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(ToggleKeyboardShortcuts.boxed_clone(), cx)
+                        }),
                     )
-                    .child(
-                        toggle_button("status-runs", "Runs", self.settings.run_panel.visible, cx)
-                            .h(px(20.0))
-                            .text_xs()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(ToggleRunPanel.boxed_clone(), cx)
-                            }),
-                    ),
+                    .child(run_panel),
             )
+    }
+
+    /// A status-bar lifecycle counter: a small ghost button that opens the
+    /// Comments tab filtered to `status` only.
+    fn status_counter(
+        &self,
+        status: CommentStatus,
+        leading: AnyElement,
+        label: String,
+        color: gpui::Hsla,
+        tooltip: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = &cx.theme().colors;
+        div()
+            .id(SharedString::from(format!("status-counter-{status}")))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .h(px(20.0))
+            .px_1p5()
+            .rounded(radius::SM)
+            .cursor_pointer()
+            .text_color(color)
+            .hover(|style| style.bg(colors.element_hover))
+            .active(|style| style.bg(colors.element_selected))
+            .tooltip(text_tooltip(tooltip))
+            .child(leading)
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.show_comments_with_status(status, window, cx)
+            }))
+            .into_any_element()
+    }
+
+    /// Opens the Comments tab with the list filtered to `status` only.
+    fn show_comments_with_status(
+        &mut self,
+        status: CommentStatus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(list) = self.comment_list.clone() {
+            list.update(cx, |list, cx| list.show_only(status, cx));
+        }
+        self.show_left_tab(LeftTab::Comments, window, cx);
     }
 
     fn render_sheet(&self, sheet: Sheet, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3473,6 +3597,17 @@ fn services(cx: &gpui::App) -> (StorageService, tokio::runtime::Handle) {
 /// the window is too small for both.
 fn clamp_size(size: f32, max: f32) -> f32 {
     size.min(max).max(MIN_DOCK_SIZE).round()
+}
+
+/// `label` followed by the shortcut of action `A` in parentheses, for
+/// tooltips; just `label` when the action has no binding.
+fn with_shortcut<A: Action>(label: &str) -> String {
+    let keys = shortcut_text::<A>();
+    if keys.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{label} ({keys})")
+    }
 }
 
 /// Formatted keystrokes of the shortcut bound to action `A`, for inline hints.
