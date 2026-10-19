@@ -91,7 +91,8 @@ input::placeholder{color:#617176}
 <div class="row" style="background: #E3F3EC; box-shadow: inset 2px 0 0 #0E8A7E"><span class="ln"></span><span class="ln" style="color: #0B6F65">145</span><span class="cc"><span title="Proposal to review" style="width: 8px; height: 8px; border-radius: 50%; background: #0E8A7E; box-shadow: 0 0 0 3px rgba(14,138,126,.16)"></span></span><span class="sg" style="color: #1F7F55">+</span><span class="code">        <span class="ty">CommentStatus</span><span class="pu">::</span><span class="ty">Running</span> <span class="pu">=&gt; (</span><span class="st">"Running"</span><span class="pu">,</span> colors<span class="pu">.</span><span class="pr wa">claude</span><span class="pu">),</span></span></div>
 
 <div style="padding: 8px 18px 10px 122px">
-<article style="max-width: 680px; border: 1px solid #D1DCDD; border-radius: 12px; background: #FCFEFE; box-shadow: 0 8px 22px rgba(20,45,50,.10); overflow: hidden">
+<article style="max-width: 680px; border: 1px solid #D1DCDD; border-radius: 8px; background: #FCFEFE; overflow: hidden; position: relative">
+<span aria-hidden="true" style="position: absolute; top: 0; bottom: 0; left: 0; width: 2px; background: #0E7F74"></span>
 <header style="display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 12px; border-bottom: 1px solid #E6EDEE">
 <span style="font-size: 12px; color: #4E5F64">Line 145</span>
 <span style="padding: 1px 8px; border-radius: 999px; background: #DCEFEC; border: 1px solid rgba(14,138,126,.45); color: #0B6F65; font-size: 11px; font-weight: 500">Proposed</span>
@@ -99,18 +100,16 @@ input::placeholder{color:#617176}
 <button style="height: 22px; padding: 0 8px; border-radius: 6px; font-size: 12px; color: #4E5F64">Dismiss</button>
 </header>
 <div style="display: flex; gap: 10px; padding: 12px 12px 10px">
-<span aria-hidden="true" style="flex: none; width: 24px; height: 24px; box-sizing: border-box; border-radius: 50%; border: 1.5px solid #0E8A7E; display: flex; align-items: center; justify-content: center"><span style="width: 8px; height: 8px; border-radius: 50%; background: #0E8A7E"></span></span>
 <div style="display: flex; flex-direction: column; gap: 3px; min-width: 0">
 <div style="display: flex; gap: 8px; align-items: baseline"><span style="font-weight: 600; font-size: 12.5px">You</span><span style="font-size: 11.5px; color: #617176">4 min ago</span></div>
 <p style="margin: 0; line-height: 1.5; color: #29373B">Running should use Claude's color everywhere. The run panel still paints its spinner with <code class="mono" style="font-size: 12px; padding: 0 4px; border-radius: 4px; background: #EFF4F4; color: #B9532F">warning</code>, so switch that too.</p>
 </div>
 </div>
 <div style="display: flex; gap: 10px; padding: 10px 12px 12px; border-top: 1px solid #E6EDEE; background: #FBF6E8">
-<span aria-hidden="true" style="flex: none; width: 24px; height: 24px; box-sizing: border-box; border-radius: 50%; background: #FCFEFE; border: 1.5px solid #A87412; display: flex; align-items: center; justify-content: center"><svg width="14" height="14" viewBox="0 0 24 24"><path d="M1.5 12C4 7 7.8 4.5 12 4.5S20 7 22.5 12C20 17 16.2 19.5 12 19.5S4 17 1.5 12Z" fill="none" stroke="#A87412" stroke-width="2"/><circle cx="12" cy="12" r="3.6" fill="#C99526"/><circle cx="12" cy="12" r="1.7" fill="#3E4AA8"/></svg></span>
 <div style="flex: 1; display: flex; flex-direction: column; gap: 8px; min-width: 0">
 <div style="display: flex; gap: 8px; align-items: baseline"><span style="font-weight: 600; font-size: 12.5px; color: #8A5E0C">Claude</span><span class="mono" style="font-size: 11px; color: #4E5F64">opus, high</span><span style="font-size: 11.5px; color: #617176">2 min ago, ran 41 s</span></div>
 <p style="margin: 0; line-height: 1.5; color: #29373B">Done in a separate worktree. <code class="mono" style="font-size: 12px; padding: 0 4px; border-radius: 4px; background: #EFF4F4; color: #172225">run_panel.rs</code> now uses <code class="mono" style="font-size: 12px; padding: 0 4px; border-radius: 4px; background: #EFF4F4; color: #B9532F">colors.claude</code> for the spinner and the progress row.</p>
-<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 8px 8px 8px 12px; border: 1px solid #D1DCDD; border-radius: 8px; background: #FCFEFE">
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding-top: 8px; border-top: 1px solid #E6EDEE">
 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4E5F64" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-6 4-12 8"/></svg>
 <span style="font-size: 12px">Proposal</span>
 <span class="mono" style="font-size: 11.5px; color: #4E5F64">2 files</span>
@@ -122,10 +121,9 @@ input::placeholder{color:#617176}
 </div>
 </div>
 </div>
-<div style="display: flex; flex-direction: column; gap: 6px; padding: 8px 12px 10px; border-top: 1px solid #E6EDEE">
-<label for="reply-day" style="font-size: 11.5px; color: #4E5F64">Reply</label>
+<div style="padding: 8px 12px 10px">
 <div style="display: flex; align-items: center; gap: 8px">
-<input id="reply-day" type="text" placeholder="Ask Claude for changes" style="flex: 1; height: 28px; padding: 0 8px; border-radius: 6px; border: 1px solid #C3D0D2; background: #F7FAFA; color: #172225; font-size: 12.5px; outline: none">
+<input id="reply-day" type="text" aria-label="Reply" placeholder="Ask Claude for changes" style="flex: 1; height: 28px; padding: 0 8px; border-radius: 6px; border: 1px solid #C3D0D2; background: #F7FAFA; color: #172225; font-size: 12.5px; outline: none">
 <kbd class="mono" style="padding: 0 5px; border: 1px solid #D1DCDD; border-radius: 4px; font-size: 11px; color: #4E5F64">⌘↵</kbd>
 </div>
 </div>

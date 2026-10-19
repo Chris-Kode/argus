@@ -1,7 +1,8 @@
 //! Small styled building blocks shared by the shell views.
 //!
 //! Every component draws its corners from the [`radius`] scale (Panoptes #56
-//! §4); pills (`rounded_full`) are reserved for status chips and avatars.
+//! §4); pills (`rounded_full`) are reserved for status chips and gutter
+//! markers.
 
 use std::rc::Rc;
 use std::time::Duration;
