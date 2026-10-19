@@ -342,3 +342,12 @@ Argus bundles [IBM Plex Sans and IBM Plex Mono](https://github.com/IBM/plex)
 default; a font chosen in Settings still wins. The fonts are licensed under the
 SIL Open Font License 1.1, see
 [crates/argus_ui/assets/fonts/OFL.txt](crates/argus_ui/assets/fonts/OFL.txt).
+
+### Icons
+
+Argus bundles regular-weight icons from
+[Phosphor Icons](https://github.com/phosphor-icons/core) (unmodified SVGs in
+`crates/argus_ui/assets/icons/`), licensed under the MIT License, see
+[crates/argus_ui/assets/icons/LICENSE](crates/argus_ui/assets/icons/LICENSE).
+The Argus eye mark (`argus-eye*.svg` in the same directory) is original to
+this project.
