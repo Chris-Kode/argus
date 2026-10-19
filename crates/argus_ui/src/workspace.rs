@@ -43,13 +43,15 @@ use crate::claude_status::observe_claude_status;
 use crate::comment_list::{CommentList, CommentListEvent};
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
-    button, disabled_button, kbd, panel_header, placeholder, primary_button, section_header,
-    text_tooltip, toggle_button,
+    button, disabled_button, disabled_ghost_button_with_icon, disabled_icon_button, icon_button,
+    kbd, muted_button_with_icon, panel_header, placeholder, primary_button, radius, section_header,
+    segmented, text_tooltip, toggle_button,
 };
 use crate::conflict::{ConflictDialog, ConflictDialogEvent, ConflictSource};
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::fonts::InstalledFonts;
+use crate::icons::{IconName, eye_mark, icon};
 use crate::jobs::BackgroundJobs;
 use crate::keymap::{
     Accept, AdvanceCommentStatus, Comment, CycleTheme, DecreaseFontSize, Dismiss, FocusFileFilter,
@@ -76,7 +78,9 @@ use crate::theme::{ActiveTheme, Theme, ThemeFamily, ThemeFonts, ThemeMode};
 use crate::{AppContext, OpenRequest};
 
 /// Height of the title bar.
-const TITLE_BAR_HEIGHT: Pixels = px(36.0);
+const TITLE_BAR_HEIGHT: Pixels = px(40.0);
+/// Tooltip of the title-bar swap button.
+const SWAP_TOOLTIP: &str = "Swap base and head";
 /// Height of the status bar.
 const STATUS_BAR_HEIGHT: Pixels = px(26.0);
 /// Space kept for the center area when docks grow.
@@ -142,6 +146,29 @@ struct ProposalTab {
 }
 
 /// The open branch picker and its subscription.
+/// What the right part of the Push split button shows.
+#[derive(Clone, Copy)]
+enum PushDetail {
+    /// No right part.
+    None,
+    /// `↑ahead ↓behind` against the upstream.
+    Counts(u32, u32),
+    /// The head branch has no upstream yet.
+    NoUpstream,
+}
+
+/// The resolved state of the Push split button.
+struct PushButtonState {
+    /// Whether clicking it starts a Push (or toggles the progress popover).
+    enabled: bool,
+    /// The left part's label: "Push" or "Pushing…".
+    label: &'static str,
+    /// The right part.
+    detail: PushDetail,
+    /// Why it is enabled or disabled.
+    tooltip: String,
+}
+
 struct OpenPicker {
     picker: Entity<BranchPicker>,
     _subscription: Subscription,
@@ -1739,6 +1766,9 @@ impl Workspace {
 
     // ---- rendering ----------------------------------------------------------
 
+    /// The title bar (Panoptes #56 §5): the breadcrumb group (eye mark,
+    /// repo, base, swap, head) on the left; the diff mode segmented control,
+    /// Fetch and the Push split button on the right.
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
         let session = self.session.as_ref().map(|session| session.read(cx));
@@ -1748,44 +1778,84 @@ impl Workspace {
 
         let branch_controls = session.map(|session| {
             let loaded = matches!(session.branches(), BranchList::Loaded(_));
+            let swap = if loaded {
+                icon_button("title-swap", IconName::ArrowsLeftRight, SWAP_TOOLTIP, cx).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.close_picker(cx);
+                        this.update_session(cx, |session, cx| session.swap(cx));
+                    }),
+                )
+            } else {
+                disabled_icon_button("title-swap", IconName::ArrowsLeftRight, SWAP_TOOLTIP, cx)
+            };
             div()
                 .flex()
                 .items_center()
                 .gap_0p5()
                 .min_w_0()
+                .child(
+                    div()
+                        .flex_none()
+                        .px_0p5()
+                        .text_color(colors.text_placeholder)
+                        .child("/"),
+                )
                 .child(self.render_branch_button(Side::Base, session, loaded, cx))
-                .child(if loaded {
-                    button("title-swap", "⇄", cx)
-                        .text_color(colors.text_muted)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.close_picker(cx);
-                            this.update_session(cx, |session, cx| session.swap(cx));
-                        }))
-                } else {
-                    disabled_button("title-swap", "⇄", cx)
-                })
+                .child(swap.w(px(22.0)))
                 .child(self.render_branch_button(Side::Head, session, loaded, cx))
         });
 
+        let breadcrumb = div()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .min_w_0()
+            .h(px(28.0))
+            .pl_2()
+            .pr(px(3.0))
+            .rounded(radius::MD)
+            .bg(colors.surface)
+            .border_1()
+            .border_color(colors.border_variant)
+            .child(eye_mark(px(16.0), cx))
+            .child(
+                button("title-repo", repo_label, cx)
+                    .h(px(22.0))
+                    .px_1p5()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(OpenRepository.boxed_clone(), cx)
+                    }),
+            )
+            .children(branch_controls);
+
         let fetch = match session {
-            Some(session) if session.is_fetching() => {
-                disabled_button("title-fetch", "Fetching…", cx)
-            }
+            Some(session) if session.is_fetching() => disabled_ghost_button_with_icon(
+                "title-fetch",
+                IconName::ArrowLineDown,
+                "Fetching…",
+                cx,
+            ),
             Some(session) if session.has_remotes() => {
-                button("title-fetch", "Fetch", cx).on_click(cx.listener(|this, _, _, cx| {
-                    this.update_session(cx, |session, cx| session.fetch(cx));
-                }))
+                muted_button_with_icon("title-fetch", IconName::ArrowLineDown, "Fetch", cx)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.update_session(cx, |session, cx| session.fetch(cx));
+                    }))
             }
-            _ => disabled_button("title-fetch", "Fetch", cx),
-        };
-        let side_by_side = self.settings.diff_view_mode == DiffViewMode::SideBySide;
-        let diff_mode = toggle_button("title-diff-mode", "Side by side", side_by_side, cx)
-            .text_color(if side_by_side {
-                colors.text
-            } else {
-                colors.text_muted
-            })
-            .on_click(|_, window, cx| window.dispatch_action(ToggleDiffMode.boxed_clone(), cx));
+            _ => {
+                disabled_ghost_button_with_icon("title-fetch", IconName::ArrowLineDown, "Fetch", cx)
+            }
+        }
+        .h(px(28.0));
+
+        let split = usize::from(self.settings.diff_view_mode == DiffViewMode::SideBySide);
+        let diff_mode = segmented("title-diff-mode", ["Unified", "Split"], split, cx).on_select(
+            move |index, window, cx| {
+                if index != split {
+                    window.dispatch_action(ToggleDiffMode.boxed_clone(), cx);
+                }
+            },
+        );
         let push = self.render_push_button(session, cx);
 
         div()
@@ -1797,126 +1867,222 @@ impl Workspace {
             .justify_between()
             .h(TITLE_BAR_HEIGHT)
             .pl(TRAFFIC_LIGHTS_WIDTH)
-            .pr_2()
+            .pr(px(10.0))
             .gap_2()
             .bg(colors.title_bar)
             .border_b_1()
-            .border_color(colors.border)
+            .border_color(colors.border_variant)
             .on_click(|event, window, _| {
                 if event.click_count() == 2 && cfg!(target_os = "macos") {
                     window.titlebar_double_click();
                 }
             })
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .min_w_0()
-                    .child(
-                        button("title-repo", repo_label, cx)
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(OpenRepository.boxed_clone(), cx)
-                            }),
-                    )
-                    .children(branch_controls),
-            )
+            .child(breadcrumb)
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap_1()
+                    .gap_1p5()
                     .child(diff_mode)
                     .child(fetch)
                     .child(push),
             )
     }
 
-    /// The Push button and its state (spec §5.4): `Push ↑ahead ↓behind`,
-    /// disabled with a tooltip when there is nothing to do or an Accept is
-    /// in flight, "No upstream" to offer `git push -u`, "Pushing…" (which
-    /// toggles the progress popover) while a Push runs.
+    /// The Push split button and its state (spec §5.4): `Push | ↑ahead
+    /// ↓behind`, disabled with a tooltip when there is nothing to do or an
+    /// Accept is in flight, `Push | No upstream` to offer `git push -u`,
+    /// "Pushing…" (which toggles the progress popover) while a Push runs.
     fn render_push_button(&self, session: Option<&RepoSession>, cx: &Context<Self>) -> AnyElement {
-        let disabled = |label: String, tooltip: String| {
-            disabled_button("title-push", label, cx)
-                .tooltip(text_tooltip(tooltip))
-                .into_any_element()
+        let state = |enabled: bool, label: &'static str, detail: PushDetail, tooltip: String| {
+            PushButtonState {
+                enabled,
+                label,
+                detail,
+                tooltip,
+            }
         };
-        let enabled = |label: String, tooltip: String| {
-            button("title-push", label, cx)
-                .tooltip(text_tooltip(tooltip))
-                .on_click(cx.listener(|this, _, _, cx| this.start_push(cx)))
-                .into_any_element()
-        };
-        if self.push_flow.read(cx).is_running() {
-            return enabled("Pushing…".to_owned(), "Show the push progress".to_owned());
-        }
-        let Some(session) = session else {
-            return disabled("Push".to_owned(), "Open a repository first.".to_owned());
-        };
-        let Some(head) = session.local_head() else {
-            return disabled(
-                "Push".to_owned(),
-                "Pick a local head branch to push.".to_owned(),
-            );
-        };
-        let counts = session
-            .upstream()
-            .map(|status| format!("Push ↑{} ↓{}", status.ahead, status.behind));
-        if self.accept_flow.read(cx).is_busy() {
-            return disabled(
-                counts.unwrap_or_else(|| "Push".to_owned()),
-                "An Accept is in progress; Push is available once it lands.".to_owned(),
-            );
-        }
-        if !session.head_has_upstream() {
-            if !session.has_remotes() {
-                return disabled(
-                    "Push · No upstream".to_owned(),
-                    "This repository has no remote to push to.".to_owned(),
+        let state = 'state: {
+            if self.push_flow.read(cx).is_running() {
+                let detail = session
+                    .and_then(RepoSession::upstream)
+                    .map_or(PushDetail::None, |status| {
+                        PushDetail::Counts(status.ahead, status.behind)
+                    });
+                break 'state state(
+                    true,
+                    "Pushing…",
+                    detail,
+                    "Show the push progress".to_owned(),
                 );
             }
-            return enabled(
-                "Push · No upstream".to_owned(),
-                format!(
-                    "`{}` has no upstream: push it with `git push -u`.",
-                    head.name
+            let Some(session) = session else {
+                break 'state state(
+                    false,
+                    "Push",
+                    PushDetail::None,
+                    "Open a repository first.".to_owned(),
+                );
+            };
+            let Some(head) = session.local_head() else {
+                break 'state state(
+                    false,
+                    "Push",
+                    PushDetail::None,
+                    "Pick a local head branch to push.".to_owned(),
+                );
+            };
+            let counts = session.upstream().map_or(PushDetail::None, |status| {
+                PushDetail::Counts(status.ahead, status.behind)
+            });
+            if self.accept_flow.read(cx).is_busy() {
+                break 'state state(
+                    false,
+                    "Push",
+                    counts,
+                    "An Accept is in progress; Push is available once it lands.".to_owned(),
+                );
+            }
+            if !session.head_has_upstream() {
+                if !session.has_remotes() {
+                    break 'state state(
+                        false,
+                        "Push",
+                        PushDetail::NoUpstream,
+                        "This repository has no remote to push to.".to_owned(),
+                    );
+                }
+                break 'state state(
+                    true,
+                    "Push",
+                    PushDetail::NoUpstream,
+                    format!(
+                        "`{}` has no upstream: push it with `git push -u`.",
+                        head.name
+                    ),
+                );
+            }
+            match session.upstream() {
+                Some(status) if status.ahead == 0 && status.behind == 0 => state(
+                    false,
+                    "Push",
+                    counts,
+                    format!(
+                        "Nothing to push: `{}` is up to date with `{}`.",
+                        head.name, status.upstream
+                    ),
                 ),
-            );
-        }
-        match session.upstream() {
-            Some(status) if status.ahead == 0 && status.behind == 0 => disabled(
-                counts.unwrap_or_default(),
-                format!(
-                    "Nothing to push: `{}` is up to date with `{}`.",
-                    head.name, status.upstream
+                Some(status) if status.ahead == 0 => state(
+                    true,
+                    "Push",
+                    counts,
+                    format!(
+                        "`{}` is behind `{}`: pull it (rebase) and push what is left.",
+                        head.name, status.upstream
+                    ),
                 ),
-            ),
-            Some(status) if status.ahead == 0 => enabled(
-                counts.unwrap_or_default(),
-                format!(
-                    "`{}` is behind `{}`: pull it (rebase) and push what is left.",
-                    head.name, status.upstream
+                Some(status) => state(
+                    true,
+                    "Push",
+                    counts,
+                    format!(
+                        "Push `{}` to `{}`; pulls with rebase first when the remote is ahead. \
+                         Never forced.",
+                        head.name, status.upstream
+                    ),
                 ),
-            ),
-            Some(status) => enabled(
-                counts.unwrap_or_default(),
-                format!(
-                    "Push `{}` to `{}`; pulls with rebase first when the remote is ahead. \
-                     Never forced.",
-                    head.name, status.upstream
+                None => state(
+                    true,
+                    "Push",
+                    PushDetail::None,
+                    format!("Push `{}` to its upstream.", head.name),
                 ),
-            ),
-            None => enabled(
-                "Push".to_owned(),
-                format!("Push `{}` to its upstream.", head.name),
-            ),
-        }
+            }
+        };
+        self.render_push_split_button(state, cx)
     }
 
-    /// A `base ▾` / `head ▾` button, with its picker popover when open.
+    /// Draws a [`PushButtonState`]: the `arrow-line-up` + label part and,
+    /// when there is a detail, a second part after a divider.
+    fn render_push_split_button(&self, state: PushButtonState, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let colors = &theme.colors;
+        let (label_color, detail_color, ahead_color) = if state.enabled {
+            (colors.text, colors.text_muted, colors.accent)
+        } else {
+            (
+                colors.text_placeholder,
+                colors.text_placeholder,
+                colors.text_placeholder,
+            )
+        };
+        let main = div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .h_full()
+            .px(px(9.0))
+            .text_color(label_color)
+            .child(icon(IconName::ArrowLineUp, px(14.0), label_color))
+            .child(state.label);
+        let detail_part = |content: AnyElement| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .h_full()
+                .px_2()
+                .border_l_1()
+                .border_color(colors.border)
+                .text_color(detail_color)
+                .child(content)
+        };
+        let detail = match state.detail {
+            PushDetail::None => None,
+            PushDetail::NoUpstream => Some(detail_part("No upstream".into_any_element())),
+            PushDetail::Counts(ahead, behind) => Some(detail_part(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .font_family(theme.fonts.code_family.clone())
+                    .text_size(px(11.5))
+                    .child(
+                        div()
+                            .when(ahead > 0, |this| this.text_color(ahead_color))
+                            .child(format!("↑{ahead}")),
+                    )
+                    .child(div().child(format!("↓{behind}")))
+                    .into_any_element(),
+            )),
+        };
+        div()
+            .id("title-push")
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(28.0))
+            .rounded(radius::MD)
+            .border_1()
+            .border_color(colors.border)
+            .overflow_hidden()
+            .text_sm()
+            .child(main)
+            .children(detail)
+            .tooltip(text_tooltip(state.tooltip))
+            .when(state.enabled, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(colors.element_hover))
+                    .active(|style| style.bg(colors.element_selected))
+                    .on_click(cx.listener(|this, _, _, cx| this.start_push(cx)))
+            })
+            .into_any_element()
+    }
+
+    /// A base / head branch button (`git-branch` icon + name in mono), with
+    /// its picker popover when open. The head branch is drawn in `accent`
+    /// on `accent_soft`, the base branch in `text_muted`.
     fn render_branch_button(
         &self,
         side: Side,
@@ -1924,54 +2090,71 @@ impl Workspace {
         enabled: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let colors = &cx.theme().colors;
+        let theme = cx.theme();
+        let colors = &theme.colors;
         let id = match side {
             Side::Base => "title-base",
             Side::Head => "title-head",
         };
         let (label, placeholder): (SharedString, bool) = match session.selected(side) {
-            Some(name) => (format!("{name} ▾").into(), false),
-            None => ("pick ▾".into(), true),
+            Some(name) => (name.to_string().into(), false),
+            None => ("pick".into(), true),
         };
         let picker = self
             .picker
             .as_ref()
             .filter(|open| open.picker.read(cx).side() == side)
             .map(|open| open.picker.clone());
-        let trigger = if enabled {
-            button(id, label, cx)
-                .max_w(px(260.0))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .when(placeholder, |button| button.text_color(colors.text_muted))
-                .when(picker.is_some(), |button| {
-                    button.bg(colors.element_selected)
-                })
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.toggle_picker(side, window, cx);
-                }))
+        let color = if !enabled || placeholder {
+            colors.text_placeholder
         } else {
-            disabled_button(id, label, cx)
+            match side {
+                Side::Base => colors.text_muted,
+                Side::Head => colors.accent,
+            }
         };
+        let fill = match side {
+            Side::Head if enabled && !placeholder => Some(colors.accent_soft),
+            _ => None,
+        };
+        let trigger = div()
+            .id(id)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(5.0))
+            .h(px(22.0))
+            .max_w(px(260.0))
+            .px_1p5()
+            .rounded(radius::SM)
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .font_family(theme.fonts.code_family.clone())
+            .text_size(px(12.0))
+            .text_color(color)
+            .when_some(fill, |this, fill| this.bg(fill))
+            .child(icon(IconName::GitBranch, px(13.0), color))
+            .child(div().min_w_0().overflow_hidden().child(label))
+            .tooltip(text_tooltip(match side {
+                Side::Base => "Base branch",
+                Side::Head => "Head branch",
+            }))
+            .when(enabled, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(colors.element_hover))
+                    .active(|style| style.bg(colors.element_selected))
+                    .when(picker.is_some(), |this| this.bg(colors.element_selected))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle_picker(side, window, cx);
+                    }))
+            });
         div()
             .relative()
             .min_w_0()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors.text_placeholder)
-                            .child(side.label()),
-                    )
-                    .child(trigger),
-            )
+            .child(trigger)
             .when_some(picker, |slot, picker| {
                 slot.child(
-                    deferred(div().absolute().top(px(30.0)).left_0().child(picker))
+                    deferred(div().absolute().top(px(28.0)).left_0().child(picker))
                         .with_priority(1),
                 )
             })
