@@ -33,8 +33,13 @@ use crate::text::{DiffLine, LineKind, TextDiff};
 /// Lines revealed by one click on "Expand up" / "Expand down".
 pub const EXPAND_STEP: u32 = 20;
 
+/// Rows of a file header: the viewer draws one header card across them
+/// (two code rows, 38 px at the default font size). Every file starts with
+/// this many [`Row::FileHeader`] rows.
+pub const HEADER_ROWS: usize = 2;
+
 /// Rows a placeholder never goes below: the header and one row of body.
-const MIN_FILE_ROWS: usize = 2;
+const MIN_FILE_ROWS: usize = HEADER_ROWS + 1;
 
 /// Context lines a hunk usually carries (3 above, 3 below), for estimates.
 const ESTIMATED_CONTEXT_ROWS: usize = 6;
@@ -42,8 +47,8 @@ const ESTIMATED_CONTEXT_ROWS: usize = 6;
 /// One uniform-height row of a file in the viewer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Row {
-    /// Path, counts, collapse toggle and "Viewed" checkbox. Always the first
-    /// row of a file.
+    /// Path, counts, collapse toggle and "Viewed" checkbox. The first
+    /// [`HEADER_ROWS`] rows of a file.
     FileHeader,
     /// Space reserved for a file whose hunks are not loaded (yet, or any
     /// more after eviction).
@@ -294,7 +299,7 @@ pub fn gaps(diff: &TextDiff) -> Vec<Gap> {
 /// The rows of one loaded file, plus what the viewer needs to navigate them.
 #[derive(Clone, Debug, Default)]
 pub struct FileRows {
-    /// Every row, starting with [`Row::FileHeader`].
+    /// Every row, starting with [`HEADER_ROWS`] [`Row::FileHeader`] rows.
     pub rows: Vec<Row>,
     /// Row indices of the hunk headers, ascending.
     pub hunk_rows: Vec<u32>,
@@ -330,7 +335,7 @@ pub fn build_rows(
     options: LayoutOptions,
 ) -> FileRows {
     let mut out = FileRows {
-        rows: vec![Row::FileHeader],
+        rows: vec![Row::FileHeader; HEADER_ROWS],
         line_digits: 1,
         ..FileRows::default()
     };
@@ -473,7 +478,8 @@ pub fn estimate_rows(stats: Option<&FileStats>, mode: ViewMode) -> usize {
                 ViewMode::Unified => added + removed,
                 ViewMode::Split => added.max(removed),
             };
-            2 + lines + ESTIMATED_CONTEXT_ROWS
+            // The header and one hunk header.
+            HEADER_ROWS + 1 + lines + ESTIMATED_CONTEXT_ROWS
         }
         _ => MIN_FILE_ROWS,
     }
@@ -748,8 +754,8 @@ pub fn select_split_range(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct InlineBlock {
     /// The row the block goes under, as an index into the rows *without*
-    /// inline blocks (see [`strip_inline`]). `0` (the file header) puts it
-    /// at the top of the file.
+    /// inline blocks (see [`strip_inline`]). A file header row puts it at
+    /// the top of the file, below the whole header.
     pub after: usize,
     /// Caller-defined identifier, stored in the block's [`Row::Inline`]
     /// rows.
@@ -786,8 +792,10 @@ pub fn place_inline(rows: &mut FileRows, blocks: &[InlineBlock]) -> Vec<usize> {
     if blocks.is_empty() {
         return first_rows;
     }
+    // A block never splits the header rows.
+    let after = |block: &InlineBlock| block.after.max(HEADER_ROWS - 1);
     let mut order: Vec<usize> = (0..blocks.len()).collect();
-    order.sort_by_key(|&index| blocks[index].after);
+    order.sort_by_key(|&index| after(&blocks[index]));
     let added: usize = blocks.iter().map(|block| block.rows.max(1) as usize).sum();
     let mut out = Vec::with_capacity(rows.rows.len() + added);
     let mut next = order.iter().peekable();
@@ -796,7 +804,7 @@ pub fn place_inline(rows: &mut FileRows, blocks: &[InlineBlock]) -> Vec<usize> {
         while let Some(&&block_index) = next.peek() {
             let block = blocks[block_index];
             // Blocks past the end go under the last row.
-            if block.after > index && index + 1 < rows.rows.len() {
+            if after(&block) > index && index + 1 < rows.rows.len() {
                 break;
             }
             next.next();

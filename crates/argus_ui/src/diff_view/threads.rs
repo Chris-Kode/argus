@@ -49,7 +49,7 @@ use gpui::{
 
 use super::{
     Anchor, COMMENT_COLUMN_WIDTH, DiffView, DiffViewEvent, FileState, LineSelection, ListStatus,
-    PROPOSAL_COMMENT_HINT, SCROLLBAR_WIDTH, SPLIT_DIVIDER_WIDTH, side_index,
+    PROPOSAL_COMMENT_HINT, SPLIT_DIVIDER_WIDTH, side_index,
 };
 use crate::AppContext;
 use crate::components::{button, chip, disabled_button, primary_button, status_chip};
@@ -64,6 +64,9 @@ use crate::theme::ActiveTheme;
 const COMPOSER_ESTIMATE_ROWS: u32 = 8;
 /// Narrowest a comment card gets before it falls back to the full width.
 const MIN_CARD_WIDTH: Pixels = px(260.0);
+/// Rows between the top of the viewport and a revealed thread: the sticky
+/// file header, then the line the thread hangs under.
+const REVEAL_OFFSET: usize = layout::HEADER_ROWS + 1;
 /// Space between a card and the edge of its column.
 const CARD_MARGIN: Pixels = px(8.0);
 /// A thread menu closed this recently by a click outside it is not reopened
@@ -167,6 +170,10 @@ pub(super) struct FileThreads {
     /// Commented line ranges per side ([`side_index`]), merged and sorted,
     /// for the gutter highlight.
     ranges: [Vec<(u32, u32)>; 2],
+    /// Status marker per side ([`side_index`]) and line: the thread's last
+    /// line, where it hangs. Lines ending several threads show the one that
+    /// matters most ([`marker_rank`]).
+    markers: [HashMap<u32, CommentStatus>; 2],
 }
 
 /// Comment state of the diff view.
@@ -295,6 +302,31 @@ impl DiffView {
         at > 0 && ranges[at - 1].1 >= line
     }
 
+    /// The status marker of `line` of `side` in `file`'s comment column.
+    pub(super) fn comment_marker(
+        &self,
+        file: usize,
+        side: DiffSide,
+        line: Option<u32>,
+    ) -> Option<CommentStatus> {
+        let markers = &self.files[file].threads.markers[side_index(side)];
+        markers.get(&line?).copied()
+    }
+
+    /// Number of current threads in `file`, loaded or not.
+    pub(super) fn thread_count(&self, file: usize) -> usize {
+        self.file_comments(file).len()
+    }
+
+    /// The first line of a comment of `file` that Claude is running.
+    pub(super) fn running_line(&self, file: usize) -> Option<u32> {
+        self.file_comments(file)
+            .into_iter()
+            .filter(|comment| comment.status == CommentStatus::Running)
+            .map(|comment| comment.anchor.start_line)
+            .min()
+    }
+
     /// Follows the comment snapshot: re-parses changed bodies, forgets the
     /// state of deleted threads and re-places every loaded file.
     pub(super) fn comments_changed(&mut self, cx: &mut Context<Self>) {
@@ -394,10 +426,19 @@ impl DiffView {
     pub(super) fn place_threads(&mut self, file: usize) {
         let mut blocks: Vec<(BlockKey, DiffSide, u32)> = Vec::new();
         let mut ranges: [Vec<(u32, u32)>; 2] = [Vec::new(), Vec::new()];
+        let mut markers: [HashMap<u32, CommentStatus>; 2] = Default::default();
         for comment in self.file_comments(file) {
             let anchor = &comment.anchor;
             blocks.push((BlockKey::Thread(comment.id), anchor.side, anchor.end_line));
             ranges[side_index(anchor.side)].push((anchor.start_line, anchor.end_line));
+            markers[side_index(anchor.side)]
+                .entry(anchor.end_line)
+                .and_modify(|status| {
+                    if marker_rank(comment.status) > marker_rank(*status) {
+                        *status = comment.status;
+                    }
+                })
+                .or_insert(comment.status);
         }
         for composer in &self.threads.composers {
             if composer.file == file {
@@ -441,7 +482,7 @@ impl DiffView {
             .zip(&rows)
             .enumerate()
             .map(|(item, (anchor, &rows))| InlineBlock {
-                after: anchor.unwrap_or(0),
+                after: anchor.unwrap_or(layout::HEADER_ROWS - 1),
                 item: item as u32,
                 rows,
             })
@@ -453,6 +494,7 @@ impl DiffView {
             first_rows,
             rows,
             ranges,
+            markers,
         };
     }
 
@@ -569,7 +611,7 @@ impl DiffView {
         };
         let rows = &loaded.rows.rows;
         let mut at = local.min(rows.len().saturating_sub(1));
-        while at > 1 && matches!(rows.get(at), Some(Row::Inline { .. })) {
+        while at > layout::HEADER_ROWS && matches!(rows.get(at), Some(Row::Inline { .. })) {
             at -= 1;
         }
         at
@@ -720,7 +762,8 @@ impl DiffView {
             return;
         }
         let total = self.total_rows();
-        let first = self.top_row() + 1;
+        // Below the sticky file header.
+        let first = self.top_row() + layout::HEADER_ROWS;
         let screen = (self.list_bounds().size.height / self.metrics.row_height).ceil() as usize;
         for row in first..(first + screen.max(1)).min(total) {
             let file = self.file_at(row);
@@ -1380,8 +1423,8 @@ impl DiffView {
         if self.files.is_empty() {
             return;
         }
-        // A revealed thread sits two rows below the top: its line, then it.
-        let reference = self.top_row() + 2;
+        // A revealed thread sits below the sticky header and its line.
+        let reference = self.top_row() + REVEAL_OFFSET;
         let mut positions: Vec<(usize, u32, CommentId)> = self
             .threads
             .snapshot
@@ -1392,7 +1435,7 @@ impl DiffView {
                 let row = self
                     .thread_row(file, comment.id)
                     // Not laid out yet: somewhere in its file, by line.
-                    .unwrap_or(self.starts[file] + 1);
+                    .unwrap_or(self.starts[file] + layout::HEADER_ROWS);
                 Some((row, comment.anchor.end_line, comment.id))
             })
             .collect();
@@ -1444,7 +1487,7 @@ impl DiffView {
         match self.thread_row(file, id) {
             Some(row) => {
                 self.threads.pending_reveal = None;
-                self.scroll_to_row(row.saturating_sub(2), cx);
+                self.scroll_to_row(row.saturating_sub(REVEAL_OFFSET), cx);
             }
             None => {
                 self.threads.pending_reveal = Some(id);
@@ -1466,7 +1509,7 @@ impl DiffView {
         };
         if let Some(row) = self.thread_row(file, id) {
             self.threads.pending_reveal = None;
-            self.scroll_to_row(row.saturating_sub(2), cx);
+            self.scroll_to_row(row.saturating_sub(REVEAL_OFFSET), cx);
             self.revealed_at = Some(self.scroll_top());
         }
     }
@@ -1484,6 +1527,7 @@ impl DiffView {
         Some(
             div()
                 .flex()
+                .flex_none()
                 .items_center()
                 .gap_1()
                 .child(div().text_xs().text_color(colors.text_muted).child(format!(
@@ -1531,7 +1575,7 @@ impl DiffView {
                 .map(|composer| composer.selection.side),
         }
         .unwrap_or(DiffSide::New);
-        let total = self.list_bounds().size.width - SCROLLBAR_WIDTH;
+        let total = self.card_width();
         let (left, width) = if loaded.rows.split {
             let columns = self.split_columns();
             let indent = columns.number + COMMENT_COLUMN_WIDTH;
@@ -2414,6 +2458,18 @@ fn confirm_bar(
 /// `sonnet · medium`, or just the model without an effort.
 /// The verb of the Run button: a Proposed comment runs again as a
 /// follow-up, which starts from a reply.
+/// Which status a line ending several threads shows: Claude at work first,
+/// then what waits for the user, then the quiet states.
+fn marker_rank(status: CommentStatus) -> u8 {
+    match status {
+        CommentStatus::Running => 4,
+        CommentStatus::Proposed => 3,
+        CommentStatus::Open => 2,
+        CommentStatus::Resolved => 1,
+        CommentStatus::Dismissed => 0,
+    }
+}
+
 fn run_verb(status: CommentStatus) -> &'static str {
     if status == CommentStatus::Proposed {
         "Follow up"
