@@ -434,6 +434,46 @@ impl WorktreeManager {
         Ok(output.stdout)
     }
 
+    /// Lines added and removed by the staged change of the worktree at
+    /// `path`, relative to `start_sha`: the sums of
+    /// `git diff --cached --numstat <start_sha>`. Binary files count zero.
+    ///
+    /// Read-only: it relies on the index a finished run left staged and does
+    /// not stage anything itself.
+    pub async fn staged_line_counts(&self, path: &Path, start_sha: &Sha) -> Result<(u64, u64)> {
+        self.guard(path)?;
+        let start = start_sha.to_hex();
+        let args = [
+            "diff",
+            "--cached",
+            "--numstat",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            start.as_str(),
+            "--",
+        ];
+        let output = GitCli::new(path).run(args).await?;
+        let counts = String::from_utf8_lossy(&output.stdout).lines().fold(
+            (0, 0),
+            |(added, removed), line| {
+                let mut fields = line.split('\t');
+                // Binary files report `-` for both counts.
+                let mut count = || {
+                    fields
+                        .next()
+                        .and_then(|field| field.parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                let line_added = count();
+                let line_removed = count();
+                (added + line_added, removed + line_removed)
+            },
+        );
+        Ok(counts)
+    }
+
     /// `git commit -F -` in an Argus worktree, with `message` on stdin.
     ///
     /// The user's identity, signing config and hooks apply, as for any
