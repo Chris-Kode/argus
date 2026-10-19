@@ -272,6 +272,9 @@ pub fn run_gpui_app(
         if let Some(options) = launch.perf {
             perf::install(options, launch.launched, cx);
         }
+        // Before any font is resolved: the bundled IBM Plex families head
+        // both preference lists.
+        fonts::register_bundled_fonts(cx);
         // A provisional theme so views can render before the workspace
         // resolves fonts and the window appearance.
         cx.set_global(Theme::new(Appearance::Dark, ThemeFonts::default()));

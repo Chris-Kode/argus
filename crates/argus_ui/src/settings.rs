@@ -179,10 +179,9 @@ impl Default for RunPanelDock {
 pub struct UiSettings {
     /// System, dark or light.
     pub theme: ThemeMode,
-    /// UI font family override; `None` picks Zed's UI font or the system one.
+    /// UI font family override; `None` picks the bundled IBM Plex Sans.
     pub ui_font_family: Option<String>,
-    /// Code font family override; `None` picks "Zed Mono" or the system
-    /// monospace font.
+    /// Code font family override; `None` picks the bundled IBM Plex Mono.
     pub code_font_family: Option<String>,
     /// UI font size in pixels.
     pub ui_font_size: f32,
