@@ -45,8 +45,8 @@ use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
     button, claude_activity, disabled_button, disabled_ghost_button_with_icon,
     disabled_icon_button, icon_button, kbd, muted_button_with_icon, panel_header, placeholder,
-    primary_button, radius, section_header, segmented, text_tooltip, toggle_button,
-    toggle_icon_button,
+    primary_button, primary_button_with_icon, radius, section_header, segmented, text_tooltip,
+    toggle_button, toggle_icon_button,
 };
 use crate::conflict::{ConflictDialog, ConflictDialogEvent, ConflictSource};
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
@@ -56,11 +56,12 @@ use crate::icons::{IconName, eye_mark, icon};
 use crate::jobs::BackgroundJobs;
 use crate::keymap::{
     Accept, AdvanceCommentStatus, Comment, CycleTheme, DecreaseFontSize, Dismiss, FocusFileFilter,
-    IncreaseFontSize, NextComment, NextFile, NextHunk, OpenRepository, OpenSettings,
-    PreviousComment, PreviousFile, PreviousHunk, ResetFontSize, Run, SHORTCUT_GROUPS, SHORTCUTS,
-    ToggleAllComments, ToggleCommentList, ToggleDiffMode, ToggleFileListMode, ToggleFileTree,
-    ToggleKeyboardShortcuts, ToggleRunPanel, ToggleRunPanelPosition, ToggleSoftWrap,
-    WORKSPACE_CONTEXT,
+    IncreaseFontSize, NextComment, NextFile, NextHunk, OpenRecent1, OpenRecent2, OpenRecent3,
+    OpenRecent4, OpenRecent5, OpenRecent6, OpenRecent7, OpenRecent8, OpenRecent9, OpenRepository,
+    OpenSettings, PreviousComment, PreviousFile, PreviousHunk, ResetFontSize, Run, SHORTCUT_GROUPS,
+    SHORTCUTS, ToggleAllComments, ToggleCommentList, ToggleDiffMode, ToggleFileListMode,
+    ToggleFileTree, ToggleKeyboardShortcuts, ToggleRunPanel, ToggleRunPanelPosition,
+    ToggleSoftWrap, WELCOME_CONTEXT, WORKSPACE_CONTEXT,
 };
 use crate::perf;
 use crate::proposal::{ProposalEvent, ProposalSource, ProposalView};
@@ -95,8 +96,13 @@ const RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 /// Settings are written this long after the last change, so a dock drag
 /// produces one write instead of one per mouse move.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
-/// How many recent repositories the empty state lists.
-const RECENT_REPOS_SHOWN: usize = 10;
+/// How many recent repositories the empty state lists; each gets a number
+/// key, `1`-`9`.
+const RECENT_REPOS_SHOWN: usize = 9;
+/// Size of the eye mark on the welcome screen.
+const WELCOME_MARK_SIZE: f32 = 56.0;
+/// Size of the "Argus" wordmark on the welcome screen.
+const WELCOME_WORDMARK_SIZE: f32 = 30.0;
 /// A picker closed this recently by a click outside it is not reopened by
 /// the same click landing on its own title-bar button.
 const PICKER_REOPEN_GUARD: Duration = Duration::from_millis(250);
@@ -1423,6 +1429,27 @@ impl Workspace {
 
     // ---- actions ------------------------------------------------------------
 
+    /// Whether the welcome screen is what the window shows: no repository,
+    /// no proposal tab and no sheet over it.
+    fn is_welcome_shown(&self) -> bool {
+        self.session.is_none() && self.active_proposal.is_none() && self.sheet.is_none()
+    }
+
+    /// Opens the recent repository at `index` (the `1`-`9` keys of the
+    /// welcome screen). Does nothing once a repository is open or opening.
+    fn open_recent(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.is_welcome_shown() || self.open_task.is_some() {
+            return;
+        }
+        let RecentRepos::Loaded(repos) = &self.recent else {
+            return;
+        };
+        if let Some(repo) = repos.iter().take(RECENT_REPOS_SHOWN).nth(index) {
+            let path = repo.path.clone();
+            self.open_path(path, cx);
+        }
+    }
+
     fn open_repository(&mut self, _: &OpenRepository, _: &mut Window, cx: &mut Context<Self>) {
         self.sheet = None;
         self.close_picker(cx);
@@ -2572,52 +2599,67 @@ impl Workspace {
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
+        let message = |text: SharedString, color: gpui::Hsla| {
+            div()
+                .py_1()
+                .text_sm()
+                .text_color(color)
+                .child(text)
+                .into_any_element()
+        };
         let recent: AnyElement =
             match &self.recent {
-                RecentRepos::Loading => div()
-                    .text_sm()
-                    .text_color(colors.text_placeholder)
-                    .child("Loading recent repositories…")
-                    .into_any_element(),
-                RecentRepos::Failed(message) => div()
-                    .text_sm()
-                    .text_color(colors.error)
-                    .child(format!("Could not load recent repositories: {message}"))
-                    .into_any_element(),
-                RecentRepos::Loaded(repos) if repos.is_empty() => div()
-                    .text_sm()
-                    .text_color(colors.text_placeholder)
-                    .child("No recent repositories.")
-                    .into_any_element(),
+                RecentRepos::Loading => message(
+                    "Loading recent repositories…".into(),
+                    colors.text_placeholder,
+                ),
+                RecentRepos::Failed(error) => message(
+                    format!("Could not load recent repositories: {error}").into(),
+                    colors.error,
+                ),
+                RecentRepos::Loaded(repos) if repos.is_empty() => {
+                    message("No recent repositories.".into(), colors.text_placeholder)
+                }
+                // The rows' padding hangs into the margin so their text lines up
+                // with the column while the hover fill keeps some room.
                 RecentRepos::Loaded(repos) => div()
                     .flex()
                     .flex_col()
                     .gap_0p5()
+                    .mx(px(-8.0))
                     .children(repos.iter().take(RECENT_REPOS_SHOWN).enumerate().map(
                         |(index, repo)| {
                             let path = repo.path.clone();
                             div()
                                 .id(("recent-repo", index))
                                 .flex()
-                                .flex_col()
+                                .items_center()
+                                .gap_2()
+                                .min_w_0()
+                                .h(px(28.0))
                                 .px_2()
-                                .py_1()
-                                .rounded_md()
+                                .rounded(radius::SM)
+                                .text_sm()
                                 .cursor_pointer()
                                 .hover(|style| style.bg(colors.element_hover))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open_path(path.clone(), cx)
                                 }))
+                                .child(kbd((index + 1).to_string(), cx))
                                 .child(
                                     div()
-                                        .text_sm()
+                                        .flex_none()
                                         .text_color(colors.text)
                                         .child(repo.name.clone()),
                                 )
                                 .child(
                                     div()
-                                        .text_xs()
-                                        .text_color(colors.text_muted)
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_color(colors.text_placeholder)
                                         .child(display_path(&repo.path)),
                                 )
                         },
@@ -2637,38 +2679,45 @@ impl Workspace {
                 div()
                     .flex()
                     .flex_col()
-                    .gap_4()
+                    .items_start()
+                    .gap_6()
                     .w(px(420.0))
                     .p_4()
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap_1()
+                            .items_start()
+                            .gap_3()
+                            .child(eye_mark(px(WELCOME_MARK_SIZE), cx))
                             .child(
                                 div()
-                                    .text_xl()
+                                    .text_size(px(WELCOME_WORDMARK_SIZE))
+                                    .line_height(px(WELCOME_WORDMARK_SIZE * 1.2))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(colors.text)
                                     .child("Argus"),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(colors.text_muted)
-                                    .child("Review a branch, comment on lines, and let Claude propose the fixes."),
-                            ),
+                            .child(div().text_sm().text_color(colors.text_muted).child(
+                                "Review a branch, comment on lines, and let Claude propose the fixes.",
+                            )),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(primary_button("open-repo", "Open a repository", cx).on_click(
-                                |_, window, cx| {
+                            .child(
+                                primary_button_with_icon(
+                                    "open-repo",
+                                    IconName::FolderSimple,
+                                    "Open repository",
+                                    cx,
+                                )
+                                .on_click(|_, window, cx| {
                                     window.dispatch_action(OpenRepository.boxed_clone(), cx)
-                                },
-                            ))
+                                }),
+                            )
                             .child(kbd(shortcut_text::<OpenRepository>(), cx)),
                     )
                     .child(
@@ -2676,11 +2725,13 @@ impl Workspace {
                             .flex()
                             .flex_col()
                             .gap_1()
+                            .w_full()
                             .child(
                                 div()
                                     .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(colors.text_muted)
-                                    .child("RECENT"),
+                                    .child("Recent"),
                             )
                             .child(recent),
                     ),
@@ -3126,7 +3177,8 @@ impl Workspace {
                     SHORTCUTS
                         .iter()
                         .filter(|shortcut| shortcut.group == name)
-                        .map(|shortcut| {
+                        .filter_map(|shortcut| Some((shortcut, shortcut.sheet_keys()?)))
+                        .map(|(shortcut, keys)| {
                             div()
                                 .flex()
                                 .items_center()
@@ -3136,7 +3188,7 @@ impl Workspace {
                                 .text_sm()
                                 .text_color(colors.text)
                                 .child(shortcut.description)
-                                .child(kbd(shortcut.display_keys(), cx))
+                                .child(kbd(keys, cx))
                         }),
                 )
         };
@@ -3523,7 +3575,14 @@ impl Render for Workspace {
 
         div()
             .id("workspace")
-            .key_context(WORKSPACE_CONTEXT)
+            .key_context({
+                let mut context = gpui::KeyContext::default();
+                context.add(WORKSPACE_CONTEXT);
+                if self.is_welcome_shown() {
+                    context.add(WELCOME_CONTEXT);
+                }
+                context
+            })
             .track_focus(&self.focus_handle)
             .relative()
             .flex()
@@ -3551,6 +3610,15 @@ impl Render for Workspace {
                 }),
             )
             .on_action(cx.listener(Self::open_repository))
+            .on_action(cx.listener(|this, _: &OpenRecent1, _, cx| this.open_recent(0, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent2, _, cx| this.open_recent(1, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent3, _, cx| this.open_recent(2, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent4, _, cx| this.open_recent(3, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent5, _, cx| this.open_recent(4, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent6, _, cx| this.open_recent(5, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent7, _, cx| this.open_recent(6, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent8, _, cx| this.open_recent(7, cx)))
+            .on_action(cx.listener(|this, _: &OpenRecent9, _, cx| this.open_recent(8, cx)))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::toggle_shortcuts))
             .on_action(cx.listener(Self::dismiss))
