@@ -23,6 +23,7 @@ pub mod jobs;
 pub mod keymap;
 pub mod markdown;
 pub mod perf;
+pub mod permission;
 pub mod proposal;
 pub mod push;
 pub mod run_panel;

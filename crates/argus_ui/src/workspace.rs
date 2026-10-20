@@ -18,7 +18,10 @@
 //! minute (a setting) so its counts stay current. A conflict of an Accept
 //! or of the pull before Push opens the [`ConflictDialog`] (#26); its
 //! resolve run's proposal opens in a tab when the run ends, and accepting
-//! a pull-before-push resolution continues the Push. Settings, the
+//! a pull-before-push resolution continues the Push. A run that waits for
+//! the reviewer (a tool permission its `auto` mode does not settle, or an
+//! `AskUserQuestion`) opens the [`PermissionDialog`]; Later hides it and the
+//! status bar's "waiting for you" counter brings it back. Settings, the
 //! repository list and git are read and written on the tokio runtime; this
 //! view only receives the results.
 
@@ -28,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use argus_diff::layout::ViewMode;
 use argus_diff::review::{CommentChange, CommentStatus};
-use argus_runs::ClaudeStatus;
+use argus_runs::{ClaudeStatus, PermissionRequest};
 use argus_store::{Repo, StorageService};
 use gpui::{
     Action, AnyElement, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable,
@@ -64,6 +67,7 @@ use crate::keymap::{
     ToggleSoftWrap, WELCOME_CONTEXT, WORKSPACE_CONTEXT,
 };
 use crate::perf;
+use crate::permission::{PermissionDialog, PermissionDialogEvent};
 use crate::proposal::{ProposalEvent, ProposalSource, ProposalView};
 use crate::push::{PushFlow, PushFlowEvent};
 use crate::run_panel::{RunPanel, RunPanelEvent};
@@ -217,6 +221,15 @@ pub struct Workspace {
     push_flow: Entity<PushFlow>,
     /// The conflict dialog, while one is open.
     conflict: Option<(Entity<ConflictDialog>, Subscription)>,
+    /// Permission requests of live runs waiting for the reviewer, oldest
+    /// first.
+    permissions: Vec<PermissionRequest>,
+    /// The dialog of the oldest waiting request, unless hidden.
+    permission_dialog: Option<(Entity<PermissionDialog>, Subscription)>,
+    /// The reviewer chose Later; the status bar counter shows the dialog
+    /// again.
+    permissions_hidden: bool,
+    _permission_task: Task<()>,
     /// Resolve runs whose proposal opens when they end.
     resolve_watches: HashMap<argus_store::RunId, Task<()>>,
     /// Fetches the head's upstream every minute, when the setting is on.
@@ -305,6 +318,17 @@ impl Workspace {
             }
         });
 
+        let mut pending = cx.global::<AppContext>().runs.subscribe_permissions();
+        let permission_task = cx.spawn(async move |this, cx| {
+            loop {
+                let requests = pending.borrow_and_update().clone();
+                let applied = this.update(cx, |this, cx| this.set_permissions(requests, cx));
+                if applied.is_err() || pending.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+
         let mut this = Self {
             focus_handle,
             settings,
@@ -325,6 +349,10 @@ impl Workspace {
             accept_flow,
             push_flow,
             conflict: None,
+            permissions: Vec::new(),
+            permission_dialog: None,
+            permissions_hidden: false,
+            _permission_task: permission_task,
             resolve_watches: HashMap::new(),
             _background_fetch: background_fetch,
             focus_requested: false,
@@ -1154,6 +1182,79 @@ impl Workspace {
         cx.notify();
     }
 
+    // ---- permission requests --------------------------------------------------
+
+    /// Takes the latest list of waiting requests and shows the oldest.
+    fn set_permissions(&mut self, requests: Vec<PermissionRequest>, cx: &mut Context<Self>) {
+        self.permissions = requests;
+        if self.permissions.is_empty() {
+            self.permissions_hidden = false;
+        }
+        self.sync_permission_dialog(cx);
+        cx.notify();
+    }
+
+    /// Opens the dialog of the oldest waiting request, keeps it when it
+    /// already shows that request, or closes it when nothing waits or the
+    /// reviewer chose Later.
+    fn sync_permission_dialog(&mut self, cx: &mut Context<Self>) {
+        let waiting = self.permissions.len();
+        let Some(request) = self
+            .permissions
+            .first()
+            .filter(|_| !self.permissions_hidden)
+            .cloned()
+        else {
+            self.permission_dialog = None;
+            return;
+        };
+        if let Some((dialog, _)) = &self.permission_dialog
+            && dialog.read(cx).key() == (request.run_id, request.request_id.as_str())
+        {
+            dialog.update(cx, |dialog, cx| dialog.set_waiting(waiting, cx));
+            return;
+        }
+        let context = self.run_panel.read(cx).run_context(request.run_id);
+        let dialog = cx.new(|cx| PermissionDialog::new(request, context, waiting, cx));
+        let subscription = cx.subscribe(&dialog, Self::permission_event);
+        self.permission_dialog = Some((dialog, subscription));
+    }
+
+    /// Hides the permission dialog; the runs keep waiting.
+    fn hide_permissions(&mut self, cx: &mut Context<Self>) {
+        self.permissions_hidden = true;
+        self.permission_dialog = None;
+        cx.notify();
+    }
+
+    /// Shows the permission dialog again.
+    fn show_permissions(&mut self, cx: &mut Context<Self>) {
+        self.permissions_hidden = false;
+        self.sync_permission_dialog(cx);
+        cx.notify();
+    }
+
+    fn permission_event(
+        &mut self,
+        _: Entity<PermissionDialog>,
+        event: &PermissionDialogEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            // The answered request leaves the list; the next one opens with
+            // the update.
+            PermissionDialogEvent::Answered => self.permission_dialog = None,
+            PermissionDialogEvent::Later => self.hide_permissions(cx),
+            PermissionDialogEvent::Notice { message, is_error } => {
+                self.notice = Some(Notice {
+                    message: message.clone(),
+                    is_error: *is_error,
+                });
+            }
+        }
+        cx.notify();
+    }
+
     /// Opens the proposal of resolve run `run_id` once it ends with
     /// something to review, or reports its failure.
     fn watch_resolve(&mut self, run_id: argus_store::RunId, cx: &mut Context<Self>) {
@@ -1516,6 +1617,10 @@ impl Workspace {
             .session
             .as_ref()
             .is_some_and(|session| session.read(cx).tracking_prompt().is_some());
+        if self.permission_dialog.is_some() {
+            self.hide_permissions(cx);
+            return;
+        }
         if let Some(dialog) = self.conflict.as_ref().map(|(dialog, _)| dialog.clone()) {
             dialog.update(cx, |dialog, cx| dialog.cancel(cx));
             return;
@@ -2846,6 +2951,27 @@ impl Workspace {
             counters
         });
 
+        let waiting = (!self.permissions.is_empty()).then(|| {
+            let count = self.permissions.len();
+            div()
+                .id("status-permissions")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .h(px(20.0))
+                .px_1p5()
+                .rounded(radius::SM)
+                .cursor_pointer()
+                .text_color(colors.claude_text)
+                .bg(colors.claude_soft)
+                .hover(|style| style.bg(colors.element_hover))
+                .tooltip(text_tooltip("Answer the runs waiting for you"))
+                .child(claude_activity(STATUS_ICON_SIZE, cx))
+                .child(format!("{count} waiting for you"))
+                .on_click(cx.listener(|this, _, _, cx| this.show_permissions(cx)))
+        });
+
         let run_panel = toggle_icon_button(
             "status-runs",
             IconName::Sidebar,
@@ -2877,6 +3003,7 @@ impl Workspace {
                     .child(files)
                     .child(comments)
                     .child(divider)
+                    .children(waiting)
                     .children(counters.into_iter().flatten())
                     .children(notice.map(|notice| notice.ml_1())),
             )
@@ -3667,6 +3794,13 @@ impl Render for Workspace {
             })
             .when_some(
                 self.conflict.as_ref().map(|(dialog, _)| dialog.clone()),
+                |root, dialog| root.child(dialog),
+            )
+            // Over every other dialog: a run is blocked until it is answered.
+            .when_some(
+                self.permission_dialog
+                    .as_ref()
+                    .map(|(dialog, _)| dialog.clone()),
                 |root, dialog| root.child(dialog),
             )
             // Last, so its paint ends the `ARGUS_PERF` frame measurement.

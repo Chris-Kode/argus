@@ -10,6 +10,12 @@
 //! no limit: every run is its own task, and nothing ever waits on one from
 //! the UI thread.
 //!
+//! A run talks `stream-json` both ways: its prompt is the first line on
+//! stdin, and stdin stays open so the reviewer's answers to its permission
+//! requests ([`crate::permission`]) can reach it; the supervisor closes stdin
+//! after the `result` line so the process exits. Requests waiting for an
+//! answer are published to [`Services::subscribe_permissions`].
+//!
 //! [`follow_up`] continues a `Proposed` comment: a new run (`kind =
 //! followup`) resumes the thread's Claude session (`--resume`) in the
 //! worktree of the current proposal, so the next proposal combines both
@@ -34,13 +40,16 @@ use argus_store::{
     StorageService, StoreError,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::process::Child;
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::claude::{
     AUTH_ERROR_HINT, ClaudeCapabilities, ClaudeCommand, SessionMode, is_auth_error,
+};
+use crate::permission::{
+    Control, PermissionDecision, PermissionRequest, parse_control, unsupported_line,
 };
 use crate::prompt::{
     CommentContext, Prompt, PromptError, RepoContext, ThreadMessage, comment_prompt,
@@ -232,18 +241,33 @@ pub(crate) struct Services {
     pub resolves: crate::resolve::ResolveSessions,
     status: broadcast::Sender<RunUpdate>,
     events: broadcast::Sender<RunStreamEvent>,
+    /// Permission requests of live runs waiting for the reviewer, oldest
+    /// first.
+    permissions: watch::Sender<Vec<PermissionRequest>>,
     active: Mutex<HashMap<RunId, ActiveRun>>,
 }
 
 #[derive(Debug)]
 struct ActiveRun {
     stop: watch::Sender<bool>,
+    /// The run's stdin, for answers to its permission requests.
+    input: mpsc::UnboundedSender<StdinMessage>,
+}
+
+/// What the stdin writer of a run does next.
+#[derive(Debug)]
+enum StdinMessage {
+    /// Write this line (a newline is added).
+    Line(String),
+    /// Close stdin: the run reported its result and may exit.
+    Close,
 }
 
 impl Services {
     pub fn new(store: StorageService, git: GitService, worktrees: WorktreeManager) -> Self {
         let (status, _) = broadcast::channel(STATUS_CAPACITY);
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
+        let (permissions, _) = watch::channel(Vec::new());
         Self {
             store,
             git,
@@ -251,6 +275,7 @@ impl Services {
             resolves: crate::resolve::ResolveSessions::default(),
             status,
             events,
+            permissions,
             active: Mutex::new(HashMap::new()),
         }
     }
@@ -281,6 +306,71 @@ impl Services {
             }
             None => false,
         }
+    }
+
+    /// Observes the permission requests waiting for the reviewer.
+    pub fn subscribe_permissions(&self) -> watch::Receiver<Vec<PermissionRequest>> {
+        self.permissions.subscribe()
+    }
+
+    /// The permission requests waiting for the reviewer, oldest first.
+    pub fn pending_permissions(&self) -> Vec<PermissionRequest> {
+        self.permissions.borrow().clone()
+    }
+
+    /// Sends the reviewer's answer to a waiting request; `false` when the
+    /// request is no longer waiting (answered, withdrawn, or its run ended).
+    pub fn answer_permission(
+        &self,
+        run_id: RunId,
+        request_id: &str,
+        decision: &PermissionDecision,
+    ) -> bool {
+        let Some(request) = self.take_permission(run_id, request_id) else {
+            return false;
+        };
+        let line = request.response_line(decision);
+        let sent = self
+            .lock_active()
+            .get(&run_id)
+            .is_some_and(|run| run.input.send(StdinMessage::Line(line)).is_ok());
+        tracing::info!(
+            run = %run_id,
+            tool = %request.tool_name,
+            ?decision,
+            sent,
+            "answered a permission request"
+        );
+        sent
+    }
+
+    fn add_permission(&self, request: PermissionRequest) {
+        tracing::info!(
+            run = %request.run_id,
+            tool = %request.tool_name,
+            "run waits for the reviewer"
+        );
+        self.permissions.send_modify(|list| list.push(request));
+    }
+
+    fn take_permission(&self, run_id: RunId, request_id: &str) -> Option<PermissionRequest> {
+        let mut taken = None;
+        self.permissions.send_if_modified(|list| {
+            let index = list
+                .iter()
+                .position(|r| r.run_id == run_id && r.request_id == request_id);
+            taken = index.map(|index| list.remove(index));
+            taken.is_some()
+        });
+        taken
+    }
+
+    fn clear_permissions(&self, run_id: RunId) {
+        self.permissions.send_if_modified(|list| {
+            let before = list.len();
+            list.retain(|request| request.run_id != run_id);
+            list.len() != before
+        });
     }
 
     pub(crate) fn publish(&self, update: RunUpdate) {
@@ -804,6 +894,7 @@ pub(crate) async fn spawn(
         run.session,
         run.rules_path.clone(),
     )
+    .protecting(worktree.repo_dir())
     .adapt_to(&run.capabilities);
     let program = run.capabilities.path().to_owned();
     let mut child = match command.to_command(&program).spawn() {
@@ -814,16 +905,11 @@ pub(crate) async fn spawn(
             return Err(RunError::Spawn(reason));
         }
     };
-    if let (Some(bytes), Some(mut stdin)) =
-        (command.stdin().map(<[u8]>::to_vec), child.stdin.take())
-    {
+    let (input, input_rx) = mpsc::unbounded_channel();
+    if let Some(stdin) = child.stdin.take() {
         // A long prompt can exceed the pipe buffer; write it without blocking
-        // the start, then close stdin so Claude sees the end of the prompt.
-        tokio::spawn(async move {
-            if let Err(error) = stdin.write_all(&bytes).await {
-                tracing::warn!(run = %run_id, %error, "cannot write the prompt to claude");
-            }
-        });
+        // the start.
+        tokio::spawn(write_stdin(stdin, command.stdin(), input_rx, run_id));
     }
 
     // Running; register for Stop before anyone can see the run.
@@ -832,9 +918,13 @@ pub(crate) async fn spawn(
         tracing::warn!(run = %run_id, %error, "cannot mark the run as running");
     }
     let (stop_tx, stop_rx) = watch::channel(false);
-    services
-        .lock_active()
-        .insert(run_id, ActiveRun { stop: stop_tx });
+    services.lock_active().insert(
+        run_id,
+        ActiveRun {
+            stop: stop_tx,
+            input: input.clone(),
+        },
+    );
     tracing::info!(
         run = %run_id,
         comment = ?comment_id,
@@ -854,6 +944,7 @@ pub(crate) async fn spawn(
             resumed: matches!(run.session, SessionMode::Resume(_)),
             worktree,
             start_sha: run.start_sha,
+            input,
         },
         child,
         stop_rx,
@@ -870,6 +961,8 @@ struct LiveRun {
     resumed: bool,
     worktree: Worktree,
     start_sha: Sha,
+    /// The run's stdin.
+    input: mpsc::UnboundedSender<StdinMessage>,
 }
 
 /// What the stream told us so far.
@@ -931,7 +1024,7 @@ async fn supervise(
                 }
             }
             line = lines.recv(), if stdout_open => match line {
-                Some(line) => handle_line(&services, &runs, run_id, &line, &mut seq, &mut state, &mut store_failed),
+                Some(line) => handle_line(&services, &runs, &run, &line, &mut seq, &mut state, &mut store_failed),
                 None => stdout_open = false,
             },
             status = child.wait(), if !stdout_open => break status,
@@ -1019,16 +1112,18 @@ async fn followup_event(
     }
 }
 
-/// Parses, stores and publishes one stdout line.
+/// Parses, stores and publishes one stdout line, and acts on control
+/// requests and the final result.
 fn handle_line(
     services: &Services,
     runs: &argus_store::RunStore,
-    run_id: RunId,
+    run: &LiveRun,
     line: &[u8],
     seq: &mut i64,
     state: &mut StreamState,
     store_failed: &mut bool,
 ) {
+    let run_id = run.run_id;
     let text = String::from_utf8_lossy(line);
     let text = text.trim_end_matches(['\n', '\r']);
     if text.trim().is_empty() {
@@ -1049,12 +1144,31 @@ fn handle_line(
         }
     };
     match &event {
-        StreamEvent::Result(result) => state.result = Some(result.clone()),
+        StreamEvent::Result(result) => {
+            state.result = Some(result.clone());
+            // Nothing more to say to Claude: closing stdin lets it exit.
+            let _ = run.input.send(StdinMessage::Close);
+        }
         StreamEvent::Assistant(message) => {
             if let Some(text) = message.text() {
                 state.last_text = Some(text);
             }
         }
+        StreamEvent::Unknown(value) => match parse_control(value, run_id, run.comment_id) {
+            Some(Control::CanUseTool(request)) => services.add_permission(*request),
+            Some(Control::Cancel { request_id }) => {
+                services.take_permission(run_id, &request_id);
+            }
+            Some(Control::Unsupported {
+                request_id,
+                subtype,
+            }) => {
+                tracing::warn!(run = %run_id, %subtype, "unsupported control request");
+                let line = unsupported_line(&request_id, &subtype);
+                let _ = run.input.send(StdinMessage::Line(line));
+            }
+            None => {}
+        },
         _ => {}
     }
     if let Err(error) = runs.append_event(run_id, *seq, event.event_type(), text)
@@ -1224,8 +1338,37 @@ async fn record_finish(services: &Services, finish: Finish, outcome: RunOutcome)
         }
     }
     services.lock_active().remove(&run_id);
+    services.clear_permissions(run_id);
     tracing::info!(run = %run_id, %status, error = ?finished.error, "run finished");
     services.publish(RunUpdate::Finished(finished));
+}
+
+/// Writes `first` (the prompt line) to the run's stdin, then each line it is
+/// sent, until it is told to close or every sender is gone.
+async fn write_stdin(
+    mut stdin: ChildStdin,
+    first: Vec<u8>,
+    mut input: mpsc::UnboundedReceiver<StdinMessage>,
+    run_id: RunId,
+) {
+    if let Err(error) = stdin.write_all(&first).await {
+        tracing::warn!(run = %run_id, %error, "cannot write the prompt to claude");
+        return;
+    }
+    while let Some(message) = input.recv().await {
+        let StdinMessage::Line(mut line) = message else {
+            break;
+        };
+        line.push('\n');
+        let written = async {
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.flush().await
+        };
+        if let Err(error) = written.await {
+            tracing::warn!(run = %run_id, %error, "cannot write to claude");
+            return;
+        }
+    }
 }
 
 /// Forwards stdout lines (with their newline) until EOF.

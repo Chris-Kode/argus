@@ -4,7 +4,9 @@
 //! [`detect`] resolves the binary, runs `claude --version` and
 //! `claude --help` (each with a clean environment and a timeout), and returns
 //! the [`ClaudeCapabilities`]. A missing required flag blocks runs; a missing
-//! `--effort` only hides the effort picker.
+//! `--effort` only hides the effort picker, and a missing `auto` permission
+//! mode makes runs fall back to `acceptEdits` (with every other tool call
+//! asked in the permission dialog).
 //!
 //! `--help` does not list every flag: Claude Code 2.1 accepts
 //! `--append-system-prompt-file` and `--max-turns` without listing them. Each
@@ -30,19 +32,25 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 /// The thinking-effort flag; optional, unlike [`REQUIRED_FLAGS`].
 pub const EFFORT_FLAG: &str = "--effort";
 
+/// The permission mode of review runs: Claude Code approves what is safe on
+/// its own and asks Argus for the rest.
+pub const AUTO_MODE: &str = "auto";
+
 /// Flags Argus cannot run without: every flag of the review-run argv
 /// (spec §6.2) plus `--tools` and `--max-turns` of the commit-message call
-/// (spec §6.4).
-pub const REQUIRED_FLAGS: [&str; 12] = [
+/// (spec §6.4). `--permission-prompt-tool` is not listed by `--help`; the
+/// probe finds it.
+pub const REQUIRED_FLAGS: [&str; 13] = [
     "-p",
     "--model",
     "--session-id",
     "--resume",
+    "--input-format",
     "--output-format",
     "--verbose",
     "--permission-mode",
-    "--allowedTools",
-    "--permission-prompts",
+    "--permission-prompt-tool",
+    "--disallowedTools",
     "--append-system-prompt-file",
     "--tools",
     "--max-turns",
@@ -122,22 +130,21 @@ pub struct ClaudeCapabilities {
     path: PathBuf,
     version: Option<ClaudeVersion>,
     flags: BTreeSet<String>,
-    stdin_prompt: bool,
+    auto_mode: bool,
 }
 
 impl ClaudeCapabilities {
     /// Capabilities from the output of `claude --version` and
     /// `claude --help`.
     pub fn from_probes(path: PathBuf, version_output: &str, help_output: &str) -> Self {
-        let flags = parse_help_flags(help_output);
-        // `-p` reads the prompt from stdin when none is given ("useful for
-        // pipes"); `--input-format` documents the same input channel.
-        let stdin_prompt = flags.contains("--input-format") || help_output.contains("pipes");
+        // `--permission-mode` lists its choices: `(choices: "acceptEdits",
+        // "auto", …)`.
+        let auto_mode = help_output.contains(&format!("\"{AUTO_MODE}\""));
         Self {
             path,
             version: ClaudeVersion::parse(version_output),
-            flags,
-            stdin_prompt,
+            flags: parse_help_flags(help_output),
+            auto_mode,
         }
     }
 
@@ -168,9 +175,9 @@ impl ClaudeCapabilities {
         self.supports(EFFORT_FLAG)
     }
 
-    /// Whether a long prompt can be passed on stdin.
-    pub fn stdin_prompt(&self) -> bool {
-        self.stdin_prompt
+    /// Whether `--permission-mode` offers [`AUTO_MODE`].
+    pub fn supports_auto_mode(&self) -> bool {
+        self.auto_mode
     }
 
     /// The [`REQUIRED_FLAGS`] the CLI lacks.
@@ -183,7 +190,7 @@ impl ClaudeCapabilities {
     }
 
     /// Why runs are disabled, e.g. `Claude Code 2.0.1 is missing
-    /// --permission-prompts; please update`; `None` when they can start.
+    /// --permission-prompt-tool; please update`; `None` when they can start.
     pub fn run_blocker(&self) -> Option<String> {
         let missing = self.missing_required();
         (!missing.is_empty()).then(|| {
@@ -195,12 +202,24 @@ impl ClaudeCapabilities {
         })
     }
 
-    /// A degradation runs live with: today only a missing `--effort`.
+    /// A degradation runs live with: a missing `--effort` or `auto` mode.
     pub fn warning(&self) -> Option<String> {
-        (!self.supports_effort()).then(|| {
+        let mut gaps = Vec::new();
+        if !self.supports_effort() {
+            gaps.push(format!(
+                "does not support {EFFORT_FLAG}; runs use its default effort"
+            ));
+        }
+        if !self.supports_auto_mode() {
+            gaps.push(format!(
+                "has no `{AUTO_MODE}` permission mode; runs ask you before anything but edits"
+            ));
+        }
+        (!gaps.is_empty()).then(|| {
             format!(
-                "Claude Code {} does not support {EFFORT_FLAG}; runs use its default effort",
-                self.version_label()
+                "Claude Code {} {}",
+                self.version_label(),
+                gaps.join(", and ")
             )
         })
     }
@@ -289,6 +308,7 @@ pub async fn detect(configured: Option<PathBuf>) -> Result<ClaudeCapabilities, D
         version = %capabilities.version_label(),
         missing = ?capabilities.missing_required(),
         effort = capabilities.supports_effort(),
+        auto_mode = capabilities.supports_auto_mode(),
         "detected Claude Code"
     );
     Ok(capabilities)
