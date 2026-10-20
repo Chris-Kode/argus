@@ -63,7 +63,7 @@ impl PermissionDialog {
         waiting: usize,
         cx: &mut Context<Self>,
     ) -> Self {
-        let others = request
+        let others: Vec<Entity<TextField>> = request
             .questions
             .iter()
             .map(|_| cx.new(|cx| TextField::new("Other answer (optional)", cx)))
