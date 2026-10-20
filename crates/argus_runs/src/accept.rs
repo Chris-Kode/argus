@@ -52,7 +52,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -985,12 +984,11 @@ async fn commit_text(
 /// Runs the commit-message command to completion and returns its stdout.
 /// Dropping the future kills `claude`.
 async fn run_claude(command: &ClaudeCommand, program: &Path) -> Result<String, String> {
-    let mut process = command.to_command(program);
-    process.stdin(Stdio::piped());
-    let mut child = process
+    let mut child = command
+        .to_command(program)
         .spawn()
         .map_err(|error| format!("cannot start {}: {error}", program.display()))?;
-    let input = command.stdin().map(<[u8]>::to_vec).unwrap_or_default();
+    let input = command.stdin();
     let mut stdin = child.stdin.take();
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();

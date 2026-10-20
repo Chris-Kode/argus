@@ -1,10 +1,12 @@
 //! The environment of every `claude` child process.
 //!
-//! Children start from an empty environment and get only the variables
-//! listed here, read one by one from Argus' own environment. Nothing else
-//! leaks through: in particular `ANTHROPIC_API_KEY` (and every other
-//! `ANTHROPIC_*` variable) is never read, so Claude Code authenticates with
-//! the user's own sign-in (spec §11.6).
+//! Review runs get the user's environment, as a `claude` started in their
+//! shell would, so MCP servers, build tools and their credentials work
+//! ([`session_env`]). Probes and commit messages start from an empty
+//! environment and get only [`PASSTHROUGH_VARS`] ([`child_env`]). In both
+//! cases `ANTHROPIC_API_KEY` (and every other `ANTHROPIC_*` variable) is
+//! never forwarded, so Claude Code authenticates with the user's own sign-in
+//! (spec §11.6).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -85,4 +87,34 @@ pub fn child_env(program: &Path) -> Vec<(&'static str, OsString)> {
 pub fn apply_clean_env(command: &mut tokio::process::Command, program: &Path) {
     command.env_clear();
     command.envs(child_env(program));
+}
+
+/// Whether a variable of Argus' environment stays out of a review run:
+/// `ANTHROPIC_*` (API keys and endpoints), and the `CLAUDE*` markers a
+/// parent Claude Code session sets (its session id, entry point, ...), which
+/// would make the run act as part of that session. `CLAUDE_CONFIG_DIR`, the
+/// user's configuration, is kept.
+fn withheld(name: &str) -> bool {
+    name.starts_with("ANTHROPIC_") || (name.starts_with("CLAUDE") && name != "CLAUDE_CONFIG_DIR")
+}
+
+/// The environment of a review run: Argus' own environment without the
+/// [`withheld`] variables, with `PATH` completed as in [`child_env`].
+pub fn session_env(program: &Path) -> Vec<(OsString, OsString)> {
+    let mut vars: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(name, _)| !name.to_str().is_some_and(withheld))
+        .collect();
+    let path = child_env(program)
+        .into_iter()
+        .find(|(name, _)| *name == "PATH")
+        .map(|(_, value)| value);
+    vars.retain(|(name, _)| name != "PATH");
+    vars.extend(path.map(|path| (OsString::from("PATH"), path)));
+    vars
+}
+
+/// Clears `command`'s environment and sets [`session_env`] of `program`.
+pub fn apply_session_env(command: &mut tokio::process::Command, program: &Path) {
+    command.env_clear();
+    command.envs(session_env(program));
 }

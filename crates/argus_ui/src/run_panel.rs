@@ -315,6 +315,28 @@ impl RunPanel {
         }
     }
 
+    /// Where a listed run works and the first line of its comment, e.g.
+    /// `src/lib.rs:12 — Rename this`; `None` when the run is not listed.
+    pub fn run_context(&self, run_id: RunId) -> Option<String> {
+        let listing = self.runs.iter().find(|listing| listing.run.id == run_id)?;
+        let snippet = listing
+            .body_md
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .trim();
+        let location = if listing.run.comment_id.is_some() {
+            format!("{}:{}", listing.file_path, listing.start_line)
+        } else {
+            listing.file_path.clone()
+        };
+        Some(if snippet.is_empty() {
+            location
+        } else {
+            format!("{location} — {snippet}")
+        })
+    }
+
     /// Whether a run of this comment is being started.
     pub fn is_starting(&self, comment_id: CommentId) -> bool {
         self.starting.contains(&comment_id)

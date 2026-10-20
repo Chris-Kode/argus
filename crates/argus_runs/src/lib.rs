@@ -12,6 +12,11 @@
 //!   Claude session and worktree (`--resume`); when the session is gone,
 //!   [`RunManager::follow_up_fresh`] starts a new one with the thread as
 //!   context.
+//! - [`permission`] carries what a live run asks the reviewer (tool
+//!   permissions its `auto` permission mode does not settle, and
+//!   `AskUserQuestion`) to the permission dialog and back
+//!   ([`RunManager::subscribe_permissions`],
+//!   [`RunManager::answer_permission`]).
 //! - [`log`] folds a run's events into the rows of the run panel's live log.
 //! - [`proposal`] shows what a finished run changed (`start_sha → worktree`)
 //!   and rejects it ([`RunManager::open_proposal`], [`RunManager::reject`]).
@@ -34,6 +39,7 @@
 pub mod accept;
 pub mod claude;
 pub mod log;
+pub mod permission;
 pub mod prompt;
 pub mod proposal;
 pub mod push;
@@ -56,6 +62,7 @@ pub use accept::{
 };
 pub use claude::{ClaudeCapabilities, ClaudeCommand, ClaudeStatus, SessionMode};
 pub use log::{LogChange, LogEntry, RunLog, ToolCall};
+pub use permission::{PermissionDecision, PermissionRequest, Question, QuestionOption};
 pub use proposal::{Proposal, ProposalError, WorktreeWatch};
 pub use push::{
     PULL_BEFORE_PUSH, PushConflict, PushError, PushEvent, PushMode, PushOutcome, PushReport,
@@ -532,6 +539,30 @@ impl RunManager {
     /// replay a run from [`argus_store::RunStore::events`].
     pub fn subscribe_events(&self) -> broadcast::Receiver<RunStreamEvent> {
         self.services.subscribe_events()
+    }
+
+    /// Observes the permission requests of live runs that wait for the
+    /// reviewer, oldest first; the receiver sees every later list.
+    pub fn subscribe_permissions(&self) -> watch::Receiver<Vec<PermissionRequest>> {
+        self.services.subscribe_permissions()
+    }
+
+    /// The permission requests waiting for the reviewer, oldest first.
+    pub fn pending_permissions(&self) -> Vec<PermissionRequest> {
+        self.services.pending_permissions()
+    }
+
+    /// Answers a waiting permission request; the run carries on. Returns
+    /// `false` when the request no longer waits (withdrawn, or its run
+    /// ended). Never blocks.
+    pub fn answer_permission(
+        &self,
+        run_id: RunId,
+        request_id: &str,
+        decision: &PermissionDecision,
+    ) -> bool {
+        self.services
+            .answer_permission(run_id, request_id, decision)
     }
 
     /// Starts detecting `claude` on `runtime`: now, again whenever the
