@@ -16,7 +16,8 @@
 //!   permissions its `auto` permission mode does not settle, and
 //!   `AskUserQuestion`) to the permission dialog and back
 //!   ([`RunManager::subscribe_permissions`],
-//!   [`RunManager::answer_permission`]).
+//!   [`RunManager::answer_permission`]); [`auto_approve`] picks out the
+//!   routine ones, which are allowed without asking.
 //! - [`log`] folds a run's events into the rows of the run panel's live log.
 //! - [`proposal`] shows what a finished run changed (`start_sha → worktree`)
 //!   and rejects it ([`RunManager::open_proposal`], [`RunManager::reject`]).
@@ -37,6 +38,7 @@
 //! of the new session starts.
 
 pub mod accept;
+pub mod auto_approve;
 pub mod claude;
 pub mod log;
 pub mod permission;
@@ -117,13 +119,14 @@ impl RunManager {
     ) -> Self {
         let (sender, _) = watch::channel(settings);
         let (claude, _) = watch::channel(ClaudeStatus::Detecting);
+        let services = run::Services::new(store, git, worktrees, sender.subscribe());
         Self {
             argus_home: Arc::new(argus_home),
             settings: Arc::new(sender),
             claude: Arc::new(claude),
             recheck: Arc::new(Notify::new()),
             save_lock: Arc::new(Mutex::new(())),
-            services: Arc::new(run::Services::new(store, git, worktrees)),
+            services: Arc::new(services),
             accepts: Arc::new(accept::AcceptQueues::default()),
         }
     }

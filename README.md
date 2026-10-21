@@ -240,9 +240,17 @@ missing or too old. Each run gets its own worktree, and runs go in parallel.
 A run has everything a normal Claude Code session has: every tool, your
 settings and `CLAUDE.md`, MCP servers, skills and plugins, and your shell
 environment (minus `ANTHROPIC_*`). It works in Claude Code's `auto` permission
-mode (`acceptEdits` on a CLI without it). When Claude needs you, for a tool
-call the mode does not settle or a question it asks with `AskUserQuestion`,
-the run waits and a dialog opens. Answer a question by picking options or
+mode (`acceptEdits` on a CLI without it). Tool calls the mode still asks
+about are answered by Argus when they are routine for a run in its own
+worktree: reading, searching and editing the worktree's files, building,
+testing, linting and formatting with the usual toolchains (`cargo`, `npm`,
+`yarn`, `pnpm`, `go`, `pytest`, `make`, ...), and local `git` that only reads
+or stages. Anything else is asked: writes outside the worktree, `sudo`,
+`curl`, `ssh`, shell expansions, `rm` on the worktree itself, `git` that
+moves branches or talks to a remote, installs to the system, publishing, MCP
+tools. **Settings → Claude → Permissions → Ask every time** turns this off.
+When Claude needs you, for a risky tool call or a question it asks with
+`AskUserQuestion`, the run waits and a dialog opens. Answer a question by picking options or
 typing your own. For a tool call, choose **Allow**, **Allow for this run** or
 **Deny**, with an optional note telling Claude what to do instead. **Later**
 (`esc`) hides the dialog without answering; the run keeps waiting, and the

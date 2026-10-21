@@ -45,6 +45,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::auto_approve;
 use crate::claude::{
     AUTH_ERROR_HINT, ClaudeCapabilities, ClaudeCommand, SessionMode, is_auth_error,
 };
@@ -55,6 +56,7 @@ use crate::prompt::{
     CommentContext, Prompt, PromptError, RepoContext, ThreadMessage, comment_prompt,
     followup_prompt, fresh_followup_prompt,
 };
+use crate::settings::ClaudeSettings;
 use crate::stream::{RunResult, StreamEvent, parse_line};
 
 /// How long Stop waits after `SIGTERM` before it sends `SIGKILL`.
@@ -244,6 +246,8 @@ pub(crate) struct Services {
     /// Permission requests of live runs waiting for the reviewer, oldest
     /// first.
     permissions: watch::Sender<Vec<PermissionRequest>>,
+    /// The live run settings, for [`ClaudeSettings::auto_approve_safe`].
+    settings: watch::Receiver<ClaudeSettings>,
     active: Mutex<HashMap<RunId, ActiveRun>>,
 }
 
@@ -264,7 +268,12 @@ enum StdinMessage {
 }
 
 impl Services {
-    pub fn new(store: StorageService, git: GitService, worktrees: WorktreeManager) -> Self {
+    pub fn new(
+        store: StorageService,
+        git: GitService,
+        worktrees: WorktreeManager,
+        settings: watch::Receiver<ClaudeSettings>,
+    ) -> Self {
         let (status, _) = broadcast::channel(STATUS_CAPACITY);
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (permissions, _) = watch::channel(Vec::new());
@@ -276,6 +285,7 @@ impl Services {
             status,
             events,
             permissions,
+            settings,
             active: Mutex::new(HashMap::new()),
         }
     }
@@ -342,6 +352,30 @@ impl Services {
             "answered a permission request"
         );
         sent
+    }
+
+    /// Takes a permission request of a run working in `worktree`: answers it
+    /// at once when it is routine ([`auto_approve::is_safe`]) and the setting
+    /// allows it, otherwise queues it for the reviewer.
+    fn request_permission(
+        &self,
+        request: PermissionRequest,
+        worktree: &Path,
+        input: &mpsc::UnboundedSender<StdinMessage>,
+    ) {
+        let auto = self.settings.borrow().auto_approve_safe;
+        if auto && auto_approve::is_safe(&request, worktree) {
+            tracing::info!(
+                run = %request.run_id,
+                tool = %request.tool_name,
+                input = %request.input_preview(),
+                "allowed a routine permission request"
+            );
+            let line = request.response_line(&PermissionDecision::Allow);
+            let _ = input.send(StdinMessage::Line(line));
+            return;
+        }
+        self.add_permission(request);
     }
 
     fn add_permission(&self, request: PermissionRequest) {
@@ -1155,7 +1189,9 @@ fn handle_line(
             }
         }
         StreamEvent::Unknown(value) => match parse_control(value, run_id, run.comment_id) {
-            Some(Control::CanUseTool(request)) => services.add_permission(*request),
+            Some(Control::CanUseTool(request)) => {
+                services.request_permission(*request, run.worktree.path(), &run.input)
+            }
             Some(Control::Cancel { request_id }) => {
                 services.take_permission(run_id, &request_id);
             }

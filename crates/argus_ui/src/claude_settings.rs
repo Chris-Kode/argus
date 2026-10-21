@@ -1,6 +1,7 @@
 //! The Claude section of the settings sheet (spec §10): the `claude` binary,
-//! the default model and effort, the review rules file and the
-//! commit-message timeout.
+//! the default model and effort, whether routine permission requests are
+//! allowed without asking, the review rules file and the commit-message
+//! timeout.
 //!
 //! Text fields apply on Enter (or their Apply button). Each value is
 //! validated first; an invalid one shows an inline error and is neither
@@ -34,6 +35,10 @@ use crate::workspace::display_path;
 
 /// Width of the label column of a text-field row.
 const LABEL_WIDTH: f32 = 150.0;
+
+/// The choices of the "Permissions" row: allow routine requests
+/// ([`ClaudeSettings::auto_approve_safe`]), or ask for each one.
+const PERMISSION_CHOICES: [&str; 2] = ["Allow routine, ask risky", "Ask every time"];
 
 /// The editable text fields of the section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -486,6 +491,7 @@ impl Render for ClaudeSettingsForm {
             .into_any_element();
         let default_model = self.settings.default_model.clone();
         let default_effort = self.settings.default_effort.clone();
+        let permissions = PERMISSION_CHOICES[usize::from(!self.settings.auto_approve_safe)];
 
         div()
             .flex()
@@ -517,6 +523,16 @@ impl Render for ClaudeSettingsForm {
                 &EFFORTS,
                 &default_effort,
                 |settings, effort| settings.default_effort = effort,
+                cx,
+            ))
+            .child(self.render_choice_row(
+                "permissions",
+                "Permissions",
+                &PERMISSION_CHOICES,
+                permissions,
+                |settings, choice| {
+                    settings.auto_approve_safe = choice == PERMISSION_CHOICES[0];
+                },
                 cx,
             ))
             .child(self.render_field_row(
