@@ -604,9 +604,17 @@ impl Workspace {
                 |this, comments, event: &ReviewCommentsEvent, cx| {
                     if let ReviewCommentsEvent::Changed(change) = event {
                         this.sync_comment_badges(&comments, cx);
-                        // Comments that arrive after the diff still follow it.
-                        if let Some(CommentChange::Loaded(_)) = change {
-                            this.reanchor_comments(cx);
+                        match change {
+                            // Comments that arrive after the diff still
+                            // follow it.
+                            Some(CommentChange::Loaded(_)) => this.reanchor_comments(cx),
+                            // A dismissed or deleted comment finishes its runs.
+                            Some(CommentChange::Updated(id) | CommentChange::Deleted(id)) => {
+                                let id = *id;
+                                this.run_panel
+                                    .update(cx, |panel, cx| panel.comment_changed(id, cx));
+                            }
+                            _ => {}
                         }
                     }
                 },
@@ -714,7 +722,8 @@ impl Workspace {
                     .or_insert(marker);
                 *slot = (*slot).max(marker);
             }
-            if comment.outdated {
+            // Closed threads need nothing more; they do not nag.
+            if comment.outdated && !comment.is_closed() {
                 let first = comment.body_md.lines().next().unwrap_or_default();
                 labels.push(SharedString::from(format!(
                     "{}:{} · {first}",

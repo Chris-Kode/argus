@@ -8,6 +8,10 @@
 //! its actions: Re-attach ([`CommentListEvent::Reattach`]), Dismiss, and a
 //! disabled Run (outdated comments cannot run, spec Q5).
 //!
+//! Resolved and dismissed threads are filtered out at first ([`CLOSED`]):
+//! the list shows what still needs the reviewer. Their chips bring them
+//! back.
+//!
 //! Rows are rendered with `uniform_list` and rebuilt only when the comments
 //! or the filter change, so a review with thousands of comments stays
 //! cheap.
@@ -38,6 +42,9 @@ const STATUSES: [CommentStatus; 5] = [
     CommentStatus::Resolved,
     CommentStatus::Dismissed,
 ];
+
+/// The statuses hidden until their chip is clicked: closed threads.
+const CLOSED: [CommentStatus; 2] = [CommentStatus::Resolved, CommentStatus::Dismissed];
 
 /// What the list reports to the workspace.
 #[derive(Clone, Debug)]
@@ -82,7 +89,7 @@ impl CommentList {
         let mut this = Self {
             comments,
             snapshot: Arc::default(),
-            hidden: HashSet::new(),
+            hidden: HashSet::from(CLOSED),
             rows: Vec::new(),
             selected: None,
             scroll: UniformListScrollHandle::new(),
@@ -542,6 +549,8 @@ impl Render for CommentList {
                 "Loading comments…"
             } else if self.snapshot.is_empty() {
                 "No comments yet. Hover a line and click “+”, or press c."
+            } else if self.snapshot.iter().all(Comment::is_closed) {
+                "Nothing left to review. Click “Resolved” or “Dismissed” to list closed comments."
             } else {
                 "No comment matches the filter."
             };

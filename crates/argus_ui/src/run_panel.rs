@@ -1,7 +1,11 @@
 //! The run panel (spec §3.1, §6.3): the runs of the open repository, each
 //! with its live log.
 //!
-//! - **List.** Active runs first, then recent ones, newest first. Each run
+//! - **List.** Active runs first, then recent ones, newest first. Finished
+//!   runs (accepted, dismissed, rejected, stopped, empty, or followed by a
+//!   newer run of their comment) are folded away behind "Show finished", so
+//!   the list holds what is running or waiting for the reviewer
+//!   ([`finished_runs`]). Each run
 //!   is a card styled by its state (Panoptes #56 §3, §5): a running run is
 //!   gold with the pulsing eye, its elapsed time and its latest steps; a
 //!   run ready to review is teal with its `+n −m`; failed runs carry an
@@ -31,7 +35,7 @@ use argus_git::Sha;
 use argus_runs::log::tool_label;
 use argus_runs::stream::{AssistantContent, StreamEvent, UserContent};
 use argus_runs::{LogEntry, RunLog, RunStreamEvent, RunUpdate};
-use argus_store::{CommentId, RepoId, RunId, RunListing, RunStatus};
+use argus_store::{CommentId, CommentStatus, RepoId, RunId, RunListing, RunStatus};
 use gpui::{
     AnyElement, Context, EventEmitter, FollowMode, FontWeight, Hsla, ListAlignment, ListState,
     SharedString, Task, Window, div, list, prelude::*, px,
@@ -179,6 +183,12 @@ struct LogView {
 pub struct RunPanel {
     repo_id: Option<RepoId>,
     runs: Vec<RunListing>,
+    /// Runs that are over and done with ([`finished_runs`]).
+    finished: HashSet<RunId>,
+    /// Indices in `runs` of the cards listed.
+    shown: Vec<usize>,
+    /// Finished runs are listed too.
+    show_finished: bool,
     live: HashMap<RunId, LiveStats>,
     stopping: HashSet<RunId>,
     /// Latest steps of the live runs.
@@ -271,6 +281,9 @@ impl RunPanel {
         Self {
             repo_id: None,
             runs: Vec::new(),
+            finished: HashSet::new(),
+            shown: Vec::new(),
+            show_finished: false,
             live: HashMap::new(),
             stopping: HashSet::new(),
             steps: HashMap::new(),
@@ -298,6 +311,8 @@ impl RunPanel {
         }
         self.repo_id = repo_id;
         self.runs.clear();
+        self.finished.clear();
+        self.shown.clear();
         self.cards.reset(0);
         self.counts_task = None;
         self.selected = None;
@@ -411,6 +426,59 @@ impl RunPanel {
         self.runs.iter().find(|listing| listing.run.id == run_id)
     }
 
+    /// Whether `listing` holds a proposal waiting for review.
+    fn is_reviewable(&self, listing: &RunListing) -> bool {
+        listing.run.status == RunStatus::Succeeded && !self.finished.contains(&listing.run.id)
+    }
+
+    /// Reloads the list when `comment_id` (whose status may have changed,
+    /// e.g. dismissed) has runs listed.
+    pub fn comment_changed(&mut self, comment_id: CommentId, cx: &mut Context<Self>) {
+        if self
+            .runs
+            .iter()
+            .any(|listing| listing.run.comment_id == Some(comment_id))
+        {
+            self.reload(cx);
+        }
+    }
+
+    fn shown_ids(&self) -> Vec<RunId> {
+        self.shown
+            .iter()
+            .map(|&index| self.runs[index].run.id)
+            .collect()
+    }
+
+    /// Recomputes the finished runs and the listed cards; `before` is the
+    /// cards listed until now.
+    fn rebuild_shown(&mut self, before: Vec<RunId>) {
+        let finished = finished_runs(&self.runs);
+        self.finished = self
+            .runs
+            .iter()
+            .zip(&finished)
+            .filter(|(_, finished)| **finished)
+            .map(|(listing, _)| listing.run.id)
+            .collect();
+        self.shown = (0..self.runs.len())
+            .filter(|&index| self.show_finished || !finished[index])
+            .collect();
+        if self.shown_ids() == before {
+            // Same cards, maybe new states: keep the reading position.
+            self.cards.remeasure();
+        } else {
+            self.cards.splice(0..before.len(), self.shown.len());
+        }
+    }
+
+    fn toggle_finished(&mut self, cx: &mut Context<Self>) {
+        let before = self.shown_ids();
+        self.show_finished = !self.show_finished;
+        self.rebuild_shown(before);
+        cx.notify();
+    }
+
     /// Reloads the list from storage; replacing the task cancels a reload
     /// in flight.
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -443,15 +511,9 @@ impl RunPanel {
                             runs.iter()
                                 .any(|l| l.run.id == *id && l.run.status.is_active())
                         });
-                        let old = this.runs.len();
+                        let before = this.shown_ids();
                         this.runs = runs;
-                        if old == this.runs.len() {
-                            // Same cards, maybe new states: keep the reading
-                            // position.
-                            this.cards.remeasure();
-                        } else {
-                            this.cards.splice(0..old, this.runs.len());
-                        }
+                        this.rebuild_shown(before);
                         this.load_line_counts(cx);
                     }
                     Ok(Ok(_)) => {}
@@ -614,7 +676,7 @@ impl RunPanel {
         let wanted: Vec<(RunId, PathBuf, Option<Sha>)> = self
             .runs
             .iter()
-            .filter(|listing| listing.run.status == RunStatus::Succeeded)
+            .filter(|listing| self.is_reviewable(listing))
             .filter(|listing| !self.line_counts.contains_key(&listing.run.id))
             .map(|listing| {
                 (
@@ -753,10 +815,25 @@ impl RunPanel {
                         .font_family(theme.fonts.code_family.clone())
                         .text_size(px(MONO_TEXT))
                         .text_color(colors.text_placeholder)
-                        .child(self.runs.len().to_string()),
+                        .child(self.shown.len().to_string()),
                 )
             })
             .child(div().flex_1())
+            .when(!self.finished.is_empty(), |header| {
+                header.child(
+                    button(
+                        "runs-show-finished",
+                        if self.show_finished {
+                            "Hide finished".to_owned()
+                        } else {
+                            format!("Show finished ({})", self.finished.len())
+                        },
+                        cx,
+                    )
+                    .text_xs()
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_finished(cx))),
+                )
+            })
             .when(cost > 0.0, |header| {
                 header.child(
                     div()
@@ -771,7 +848,7 @@ impl RunPanel {
 
     /// One run card, with its share of the list's padding and gaps.
     fn render_card(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let Some(listing) = self.runs.get(index) else {
+        let Some(listing) = self.shown.get(index).and_then(|&run| self.runs.get(run)) else {
             return div().into_any_element();
         };
         let theme = cx.theme().clone();
@@ -782,7 +859,8 @@ impl RunPanel {
         let comment_id = run.comment_id;
         let status = run.status;
         let selected = self.selected == Some(id);
-        let style = card_style(status, colors);
+        let finished = self.finished.contains(&id);
+        let style = card_style(status, finished.then_some(listing.comment_status), colors);
 
         let snippet = listing
             .body_md
@@ -808,7 +886,7 @@ impl RunPanel {
             meta.push(format_cost(cost));
         }
         let elapsed = format_elapsed(elapsed_ms(run, now_ms()));
-        let line_counts = (status == RunStatus::Succeeded)
+        let line_counts = (status == RunStatus::Succeeded && !finished)
             .then(|| self.line_counts.get(&id).copied().flatten())
             .flatten();
 
@@ -1014,7 +1092,7 @@ impl RunPanel {
             .child(location_row)
             .children(steps)
             .children(stop);
-        let last = index + 1 == self.runs.len();
+        let last = index + 1 == self.shown.len();
         div()
             .px(px(LIST_PADDING))
             .when(index == 0, |item| item.pt(px(LIST_PADDING)))
@@ -1024,13 +1102,15 @@ impl RunPanel {
     }
 
     fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.runs.is_empty() {
+        if self.shown.is_empty() {
             let text = if self.repo_id.is_none() {
                 "No repository open."
-            } else if self.list_task.is_some() {
+            } else if self.list_task.is_some() && self.runs.is_empty() {
                 "Loading runs…"
-            } else {
+            } else if self.runs.is_empty() {
                 "No runs yet. Comment on a line and run it with Claude (r)."
+            } else {
+                "Nothing running or waiting for review."
             };
             return placeholder(text, cx).into_any_element();
         }
@@ -1054,7 +1134,7 @@ impl RunPanel {
             .filter(|listing| listing.run.status != RunStatus::Rejected)
             .map(|listing| listing.run.worktree_path.clone());
         let proposal = listing
-            .filter(|listing| listing.run.status == RunStatus::Succeeded)
+            .filter(|listing| self.is_reviewable(listing))
             .map(|listing| listing.run.id);
         let toolbar =
             div()
@@ -1537,7 +1617,13 @@ struct CardStyle {
     secondary: Hsla,
 }
 
-fn card_style(status: RunStatus, colors: &ThemeColors) -> CardStyle {
+/// The style of a card; `finished` is `Some(comment status)` for a run that
+/// is over and done with.
+fn card_style(
+    status: RunStatus,
+    finished: Option<Option<CommentStatus>>,
+    colors: &ThemeColors,
+) -> CardStyle {
     let quiet = |text, label| CardStyle {
         text,
         label,
@@ -1547,6 +1633,11 @@ fn card_style(status: RunStatus, colors: &ThemeColors) -> CardStyle {
         secondary: colors.text_placeholder,
     };
     match status {
+        RunStatus::Succeeded if finished.is_some() => match finished.flatten() {
+            Some(CommentStatus::Resolved) => quiet("Accepted", colors.text_muted),
+            Some(CommentStatus::Dismissed) => quiet("Dismissed", colors.text_placeholder),
+            _ => quiet("Followed up", colors.text_placeholder),
+        },
         RunStatus::Queued => CardStyle {
             summary: colors.text,
             secondary: colors.text_muted,
@@ -1580,6 +1671,43 @@ fn card_style(status: RunStatus, colors: &ThemeColors) -> CardStyle {
         RunStatus::Stopped => quiet("Stopped", colors.text_placeholder),
         RunStatus::Rejected => quiet("Rejected", colors.text_placeholder),
     }
+}
+
+/// Whether each of `runs` is over and done with: not active, and not the
+/// latest run of its comment when that run is a proposal waiting for review
+/// or a failure the comment is still open with.
+fn finished_runs(runs: &[RunListing]) -> Vec<bool> {
+    let mut latest: HashMap<CommentId, i64> = HashMap::new();
+    for listing in runs {
+        if let Some(comment_id) = listing.run.comment_id {
+            let at = latest.entry(comment_id).or_insert(listing.run.created_at);
+            *at = (*at).max(listing.run.created_at);
+        }
+    }
+    runs.iter()
+        .map(|listing| {
+            let run = &listing.run;
+            let is_latest = run
+                .comment_id
+                .is_none_or(|comment_id| latest.get(&comment_id) == Some(&run.created_at));
+            let waiting = match run.status {
+                RunStatus::Queued | RunStatus::Running => true,
+                RunStatus::Succeeded => {
+                    is_latest
+                        && matches!(listing.comment_status, None | Some(CommentStatus::Proposed))
+                }
+                RunStatus::Failed => {
+                    is_latest
+                        && !matches!(
+                            listing.comment_status,
+                            Some(CommentStatus::Resolved | CommentStatus::Dismissed)
+                        )
+                }
+                RunStatus::NoChanges | RunStatus::Stopped | RunStatus::Rejected => false,
+            };
+            !waiting
+        })
+        .collect()
 }
 
 fn now_ms() -> i64 {

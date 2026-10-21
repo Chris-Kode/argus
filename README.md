@@ -215,7 +215,10 @@ status chip (Open, Running, Proposed, Resolved, Dismissed), replies and a menu
 to edit, delete, dismiss or reopen. `]c` / `[c` jump between threads, `shift-c`
 folds them all, and the "Comments" tab of the left dock (`cmd-shift-c`) lists
 every thread by file, filterable by status. File-tree rows show a comment
-count. Debug builds add "Advance status (debug)" to the thread menu, to walk
+count. Closed threads (Resolved after Accept, or Dismissed) leave the diff
+and the Comments tab, so both show only what still needs you: the toolbar's
+**Show closed** puts them back inline, and the Resolved and Dismissed chips
+list them again. Debug builds add "Advance status (debug)" to the thread menu, to walk
 the status chips by hand.
 
 Comments follow their code. Every time the diff is refreshed (branch change,
@@ -251,7 +254,10 @@ mode, a run can never `git commit`, `git push`, or edit files in your own
 checkout.
 
 The run panel (`cmd-j`, docked right or bottom with `cmd-shift-j`) lists the
-repository's active runs first, then recent ones. Each row shows the comment,
+repository's active runs first, then the ones waiting for you: a proposal to
+review, or a failure on a comment that is still open. Finished runs (accepted,
+rejected, dismissed, stopped, empty, or followed by a newer run of the same
+comment) fold behind the header's **Show finished**. Each row shows the comment,
 `file:line`, model and effort, status, elapsed time, turns, cost and a Stop
 button, and the header totals the active runs and their cost. Clicking a row
 jumps to its comment and shows the run's live log: assistant text as
