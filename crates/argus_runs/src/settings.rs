@@ -98,6 +98,10 @@ pub struct ClaudeSettings {
     /// How long the Haiku commit-message call may take before the commit
     /// dialog opens with an empty body (spec §6.4), in seconds.
     pub commit_message_timeout_s: u64,
+    /// Allow the permission requests of runs that
+    /// [`auto_approve::is_safe`](crate::auto_approve::is_safe) recognizes
+    /// as routine, instead of asking in the permission dialog.
+    pub auto_approve_safe: bool,
 }
 
 impl Default for ClaudeSettings {
@@ -108,6 +112,7 @@ impl Default for ClaudeSettings {
             default_effort: DEFAULT_EFFORT.to_owned(),
             review_rules_path: None,
             commit_message_timeout_s: DEFAULT_COMMIT_MESSAGE_TIMEOUT_S,
+            auto_approve_safe: true,
         }
     }
 }
