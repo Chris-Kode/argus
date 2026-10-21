@@ -221,14 +221,19 @@ the status chips by hand.
 Comments follow their code. Every time the diff is refreshed (branch change,
 Fetch, Accept), each comment looks for its lines and their context in the new
 diff: unchanged, moved (lines inserted above, or the file renamed), or gone.
-When the code is gone, the comment becomes **outdated**. Outdated comments are
-not shown inline. They are listed in the "Outdated" group of the file tree and
-the Comments tab, which shows the original code at its original line numbers.
-From there, **Re-attach…** lets you pick new lines in the diff (gutter "+",
-`c` on a selection, or Save in the bar), and **Dismiss** closes the comment.
-Outdated comments cannot be run. A comment that finds its code again (for
-example after a revert) is no longer outdated. Resolved comments are moved
-too, but are never flagged outdated.
+A commit that edits the lines around a comment does not lose it: the commented
+lines are found again by themselves, and lines edited in place are found
+between their unchanged neighbours. When the code is really gone, the comment
+becomes **outdated**. Outdated comments are not shown inline. They are listed
+in the "Outdated" group of the file tree and the Comments tab, which shows the
+original code at its original line numbers. From there, **Re-attach…** scrolls
+the diff to where the code was and selects those lines, so Save re-attaches it
+there (or pick other lines: gutter "+", `c` on a selection), and **Dismiss**
+closes the comment. Outdated comments cannot be run. A comment that finds its
+code again (for example after a revert) is no longer outdated. Resolved
+comments are moved too, but are never flagged outdated, and neither are
+running or proposed ones while their file is still in the diff: they keep
+their place, with the run's progress and the proposal's Accept.
 
 Run a comment with Claude from its thread: the "Run · sonnet · medium ▾"
 split button runs with the shown model and effort, and its arrow opens the Run
