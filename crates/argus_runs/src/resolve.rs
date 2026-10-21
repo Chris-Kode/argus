@@ -795,6 +795,7 @@ pub(crate) async fn listings(
                 start_line: 0,
                 end_line: 0,
                 body_md: format!("{what}: {}", session.stop.subject),
+                comment_status: None,
                 run,
             });
         }

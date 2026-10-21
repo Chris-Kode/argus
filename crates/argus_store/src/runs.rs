@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{OptionalExtension as _, Row, params};
 
 use crate::error::Result;
-use crate::model::{CommentId, RepoId, RunId, RunKind, RunStatus};
+use crate::model::{CommentId, CommentStatus, RepoId, RunId, RunKind, RunStatus};
 use crate::writer::PendingEvent;
 use crate::{StorageService, expect_changed, now_ms, path_to_text};
 
@@ -135,6 +135,8 @@ pub struct RunListing {
     pub end_line: u32,
     /// The comment's Markdown body.
     pub body_md: String,
+    /// The comment's status; `None` for a run without a comment.
+    pub comment_status: Option<CommentStatus>,
 }
 
 const COLUMNS: &str = "id, comment_id, kind, session_id, model, effort, worktree_path, \
@@ -383,7 +385,8 @@ impl RunStore {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let mut stmt = conn.prepare_cached(&format!(
-                    "SELECT {columns}, c.file_path, c.start_line, c.end_line, c.body_md
+                    "SELECT {columns}, c.file_path, c.start_line, c.end_line, c.body_md,
+                            c.status
                      FROM runs r JOIN comments c ON c.id = r.comment_id
                      WHERE c.repo_id = ?1
                      ORDER BY r.created_at DESC, r.id DESC
@@ -396,6 +399,7 @@ impl RunStore {
                         start_line: row.get(19)?,
                         end_line: row.get(20)?,
                         body_md: row.get(21)?,
+                        comment_status: Some(row.get(22)?),
                     })
                 })?;
                 Ok(rows.collect::<rusqlite::Result<_>>()?)

@@ -23,6 +23,11 @@
 //!   arrow opens the Run menu with every model and effort on offer.
 //!   The run manager makes the choice the new default once the run starts.
 //!
+//! - **Closed threads** (resolved or dismissed) leave the diff, so it shows
+//!   only what still needs the reviewer. "Show closed" in the toolbar puts
+//!   them back ([`DiffView::toggle_closed_threads`]); revealing one from the
+//!   Comments list does too.
+//!
 //! - **Outdated comments** (spec §7.3) are not shown inline: their code is
 //!   gone. The Comments list shows them with their stored snippet. Its
 //!   Re-attach action puts the view in re-attach mode
@@ -194,8 +199,10 @@ pub(super) struct FileThreads {
 #[derive(Default)]
 pub(super) struct Threads {
     snapshot: Arc<Vec<Comment>>,
-    /// Snapshot indices by file path.
+    /// Snapshot indices of the inline threads, by file path.
     by_path: HashMap<String, Vec<usize>>,
+    /// Resolved and dismissed threads are shown inline too.
+    show_closed: bool,
     /// Threads whose fold differs from the default (expanded, or collapsed
     /// for outdated ones).
     toggled: HashSet<CommentId>,
@@ -282,8 +289,67 @@ impl DiffView {
         self.path_index.get(&comment.anchor.file_path).copied()
     }
 
-    /// Current (not outdated) comments anchored in `file`, by line and
-    /// creation time.
+    /// Whether `comment` is inline: not outdated, and not closed unless
+    /// closed threads are shown.
+    fn is_inline(&self, comment: &Comment) -> bool {
+        !comment.outdated && (self.threads.show_closed || !comment.is_closed())
+    }
+
+    /// Indexes the inline threads of the snapshot by file path, and drops
+    /// the focus of a thread no longer inline.
+    fn index_threads(&mut self) {
+        let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
+        for (index, comment) in self.threads.snapshot.iter().enumerate() {
+            if self.is_inline(comment) {
+                by_path
+                    .entry(comment.anchor.file_path.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+        self.threads.by_path = by_path;
+        // Keys act on the focused thread; a hidden one is out of reach.
+        if self
+            .threads
+            .focused
+            .is_some_and(|id| self.comment(id).is_none_or(|c| !self.is_inline(c)))
+        {
+            self.threads.focused = None;
+        }
+    }
+
+    /// Re-places the threads of every loaded file, keeping the reading
+    /// position.
+    fn place_all_threads(&mut self) {
+        self.with_scroll_anchor(|this| {
+            for file in 0..this.files.len() {
+                if this.files[file].loaded().is_some() {
+                    this.reveal_commented(file);
+                    this.place_threads(file);
+                }
+            }
+        });
+    }
+
+    /// Number of resolved and dismissed threads that have a place in the
+    /// diff.
+    fn closed_count(&self) -> usize {
+        self.threads
+            .snapshot
+            .iter()
+            .filter(|comment| !comment.outdated && comment.is_closed())
+            .count()
+    }
+
+    /// Shows or hides the resolved and dismissed threads.
+    pub fn toggle_closed_threads(&mut self, cx: &mut Context<Self>) {
+        self.threads.show_closed = !self.threads.show_closed;
+        self.index_threads();
+        self.place_all_threads();
+        cx.notify();
+    }
+
+    /// Inline comments anchored in `file`, by line and creation time.
     fn file_comments(&self, file: usize) -> Vec<&Comment> {
         let ListStatus::Ready(list) = &self.status else {
             return Vec::new();
@@ -365,15 +431,7 @@ impl DiffView {
     /// state of deleted threads and re-places every loaded file.
     pub(super) fn comments_changed(&mut self, cx: &mut Context<Self>) {
         let snapshot = self.comments.read(cx).comments().clone();
-        let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
-        for (index, comment) in snapshot.iter().enumerate() {
-            // Outdated threads are not inline (spec §7.3).
-            if !comment.outdated {
-                by_path
-                    .entry(comment.anchor.file_path.clone())
-                    .or_default()
-                    .push(index);
-            }
+        for comment in snapshot.iter() {
             self.threads
                 .markdown
                 .prepare(&comment.body_md, markdown_cache, cx);
@@ -384,6 +442,29 @@ impl DiffView {
             }
         }
         let ids: HashSet<CommentId> = snapshot.iter().map(|comment| comment.id).collect();
+        if !self.threads.show_closed {
+            // A thread closing here (Accept, Dismiss) leaves the diff; say
+            // where it went.
+            let was_open: HashSet<CommentId> = self
+                .threads
+                .snapshot
+                .iter()
+                .filter(|comment| !comment.is_closed())
+                .map(|comment| comment.id)
+                .collect();
+            let closed = snapshot
+                .iter()
+                .find(|comment| comment.is_closed() && was_open.contains(&comment.id));
+            if let Some(comment) = closed {
+                self.hint = Some(
+                    format!(
+                        "Comment {} and hidden. “Show closed” in the toolbar brings it back.",
+                        comment.status
+                    )
+                    .into(),
+                );
+            }
+        }
         let threads = &mut self.threads;
         threads.toggled.retain(|id| ids.contains(id));
         threads.edits.retain(|id, _| ids.contains(id));
@@ -409,16 +490,9 @@ impl DiffView {
             threads.reattach = None;
         }
         threads.snapshot = snapshot;
-        threads.by_path = by_path;
+        self.index_threads();
         self.load_proposals(cx);
-        self.with_scroll_anchor(|this| {
-            for file in 0..this.files.len() {
-                if this.files[file].loaded().is_some() {
-                    this.reveal_commented(file);
-                    this.place_threads(file);
-                }
-            }
-        });
+        self.place_all_threads();
         self.reveal_pending(cx);
         if let Some(id) = self.threads.reveal_reattached
             && self.comment(id).is_none_or(|comment| !comment.outdated)
@@ -1154,7 +1228,7 @@ impl DiffView {
         self.threads
             .snapshot
             .iter()
-            .filter(|comment| !comment.outdated)
+            .filter(|comment| self.is_inline(comment))
             .all(|comment| self.is_collapsed(comment))
     }
 
@@ -1634,7 +1708,7 @@ impl DiffView {
             .threads
             .snapshot
             .iter()
-            .filter(|comment| !comment.outdated)
+            .filter(|comment| self.is_inline(comment))
             .filter_map(|comment| {
                 let file = *self.path_index.get(&comment.anchor.file_path)?;
                 let row = self
@@ -1678,6 +1752,11 @@ impl DiffView {
             return;
         };
         self.threads.focused = Some(id);
+        if !self.threads.show_closed && self.comment(id).is_some_and(Comment::is_closed) {
+            self.threads.show_closed = true;
+            self.index_threads();
+            self.place_all_threads();
+        }
         if self.files[file].collapsed {
             self.relayout(|this| this.files[file].collapsed = false);
         }
@@ -1685,7 +1764,7 @@ impl DiffView {
             .comment(id)
             .is_some_and(|comment| self.is_collapsed(comment))
         {
-            self.threads.toggled.insert(id);
+            self.threads.toggled.remove(&id);
             self.threads.heights.remove(&BlockKey::Thread(id));
             self.with_scroll_anchor(|this| this.place_threads(file));
         }
@@ -1721,14 +1800,17 @@ impl DiffView {
 
     // ---- rendering --------------------------------------------------------
 
-    /// The comment summary and "Collapse all" of the toolbar.
+    /// The comment summary, "Show closed" and "Collapse all" of the
+    /// toolbar.
     pub(super) fn render_comments_toolbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let count = self.threads.snapshot.len();
-        if count == 0 {
+        if self.threads.snapshot.is_empty() {
             return None;
         }
+        let closed = self.closed_count();
+        let count = self.threads.snapshot.len() - closed;
         let colors = cx.theme().colors.clone();
         let collapsed = self.all_threads_collapsed();
+        let show_closed = self.threads.show_closed;
         Some(
             div()
                 .flex()
@@ -1739,6 +1821,22 @@ impl DiffView {
                     "{count} comment{}",
                     if count == 1 { "" } else { "s" }
                 )))
+                .when(closed > 0, |toolbar| {
+                    toolbar.child(
+                        button(
+                            "diff-show-closed",
+                            if show_closed {
+                                "Hide closed".to_owned()
+                            } else {
+                                format!("Show closed ({closed})")
+                            },
+                            cx,
+                        )
+                        .text_xs()
+                        .tooltip(text_tooltip("Resolved and dismissed comments"))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_closed_threads(cx))),
+                    )
+                })
                 .child(
                     button(
                         "diff-collapse-comments",
