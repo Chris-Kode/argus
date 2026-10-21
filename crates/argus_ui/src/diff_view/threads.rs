@@ -26,8 +26,9 @@
 //! - **Outdated comments** (spec §7.3) are not shown inline: their code is
 //!   gone. The Comments list shows them with their stored snippet. Its
 //!   Re-attach action puts the view in re-attach mode
-//!   ([`DiffView::start_reattach`]): the next line or range picked (gutter
-//!   "+", `c`, or a selection and Save) becomes the comment's new anchor.
+//!   ([`DiffView::start_reattach`]), scrolled to the old lines and with them
+//!   selected: the next line or range picked (gutter "+", `c`, or a
+//!   selection and Save) becomes the comment's new anchor.
 //!
 //! [`ReviewComments`]: crate::comments::ReviewComments
 
@@ -1418,13 +1419,59 @@ impl DiffView {
     /// Enters re-attach mode for an outdated comment: the next line or range
     /// picked in the diff becomes its anchor (spec §7.3).
     pub fn start_reattach(&mut self, id: CommentId, cx: &mut Context<Self>) {
-        if self.comment(id).is_none() {
+        let Some(comment) = self.comment(id).cloned() else {
             return;
-        }
+        };
         self.threads.reattach = Some(Reattach { id, saving: false });
         self.hint = None;
         self.focus_requested = true;
+        self.show_old_place(&comment, cx);
         cx.notify();
+    }
+
+    /// Scrolls to where an outdated comment's code was and, when its file is
+    /// loaded and those lines are not folded away, selects them: after a
+    /// commit the code is usually still around there, so Save (or a small
+    /// adjustment) re-attaches it.
+    fn show_old_place(&mut self, comment: &Comment, cx: &mut Context<Self>) {
+        let anchor = &comment.anchor;
+        let Some(file) = [Some(&anchor.file_path), anchor.old_file_path.as_ref()]
+            .into_iter()
+            .flatten()
+            .find_map(|path| self.path_index.get(path).copied())
+        else {
+            return;
+        };
+        self.reveal_file(file, cx);
+        let Some(loaded) = self.files[file].loaded() else {
+            return;
+        };
+        let Some(text) = loaded.diff.text() else {
+            return;
+        };
+        let line_count = text.source(anchor.side).line_count().max(1);
+        let start = anchor.start_line.min(line_count);
+        let end = anchor.end_line.clamp(start, line_count);
+        let rows = &loaded.rows.rows;
+        let found = layout::anchor_rows(text, rows, &[(anchor.side, start), (anchor.side, end)]);
+        let (Some(first), Some(last)) = (found[0], found[1]) else {
+            return;
+        };
+        let side = loaded.rows.split.then_some(anchor.side);
+        self.selection = Some(super::Selection {
+            file,
+            side,
+            anchor: first,
+            head: last,
+        });
+        if !matches!(self.selection(), Some(Ok(_))) {
+            self.selection = None;
+        }
+        self.scroll_to_row(
+            (self.starts[file] + first).saturating_sub(REVEAL_OFFSET),
+            cx,
+        );
+        self.revealed_at = Some(self.scroll_top());
     }
 
     /// Whether the view is waiting for the lines to re-attach a comment to.
