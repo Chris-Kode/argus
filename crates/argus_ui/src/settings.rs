@@ -47,6 +47,14 @@ pub const MAX_TAB_WIDTH: u32 = 16;
 /// Seconds between two background fetches of the head's upstream.
 pub const BACKGROUND_FETCH_INTERVAL_SECS: u64 = 60;
 
+/// Narrowest diff area, in pixels, that [`DiffViewMode::Auto`] shows side by
+/// side; below it the columns would cut most lines.
+pub const AUTO_SPLIT_MIN_WIDTH: f32 = 1100.0;
+
+/// Revision of the layout defaults. Records saved under an older one get
+/// the newer defaults once (see [`UiSettings::sanitized`]).
+const LAYOUT_REVISION: u32 = 1;
+
 /// Every persisted setting, as loaded at startup.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
@@ -100,27 +108,39 @@ impl RunPanelPosition {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffViewMode {
+    /// Side by side when the diff area is at least
+    /// [`AUTO_SPLIT_MIN_WIDTH`] wide, unified otherwise.
+    #[default]
+    Auto,
     /// One column with old and new line numbers.
     Unified,
-    /// Old and new columns side by side (spec §3.1 default).
-    #[default]
+    /// Old and new columns side by side.
     SideBySide,
 }
 
 impl DiffViewMode {
+    /// Every mode, in the order the settings offer them.
+    pub const ALL: [DiffViewMode; 3] = [
+        DiffViewMode::Auto,
+        DiffViewMode::SideBySide,
+        DiffViewMode::Unified,
+    ];
+
     /// Human-readable label.
     pub fn label(self) -> &'static str {
         match self {
+            DiffViewMode::Auto => "Auto",
             DiffViewMode::Unified => "Unified",
             DiffViewMode::SideBySide => "Side by side",
         }
     }
 
-    /// The other mode.
-    pub fn toggled(self) -> Self {
+    /// Whether the diff shows side by side in an area `width` pixels wide.
+    pub fn is_split(self, width: f32) -> bool {
         match self {
-            DiffViewMode::Unified => DiffViewMode::SideBySide,
-            DiffViewMode::SideBySide => DiffViewMode::Unified,
+            DiffViewMode::Auto => width >= AUTO_SPLIT_MIN_WIDTH,
+            DiffViewMode::Unified => false,
+            DiffViewMode::SideBySide => true,
         }
     }
 }
@@ -164,7 +184,9 @@ pub struct RunPanelDock {
 impl Default for RunPanelDock {
     fn default() -> Self {
         Self {
-            visible: true,
+            // Threads show a run's progress and its proposal; the log is
+            // opened on demand (⌘J or "What Claude did").
+            visible: false,
             position: RunPanelPosition::Right,
             width: DEFAULT_RUN_PANEL_WIDTH,
             height: DEFAULT_RUN_PANEL_HEIGHT,
@@ -208,6 +230,13 @@ pub struct UiSettings {
     /// Fetch the head's upstream every [`BACKGROUND_FETCH_INTERVAL_SECS`]
     /// seconds so the Push counts stay current (spec §5.4).
     pub background_fetch: bool,
+    /// Patterns of files left out of the file tree and the main diff (see
+    /// [`crate::hidden_files`]), in the order they were added.
+    pub hidden_files: Vec<String>,
+    /// [`LAYOUT_REVISION`] the record was saved under; missing in records
+    /// older than the field.
+    #[serde(default)]
+    pub layout_revision: u32,
 }
 
 impl Default for UiSettings {
@@ -227,6 +256,8 @@ impl Default for UiSettings {
             diff_view_mode: DiffViewMode::default(),
             diff_link_horizontal_scroll: true,
             background_fetch: true,
+            hidden_files: Vec::new(),
+            layout_revision: LAYOUT_REVISION,
         }
     }
 }
@@ -283,8 +314,19 @@ impl UiSettings {
         self.run_panel = RunPanelDock::default();
     }
 
-    /// Clamps values a hand-edited or corrupted record could put out of range.
+    /// Clamps values a hand-edited or corrupted record could put out of
+    /// range, and brings a record saved under older layout defaults to the
+    /// current ones.
     pub fn sanitized(mut self) -> Self {
+        if self.layout_revision < 1 {
+            // Revision 1: the run panel opens on demand, and the diff picks
+            // its layout from the available width.
+            self.run_panel.visible = false;
+            if self.diff_view_mode == DiffViewMode::SideBySide {
+                self.diff_view_mode = DiffViewMode::Auto;
+            }
+        }
+        self.layout_revision = LAYOUT_REVISION;
         self.ui_font_size = clamp_font_size(self.ui_font_size, DEFAULT_UI_FONT_SIZE);
         self.code_font_size = clamp_font_size(self.code_font_size, DEFAULT_CODE_FONT_SIZE);
         self.file_tree.width = clamp_dock_size(self.file_tree.width, DEFAULT_FILE_TREE_WIDTH);

@@ -309,6 +309,7 @@ dependencies = [
  "gpui_platform",
  "libc",
  "pulldown-cmark",
+ "regex",
  "serde",
  "thiserror 2.0.21",
  "tokio",

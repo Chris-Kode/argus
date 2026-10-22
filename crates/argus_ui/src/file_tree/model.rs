@@ -16,96 +16,6 @@ use gpui::SharedString;
 
 use crate::fuzzy::FuzzyQuery;
 
-/// The change-kind groups the filter can toggle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum KindGroup {
-    /// New files.
-    Added,
-    /// Content, mode or type changes.
-    Modified,
-    /// Removed files.
-    Deleted,
-    /// Moved files.
-    Renamed,
-}
-
-impl KindGroup {
-    /// Every group, in the order the filter chips show them.
-    pub const ALL: [KindGroup; 4] = [
-        KindGroup::Added,
-        KindGroup::Modified,
-        KindGroup::Deleted,
-        KindGroup::Renamed,
-    ];
-
-    /// The group a change kind belongs to.
-    pub fn of(kind: ChangeKind) -> Self {
-        match kind {
-            ChangeKind::Added => KindGroup::Added,
-            ChangeKind::Deleted => KindGroup::Deleted,
-            ChangeKind::Renamed => KindGroup::Renamed,
-            ChangeKind::Modified | ChangeKind::ModeChanged | ChangeKind::TypeChanged => {
-                KindGroup::Modified
-            }
-        }
-    }
-
-    /// One-letter label of the filter chip.
-    pub fn letter(self) -> &'static str {
-        match self {
-            KindGroup::Added => "A",
-            KindGroup::Modified => "M",
-            KindGroup::Deleted => "D",
-            KindGroup::Renamed => "R",
-        }
-    }
-
-    /// Tooltip-style description.
-    pub fn label(self) -> &'static str {
-        match self {
-            KindGroup::Added => "Added",
-            KindGroup::Modified => "Modified",
-            KindGroup::Deleted => "Deleted",
-            KindGroup::Renamed => "Renamed",
-        }
-    }
-
-    fn bit(self) -> u8 {
-        match self {
-            KindGroup::Added => 1,
-            KindGroup::Modified => 2,
-            KindGroup::Deleted => 4,
-            KindGroup::Renamed => 8,
-        }
-    }
-}
-
-/// The set of change-kind groups shown; empty means "all".
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct KindFilter(u8);
-
-impl KindFilter {
-    /// Whether no kind restriction applies.
-    pub fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
-    /// Whether `group` is explicitly selected.
-    pub fn contains(self, group: KindGroup) -> bool {
-        self.0 & group.bit() != 0
-    }
-
-    /// Adds or removes `group`.
-    pub fn toggle(&mut self, group: KindGroup) {
-        self.0 ^= group.bit();
-    }
-
-    /// Whether a file of `kind` passes.
-    pub fn allows(self, kind: ChangeKind) -> bool {
-        self.is_empty() || self.contains(KindGroup::of(kind))
-    }
-}
-
 /// The badge letter of a change kind (`T` for a type change, `M` for a mode
 /// change, as `git status` shows them).
 pub fn kind_letter(kind: ChangeKind) -> &'static str {
@@ -194,8 +104,9 @@ pub struct View<'a> {
     pub flat: bool,
     /// Fuzzy path filter.
     pub query: &'a FuzzyQuery,
-    /// Change-kind filter.
-    pub kinds: KindFilter,
+    /// By file-list index: files left out whatever the filter (hidden-file
+    /// patterns). Shorter than the list (e.g. empty) hides nothing more.
+    pub hidden: &'a [bool],
     /// Collapsed directory paths (ignored while a filter is active, which
     /// shows every match).
     pub collapsed: &'a HashSet<SharedString>,
@@ -205,7 +116,7 @@ pub struct View<'a> {
 
 impl View<'_> {
     fn filtering(&self) -> bool {
-        !self.query.is_empty() || !self.kinds.is_empty()
+        !self.query.is_empty()
     }
 }
 
@@ -378,8 +289,9 @@ impl TreeIndex {
     fn matches(&self, view: &View<'_>) -> Vec<Option<i32>> {
         self.files
             .iter()
-            .map(|file| {
-                if !view.kinds.allows(file.kind) {
+            .enumerate()
+            .map(|(index, file)| {
+                if view.hidden.get(index).copied().unwrap_or(false) {
                     return None;
                 }
                 let score = view.query.score(&file.path);

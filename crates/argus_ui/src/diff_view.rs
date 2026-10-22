@@ -85,6 +85,14 @@
 //! sit in collapsed context are revealed ([`layout::reveal_lines`]), so a
 //! thread made on expanded context comes back at its line after a restart.
 //! See [`threads`].
+//!
+//! # Hidden files
+//!
+//! Files matched by the hidden-file patterns ([`HiddenFiles`]) take no rows:
+//! they are never loaded, highlighted or reached by `j`/`k`, and the totals
+//! leave them out. Their mask is computed on the tokio runtime with the
+//! file list, and again when the patterns change. Proposal views hide
+//! nothing: a run's whole change is always shown before it is accepted.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
@@ -113,12 +121,12 @@ use gpui::{
 use crate::AppContext;
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
-    BadgeSize, button, chip, claude_activity, kbd, letter_badge, muted_button_with_icon,
-    placeholder, radius, toggle_button,
+    BadgeSize, button, chip, claude_activity, letter_badge, muted_button_with_icon, placeholder,
+    radius,
 };
+use crate::hidden_files::HiddenFiles;
 use crate::icons::{IconName, icon};
 use crate::jobs::BackgroundJobs;
-use crate::keymap::ToggleSoftWrap;
 use crate::perf;
 use crate::runtime::spawn_job;
 use crate::session::DiffTarget;
@@ -224,6 +232,10 @@ pub enum DiffViewEvent {
     /// A proposal's "Open in editor" on a changed file (repository-relative
     /// path).
     OpenInEditor(String),
+    /// "What Claude did" on a thread: open this run's log.
+    ShowRunLog(argus_store::RunId),
+    /// "Running…" on a thread: open the log of the comment's live run.
+    ShowCommentRun(argus_diff::review::CommentId),
 }
 
 /// How lines are displayed; persisted in the UI settings.
@@ -348,6 +360,8 @@ struct FileSlot {
     /// Rows when expanded (header included).
     full_len: usize,
     collapsed: bool,
+    /// Matched by a hidden-file pattern: no rows at all.
+    hidden: bool,
     viewed: bool,
     expansions: Vec<GapExpansion>,
     mode: LoadMode,
@@ -361,12 +375,13 @@ struct FileSlot {
 }
 
 impl FileSlot {
-    fn new(stats: Option<FileStats>, viewed: bool, mode: ViewMode) -> Self {
+    fn new(stats: Option<FileStats>, viewed: bool, hidden: bool, mode: ViewMode) -> Self {
         Self {
             full_len: layout::estimate_rows(stats.as_ref(), mode),
             stats,
             state: FileState::Pending,
             collapsed: viewed,
+            hidden,
             viewed,
             expansions: Vec::new(),
             mode: LoadMode::Normal,
@@ -378,8 +393,11 @@ impl FileSlot {
     }
 
     /// Rows the file takes in the list: its layout rows (only the header
-    /// when collapsed) and the card spacer after them.
+    /// when collapsed) and the card spacer after them; none when hidden.
     fn len(&self) -> usize {
+        if self.hidden {
+            return 0;
+        }
         let rows = if self.collapsed {
             HEADER_ROWS
         } else {
@@ -394,6 +412,24 @@ impl FileSlot {
             _ => None,
         }
     }
+
+    /// Whether the file's lines are on the list (not folded, not hidden).
+    fn shows_body(&self) -> bool {
+        !self.collapsed && !self.hidden
+    }
+}
+
+/// What the diff holds, for the title bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiffSummary {
+    /// Changed files shown.
+    pub files: usize,
+    /// Changed files left out by the hidden-file patterns.
+    pub hidden: usize,
+    /// Lines added in the shown files (as far as counted).
+    pub added: u64,
+    /// Lines removed in the shown files (as far as counted).
+    pub removed: u64,
 }
 
 /// A gutter selection in progress, as rows of one file.
@@ -537,6 +573,11 @@ pub struct DiffView {
     proposal: bool,
     /// File to reveal once the file list loads (by path).
     pending_reveal_path: Option<String>,
+    /// Patterns of the files left out (none in a proposal).
+    hidden_files: Arc<HiddenFiles>,
+    /// How many files the patterns leave out.
+    hidden_count: usize,
+    hidden_task: Option<Task<()>>,
 }
 
 impl EventEmitter<DiffViewEvent> for DiffView {}
@@ -544,13 +585,14 @@ impl EventEmitter<DiffViewEvent> for DiffView {}
 impl DiffView {
     /// Opens the diff of `session` and starts loading its file list.
     /// `viewed` restores the "Viewed" marks of a previous view of the same
-    /// branches.
+    /// branches; files matching `hidden_files` are left out.
     pub fn new(
         session: DiffSession,
         target: DiffTarget,
         options: DisplayOptions,
         viewed: HashSet<String>,
         comments: Entity<ReviewComments>,
+        hidden_files: Arc<HiddenFiles>,
         cx: &mut Context<Self>,
     ) -> Self {
         let comments_subscription =
@@ -601,6 +643,9 @@ impl DiffView {
             focus_requested: false,
             proposal: false,
             pending_reveal_path: None,
+            hidden_files,
+            hidden_count: 0,
+            hidden_task: None,
         };
         this.comments_changed(cx);
         this.load_list(cx);
@@ -627,7 +672,8 @@ impl DiffView {
         comments: Entity<ReviewComments>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut this = Self::new(session, target, options, viewed, comments, cx);
+        let hidden_files = Arc::default();
+        let mut this = Self::new(session, target, options, viewed, comments, hidden_files, cx);
         this.proposal = true;
         this
     }
@@ -681,6 +727,55 @@ impl DiffView {
         self.options.mode
     }
 
+    /// Files and line counts on the list, once it is known.
+    pub fn summary(&self) -> Option<DiffSummary> {
+        let ListStatus::Ready(_) = &self.status else {
+            return None;
+        };
+        Some(DiffSummary {
+            files: self.files.len() - self.hidden_count,
+            hidden: self.hidden_count,
+            added: self.totals.0,
+            removed: self.totals.1,
+        })
+    }
+
+    /// Applies new hidden-file patterns: the mask of the current list is
+    /// recomputed on the tokio runtime, then the files re-laid out with the
+    /// reading position kept.
+    pub fn set_hidden_files(&mut self, hidden_files: Arc<HiddenFiles>, cx: &mut Context<Self>) {
+        if self.proposal {
+            return;
+        }
+        self.hidden_files = hidden_files.clone();
+        let ListStatus::Ready(list) = &self.status else {
+            if matches!(self.status, ListStatus::Loading) {
+                // The listing in flight took the old patterns.
+                self.load_list(cx);
+            }
+            return;
+        };
+        let list = list.clone();
+        let job = spawn_job(cx, async move { hidden_files.mask(&list) });
+        self.hidden_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(mask) = job.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.hidden_task = None;
+                this.hidden_count = mask.iter().filter(|&&hidden| hidden).count();
+                this.relayout(|this| {
+                    for (slot, hidden) in this.files.iter_mut().zip(mask) {
+                        slot.hidden = hidden;
+                    }
+                });
+                this.recount_totals();
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// Applies new display options (tab width, soft wrap, mode, linked
     /// horizontal scroll). A mode change keeps the line at the top of the
     /// viewport in place.
@@ -710,13 +805,18 @@ impl DiffView {
 
     fn load_list(&mut self, cx: &mut Context<Self>) {
         let session = self.session.clone();
+        let hidden_files = self.hidden_files.clone();
         // Shared with the file tree: the list is computed once per session.
-        let job = spawn_job(cx, async move { session.file_list().await });
+        let job = spawn_job(cx, async move {
+            let list = session.file_list().await?;
+            let hidden = hidden_files.mask(&list);
+            Ok::<_, argus_diff::DiffError>((list, hidden))
+        });
         self.list_task = Some(cx.spawn(async move |this, cx| {
             let result = job.await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(Ok(list)) => this.list_loaded(list, cx),
+                    Ok(Ok((list, hidden))) => this.list_loaded(list, hidden, cx),
                     Ok(Err(error)) => {
                         tracing::warn!(%error, "failed to list the changed files");
                         this.status = ListStatus::Failed(error.to_string().into());
@@ -729,7 +829,7 @@ impl DiffView {
         }));
     }
 
-    fn list_loaded(&mut self, list: Arc<FileList>, cx: &mut Context<Self>) {
+    fn list_loaded(&mut self, list: Arc<FileList>, hidden: Vec<bool>, cx: &mut Context<Self>) {
         tracing::debug!(files = list.len(), "diff view file list loaded");
         let viewed = std::mem::take(&mut self.remembered_viewed);
         self.files = list
@@ -739,10 +839,12 @@ impl DiffView {
                 FileSlot::new(
                     self.session.stats(entry.index),
                     viewed.contains(&entry.path),
+                    hidden.get(entry.index).copied().unwrap_or(false),
                     self.options.mode,
                 )
             })
             .collect();
+        self.hidden_count = self.files.iter().filter(|slot| slot.hidden).count();
         self.path_index = list
             .entries()
             .iter()
@@ -791,16 +893,17 @@ impl DiffView {
     }
 
     fn recount_totals(&mut self) {
-        self.totals = self
-            .files
-            .iter()
-            .fold((0, 0), |(added, removed), slot| match slot.stats {
-                Some(FileStats::Text {
-                    added: a,
-                    removed: r,
-                }) => (added + u64::from(a), removed + u64::from(r)),
-                _ => (added, removed),
-            });
+        self.totals =
+            self.files
+                .iter()
+                .filter(|slot| !slot.hidden)
+                .fold((0, 0), |(added, removed), slot| match slot.stats {
+                    Some(FileStats::Text {
+                        added: a,
+                        removed: r,
+                    }) => (added + u64::from(a), removed + u64::from(r)),
+                    _ => (added, removed),
+                });
     }
 
     fn layout_options(&self) -> LayoutOptions {
@@ -890,7 +993,7 @@ impl DiffView {
                 });
                 self.reveal_pending(cx);
                 self.compute_words(file, diff, cx);
-                if !self.files[file].collapsed {
+                if self.files[file].shows_body() {
                     let priority = self.priority_of(file);
                     self.start_highlight(file, priority, cx);
                 }
@@ -960,7 +1063,7 @@ impl DiffView {
             let slot = &mut self.files[file];
             slot.last_used = self.tick;
             let needs_load = matches!(slot.state, FileState::Pending | FileState::Evicted)
-                && !slot.collapsed
+                && slot.shows_body()
                 && !self.loads.contains_key(&file);
             if needs_load {
                 self.start_load(file, cx);
@@ -1007,7 +1110,7 @@ impl DiffView {
                 continue;
             }
             let slot = &self.files[file];
-            if !slot.syntax.requested && !slot.collapsed && slot.loaded().is_some() {
+            if !slot.syntax.requested && slot.shows_body() && slot.loaded().is_some() {
                 self.start_highlight(file, priority, cx);
             }
         }
@@ -1532,7 +1635,7 @@ impl DiffView {
     /// report their first body row, where their first hunk will be.
     fn hunk_rows(&self, file: usize) -> Vec<usize> {
         let slot = &self.files[file];
-        if slot.collapsed {
+        if !slot.shows_body() {
             return Vec::new();
         }
         match &slot.state {
@@ -1555,6 +1658,10 @@ impl DiffView {
         if index >= self.files.len() {
             return;
         }
+        if self.files[index].hidden {
+            self.hint = Some("This file is hidden by a hidden-file pattern (Settings).".into());
+            return;
+        }
         if self.files[index].collapsed {
             self.relayout(|this| this.files[index].collapsed = false);
         }
@@ -1569,8 +1676,8 @@ impl DiffView {
             return;
         }
         let current = self.file_at(self.top_row());
-        if current + 1 < self.files.len() {
-            self.scroll_to_row(self.starts[current + 1], cx);
+        if let Some(next) = (current + 1..self.files.len()).find(|&file| !self.files[file].hidden) {
+            self.scroll_to_row(self.starts[next], cx);
         }
     }
 
@@ -1584,7 +1691,10 @@ impl DiffView {
         let current = self.file_at(top);
         let at_header = top == self.starts[current] && self.scroll_top() % self.row_height() == 0.0;
         let target = if at_header {
-            current.saturating_sub(1)
+            (0..current)
+                .rev()
+                .find(|&file| !self.files[file].hidden)
+                .unwrap_or(current)
         } else {
             current
         };
@@ -2723,7 +2833,7 @@ impl DiffView {
     }
 
     /// The header card of a file (Panoptes #56 §5): caret, letter badge,
-    /// path, counts, thread count, extras and the Viewed toggle, on
+    /// path, counts, extras and the Viewed toggle, on
     /// `surface` across the [`HEADER_ROWS`] rows. A collapsed file is this
     /// card alone, closed on all sides; the sticky copy uses the same look,
     /// with square top corners while `stuck` to the top of the view.
@@ -2785,24 +2895,6 @@ impl DiffView {
                 .text_xs()
                 .text_color(colors.text_muted)
                 .child(format!("{} → {}", old.mode(), new.mode()))
-        });
-        let threads = self.thread_count(file);
-        let thread_count = (threads > 0).then(|| {
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap_1()
-                .text_color(colors.text_muted)
-                .child(icon(
-                    IconName::ChatText,
-                    HEADER_ICON_SIZE,
-                    colors.text_muted,
-                ))
-                .child(format!(
-                    "{threads} thread{}",
-                    if threads == 1 { "" } else { "s" }
-                ))
         });
         let viewed = slot.viewed;
         let out_of_scope = self.proposal
@@ -2974,7 +3066,6 @@ impl DiffView {
             .children(scope_badge)
             .child(counts)
             .children(mode)
-            .children(thread_count)
             .child(div().flex_1())
             .children(running)
             .children(force_highlight)
@@ -2983,21 +3074,59 @@ impl DiffView {
             .into_any_element()
     }
 
-    /// The 34 px row above the cards: `base...head`, the file count, the
-    /// totals, the selection hint, then the comment summary, soft wrap and
-    /// the navigation shortcuts.
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A hint (e.g. why a selection cannot be commented) floating over the
+    /// bottom of the diff, so it never moves the lines; a click dismisses
+    /// it.
+    fn render_hint(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let hint = self.hint.clone()?;
+        let colors = &cx.theme().colors;
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_3()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("diff-hint")
+                        .max_w(px(640.0))
+                        .px_3()
+                        .py_1p5()
+                        .rounded(radius::MD)
+                        .border_1()
+                        .border_color(colors.warning.opacity(0.5))
+                        .bg(colors.elevated_surface)
+                        .shadow(vec![BoxShadow {
+                            color: colors.shadow,
+                            offset: point(px(0.0), px(2.0)),
+                            blur_radius: px(8.0),
+                            spread_radius: px(0.0),
+                            inset: false,
+                        }])
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(colors.warning)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.hint = None;
+                            cx.notify();
+                        }))
+                        .child(hint),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The row above a proposal's cards: its `start...worktree` range, file
+    /// count and totals. The main diff has none: the title bar carries its
+    /// summary.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.proposal {
+            return None;
+        }
         let theme = cx.theme().clone();
         let colors = &theme.colors;
-        let summary: SharedString = match &self.status {
-            ListStatus::Loading => "Listing changed files…".into(),
-            ListStatus::Failed(_) => "No diff".into(),
-            ListStatus::Ready(list) => {
-                let files = list.len();
-                format!("{files} file{} changed", if files == 1 { "" } else { "s" },).into()
-            }
-        };
-        let (added, removed) = self.totals;
         let mono = |text: String, color: Hsla| {
             div()
                 .flex_none()
@@ -3006,96 +3135,36 @@ impl DiffView {
                 .text_color(color)
                 .child(text)
         };
-        let hint = |keys: &'static [&'static str], label: &'static str| {
+        let summary: SharedString = match &self.status {
+            ListStatus::Loading => "Listing changed files…".into(),
+            ListStatus::Failed(_) => "No diff".into(),
+            ListStatus::Ready(list) => {
+                let files = list.len();
+                format!("{files} file{} changed", if files == 1 { "" } else { "s" }).into()
+            }
+        };
+        let (added, removed) = self.totals;
+        let range = format!("{}...{}", self.target.base, self.target.head);
+        Some(
             div()
                 .flex()
                 .flex_none()
                 .items_center()
-                .gap_0p5()
-                .text_xs()
-                .text_color(colors.text_placeholder)
-                .children(keys.iter().map(|key| kbd(*key, cx)))
-                .child(div().pl_0p5().child(label))
-        };
-        let mut hints = vec![hint(&["j", "k"], "Files"), hint(&["n", "p"], "Hunks")];
-        if !self.proposal {
-            hints.push(hint(&["c"], "Comment"));
-        }
-        let comments = self.render_comments_toolbar(cx);
-        let range = format!("{}...{}", self.target.base, self.target.head);
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .h(TOOLBAR_HEIGHT)
-            .px(CARD_INSET)
-            .border_b_1()
-            .border_color(colors.border_variant)
-            .text_sm()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .min_w_0()
-                    // Without a hint to ellipsize, the summary keeps its
-                    // width and the shortcut hints give way.
-                    .when(self.hint.is_none(), |left| left.flex_none())
-                    .child(mono(range, colors.text).whitespace_nowrap())
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(colors.text_muted)
-                            .child(summary),
-                    )
-                    .when(matches!(self.status, ListStatus::Ready(_)), |row| {
-                        row.child(mono(format!("+{added}"), colors.diff_added_text))
-                            .child(mono(format!("−{removed}"), colors.diff_removed_text))
-                    })
-                    .children(self.hint.clone().map(|hint| {
-                        div()
-                            .id("diff-hint")
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .cursor_pointer()
-                            .text_color(colors.warning)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.hint = None;
-                                cx.notify();
-                            }))
-                            .child(hint)
-                    })),
-            )
-            .child(
-                div()
-                    .flex()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .items_center()
-                    .gap_2()
-                    .children(comments)
-                    .child(
-                        toggle_button("diff-soft-wrap", "Soft wrap", self.options.soft_wrap, cx)
-                            .text_xs()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(ToggleSoftWrap), cx)
-                            }),
-                    )
-                    // The hints give way first when the toolbar is narrow.
-                    .child(
-                        div()
-                            .flex()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .items_center()
-                            .gap_2()
-                            .children(hints),
-                    ),
-            )
+                .gap_2()
+                .min_w_0()
+                .h(TOOLBAR_HEIGHT)
+                .px(CARD_INSET)
+                .border_b_1()
+                .border_color(colors.border_variant)
+                .text_sm()
+                .child(mono(range, colors.text).whitespace_nowrap())
+                .child(div().text_color(colors.text_muted).child(summary))
+                .when(matches!(self.status, ListStatus::Ready(_)), |row| {
+                    row.child(mono(format!("+{added}"), colors.diff_added_text))
+                        .child(mono(format!("−{removed}"), colors.diff_removed_text))
+                })
+                .into_any_element(),
+        )
     }
 }
 
@@ -3106,8 +3175,9 @@ impl Render for DiffView {
         }
         let theme = cx.theme().clone();
         let colors = &theme.colors;
-        let toolbar = self.render_toolbar(cx).into_any_element();
+        let toolbar = self.render_toolbar(cx);
         let reattach_bar = self.render_reattach_bar(cx);
+        let hint = self.render_hint(cx);
         let root = div()
             .track_focus(&self.focus_handle)
             .flex()
@@ -3115,7 +3185,7 @@ impl Render for DiffView {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .child(toolbar)
+            .children(toolbar)
             .children(reattach_bar);
 
         let list = match &self.status {
@@ -3144,6 +3214,12 @@ impl Render for DiffView {
                     } else {
                         "No changes: head has the same tree as the merge-base."
                     },
+                    cx,
+                ));
+            }
+            ListStatus::Ready(list) if self.hidden_count == list.len() => {
+                return root.child(placeholder(
+                    "Every changed file is hidden by your hidden-file patterns (Settings).",
                     cx,
                 ));
             }
@@ -3285,7 +3361,8 @@ impl Render for DiffView {
                         .child(sticky),
                 )
                 .children(scrollbar)
-                .children(drag_listener),
+                .children(drag_listener)
+                .children(hint),
         )
     }
 }

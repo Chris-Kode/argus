@@ -10,11 +10,11 @@
 //!   gold with the pulsing eye, its elapsed time and its latest steps; a
 //!   run ready to review is teal with its `+n −m`; failed runs carry an
 //!   `error` label and the quiet states stay neutral. A card shows the
-//!   comment's first line, `file:line`, `model · effort`, the turns and the
-//!   cost once known, and Stop while the run is live. The header shows the
-//!   number of runs listed. Clicking a card selects it and asks the
-//!   workspace to scroll the diff to its comment
-//!   ([`RunPanelEvent::OpenComment`]).
+//!   comment's first line and `file:line`, the elapsed time while the run
+//!   is live, and Stop. Model, effort, turns, cost and duration belong to
+//!   the log. Clicking a card selects it and asks the workspace to scroll
+//!   the diff to its comment ([`RunPanelEvent::OpenComment`]); a thread's
+//!   "What Claude did" opens a run's log directly ([`RunPanel::show_run`]).
 //! - **Log.** The selected run's events are folded into rows by
 //!   [`RunLog`]: a stored log is rebuilt on the tokio runtime, then live
 //!   events are appended as they stream. The log is a virtualized [`list`],
@@ -93,17 +93,6 @@ pub enum RunPanelEvent {
         /// Whether it reports a failure.
         is_error: bool,
     },
-}
-
-/// Live numbers of a run, from its stream.
-#[derive(Clone, Copy, Debug, Default)]
-struct LiveStats {
-    /// Assistant messages so far.
-    turns: u32,
-    /// Claude's turn count from the result.
-    final_turns: Option<u32>,
-    /// Total cost from the result.
-    cost_usd: Option<f64>,
 }
 
 /// One tool call of a live run, for its card.
@@ -189,7 +178,6 @@ pub struct RunPanel {
     shown: Vec<usize>,
     /// Finished runs are listed too.
     show_finished: bool,
-    live: HashMap<RunId, LiveStats>,
     stopping: HashSet<RunId>,
     /// Latest steps of the live runs.
     steps: HashMap<RunId, LiveSteps>,
@@ -284,7 +272,6 @@ impl RunPanel {
             finished: HashSet::new(),
             shown: Vec::new(),
             show_finished: false,
-            live: HashMap::new(),
             stopping: HashSet::new(),
             steps: HashMap::new(),
             line_counts: HashMap::new(),
@@ -562,15 +549,6 @@ impl RunPanel {
             {
                 stepped.insert(event.run_id);
             }
-            let stats = self.live.entry(event.run_id).or_default();
-            match event.event.as_ref() {
-                StreamEvent::Assistant(_) => stats.turns += 1,
-                StreamEvent::Result(result) => {
-                    stats.final_turns = result.num_turns;
-                    stats.cost_usd = result.total_cost_usd;
-                }
-                _ => {}
-            }
         }
         // A card gained a step line: measure it again.
         for (index, _) in self
@@ -596,6 +574,25 @@ impl RunPanel {
             self.load_log(run_id, cx);
         }
         cx.notify();
+    }
+
+    /// Opens the log of `run_id` (a thread's "What Claude did").
+    pub fn show_run(&mut self, run_id: RunId, cx: &mut Context<Self>) {
+        self.select(run_id, cx);
+    }
+
+    /// Opens the log of the newest run of `comment_id` (a running thread's
+    /// "Running…"); nothing when it has none listed yet.
+    pub fn show_comment_run(&mut self, comment_id: CommentId, cx: &mut Context<Self>) {
+        let newest = self
+            .runs
+            .iter()
+            .filter(|listing| listing.run.comment_id == Some(comment_id))
+            .max_by_key(|listing| listing.run.created_at)
+            .map(|listing| listing.run.id);
+        if let Some(run_id) = newest {
+            self.select(run_id, cx);
+        }
     }
 
     /// Selects a run and loads its log.
@@ -772,27 +769,9 @@ impl RunPanel {
 
     // ---- rendering ------------------------------------------------------------
 
-    fn turns(&self, listing: &RunListing) -> Option<u32> {
-        let live = self.live.get(&listing.run.id);
-        listing
-            .run
-            .num_turns
-            .or_else(|| live.and_then(|stats| stats.final_turns))
-            .or_else(|| live.map(|stats| stats.turns).filter(|turns| *turns > 0))
-    }
-
-    fn cost(&self, listing: &RunListing) -> Option<f64> {
-        listing.run.cost_usd.or_else(|| {
-            self.live
-                .get(&listing.run.id)
-                .and_then(|stats| stats.cost_usd)
-        })
-    }
-
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let colors = &theme.colors;
-        let cost: f64 = self.runs.iter().filter_map(|l| self.cost(l)).sum();
         div()
             .flex()
             .flex_none()
@@ -809,15 +788,6 @@ impl RunPanel {
                     .text_color(colors.text)
                     .child("Runs"),
             )
-            .when(self.repo_id.is_some(), |header| {
-                header.child(
-                    div()
-                        .font_family(theme.fonts.code_family.clone())
-                        .text_size(px(MONO_TEXT))
-                        .text_color(colors.text_placeholder)
-                        .child(self.shown.len().to_string()),
-                )
-            })
             .child(div().flex_1())
             .when(!self.finished.is_empty(), |header| {
                 header.child(
@@ -832,15 +802,6 @@ impl RunPanel {
                     )
                     .text_xs()
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_finished(cx))),
-                )
-            })
-            .when(cost > 0.0, |header| {
-                header.child(
-                    div()
-                        .font_family(theme.fonts.code_family.clone())
-                        .text_size(px(MONO_TEXT))
-                        .text_color(colors.text_placeholder)
-                        .child(format_cost(cost)),
                 )
             })
             .into_any_element()
@@ -862,30 +823,16 @@ impl RunPanel {
         let finished = self.finished.contains(&id);
         let style = card_style(status, finished.then_some(listing.comment_status), colors);
 
-        let snippet = listing
-            .body_md
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or_default()
-            .to_owned();
+        let snippet = markdown::first_line_plain(&listing.body_md);
         let location = if comment_id.is_some() {
             format!("{}:{}", listing.file_path, listing.start_line)
         } else {
             listing.file_path.clone()
         };
-        let mut meta = Vec::new();
-        meta.push(if run.effort.is_empty() {
-            run.model.clone()
-        } else {
-            format!("{} · {}", run.model, run.effort)
-        });
-        if let Some(turns) = self.turns(listing) {
-            meta.push(format!("{turns} turn{}", if turns == 1 { "" } else { "s" }));
-        }
-        if let Some(cost) = self.cost(listing) {
-            meta.push(format_cost(cost));
-        }
-        let elapsed = format_elapsed(elapsed_ms(run, now_ms()));
+        // A live clock while Claude works; how long a finished run took is
+        // in its log.
+        let elapsed = matches!(status, RunStatus::Running | RunStatus::Queued)
+            .then(|| format_elapsed(elapsed_ms(run, now_ms())));
         let line_counts = (status == RunStatus::Succeeded && !finished)
             .then(|| self.line_counts.get(&id).copied().flatten())
             .flatten();
@@ -920,14 +867,14 @@ impl RunPanel {
                     .child(style.text),
             )
             .child(div().flex_1())
-            .child(
+            .children(elapsed.map(|elapsed| {
                 div()
                     .flex_none()
                     .font_family(mono.clone())
                     .text_size(px(MONO_TEXT))
                     .text_color(style.secondary)
-                    .child(elapsed),
-            );
+                    .child(elapsed)
+            }));
         let summary = div()
             .min_w_0()
             .overflow_hidden()
@@ -966,17 +913,7 @@ impl RunPanel {
                         .text_color(colors.diff_removed_text)
                         .child(format!("−{removed}")),
                 )
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_color(colors.text_placeholder)
-                    .child(meta.join(" · ")),
-            );
+            });
 
         let steps = (status == RunStatus::Running).then(|| {
             let steps = self
@@ -1126,8 +1063,21 @@ impl RunPanel {
     fn render_detail(&self, view: &LogView, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let listing = self.listing(view.run_id);
+        // The log is where the run's details live: model and effort here,
+        // turns, cost and duration in its summary.
         let title = listing
-            .map(|listing| format!("{}:{}", listing.file_path, listing.start_line))
+            .map(|listing| {
+                let run = &listing.run;
+                let mut title = format!(
+                    "{}:{} · {}",
+                    listing.file_path, listing.start_line, run.model
+                );
+                if !run.effort.is_empty() {
+                    title.push_str(" · ");
+                    title.push_str(&run.effort);
+                }
+                title
+            })
             .unwrap_or_else(|| "Run".to_owned());
         // A rejected run's worktree is gone.
         let worktree = listing

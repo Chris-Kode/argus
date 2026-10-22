@@ -61,7 +61,7 @@ use super::{
 };
 use crate::AppContext;
 use crate::components::{
-    accept_button, button, chip, disabled_button, disabled_button_with_icon, icon_button, kbd,
+    accept_button, button, chip, disabled_button, disabled_button_with_icon, icon_button,
     primary_button, radius, reject_button, status_chip, text_tooltip,
 };
 use crate::followup::FollowupKind;
@@ -86,8 +86,11 @@ const CARD_MARGIN: Pixels = px(8.0);
 const MAX_CARD_WIDTH: Pixels = px(680.0);
 /// Height of a thread card's header row.
 const THREAD_HEADER_HEIGHT: Pixels = px(34.0);
-/// Hint of a thread's reply input.
+/// Hint of a thread's reply input once Claude has answered.
 const REPLY_HINT: &str = "Ask Claude for changes";
+/// Hint of a reply before Claude has answered: the comment is the ask, a
+/// reply only adds to it.
+const NOTE_HINT: &str = "Add to the comment";
 /// A thread menu closed this recently by a click outside it is not reopened
 /// by the same click landing on its own "⋯" button.
 const MENU_REOPEN_GUARD: Duration = Duration::from_millis(250);
@@ -333,12 +336,17 @@ impl DiffView {
 
     /// Number of resolved and dismissed threads that have a place in the
     /// diff.
-    fn closed_count(&self) -> usize {
+    pub fn closed_count(&self) -> usize {
         self.threads
             .snapshot
             .iter()
             .filter(|comment| !comment.outdated && comment.is_closed())
             .count()
+    }
+
+    /// Whether the resolved and dismissed threads are shown.
+    pub fn shows_closed_threads(&self) -> bool {
+        self.threads.show_closed
     }
 
     /// Shows or hides the resolved and dismissed threads.
@@ -411,11 +419,6 @@ impl DiffView {
     ) -> Option<CommentStatus> {
         let markers = &self.files[file].threads.markers[side_index(side)];
         markers.get(&line?).copied()
-    }
-
-    /// Number of current threads in `file`, loaded or not.
-    pub(super) fn thread_count(&self, file: usize) -> usize {
-        self.file_comments(file).len()
     }
 
     /// The first line of a comment of `file` that Claude is running.
@@ -1289,7 +1292,12 @@ impl DiffView {
         }
         let draft = DraftKey::Reply(id);
         let text = CommentDrafts::read(cx, &draft).unwrap_or_default();
-        let slot = self.new_editor_slot(draft, text, REPLY_HINT, cx);
+        let hint = if self.comment(id).is_some_and(claude_replied) {
+            REPLY_HINT
+        } else {
+            NOTE_HINT
+        };
+        let slot = self.new_editor_slot(draft, text, hint, cx);
         self.threads.replies.insert(id, slot);
         self.threads.heights.remove(&BlockKey::Thread(id));
         if let Some(file) = self.comment_file(id) {
@@ -1618,12 +1626,7 @@ impl DiffView {
         let reattach = self.threads.reattach.as_ref()?;
         let comment = self.comment(reattach.id)?;
         let colors = cx.theme().colors.clone();
-        let first = comment
-            .body_md
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or_default()
-            .to_owned();
+        let first = markdown::first_line_plain(&comment.body_md);
         let picked = match self.selection() {
             Some(Ok(lines)) if lines.end > lines.start => {
                 format!("{} lines {}–{}", lines.file, lines.start, lines.end)
@@ -1711,6 +1714,9 @@ impl DiffView {
             .filter(|comment| self.is_inline(comment))
             .filter_map(|comment| {
                 let file = *self.path_index.get(&comment.anchor.file_path)?;
+                if self.files[file].hidden {
+                    return None;
+                }
                 let row = self
                     .thread_row(file, comment.id)
                     // Not laid out yet: somewhere in its file, by line.
@@ -1751,6 +1757,11 @@ impl DiffView {
             cx.notify();
             return;
         };
+        if self.files[file].hidden {
+            self.hint = Some("That comment's file is hidden by a hidden-file pattern.".into());
+            cx.notify();
+            return;
+        }
         self.threads.focused = Some(id);
         if !self.threads.show_closed && self.comment(id).is_some_and(Comment::is_closed) {
             self.threads.show_closed = true;
@@ -1799,60 +1810,6 @@ impl DiffView {
     }
 
     // ---- rendering --------------------------------------------------------
-
-    /// The comment summary, "Show closed" and "Collapse all" of the
-    /// toolbar.
-    pub(super) fn render_comments_toolbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.threads.snapshot.is_empty() {
-            return None;
-        }
-        let closed = self.closed_count();
-        let count = self.threads.snapshot.len() - closed;
-        let colors = cx.theme().colors.clone();
-        let collapsed = self.all_threads_collapsed();
-        let show_closed = self.threads.show_closed;
-        Some(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap_1()
-                .child(div().text_xs().text_color(colors.text_muted).child(format!(
-                    "{count} comment{}",
-                    if count == 1 { "" } else { "s" }
-                )))
-                .when(closed > 0, |toolbar| {
-                    toolbar.child(
-                        button(
-                            "diff-show-closed",
-                            if show_closed {
-                                "Hide closed".to_owned()
-                            } else {
-                                format!("Show closed ({closed})")
-                            },
-                            cx,
-                        )
-                        .text_xs()
-                        .tooltip(text_tooltip("Resolved and dismissed comments"))
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_closed_threads(cx))),
-                    )
-                })
-                .child(
-                    button(
-                        "diff-collapse-comments",
-                        if collapsed {
-                            "Expand comments"
-                        } else {
-                            "Collapse comments"
-                        },
-                        cx,
-                    )
-                    .text_xs()
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_all_threads(cx))),
-                )
-                .into_any_element(),
-        )
-    }
 
     /// Item `item` of `file`'s blocks, drawn from block row `part` (the
     /// first visible one) downward.
@@ -1982,12 +1939,7 @@ impl DiffView {
                 colors.text_muted,
             ));
         let preview = collapsed.then(|| {
-            let first = comment
-                .body_md
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .to_owned();
+            let first = markdown::first_line_plain(&comment.body_md);
             div()
                 .flex_1()
                 .min_w_0()
@@ -2036,6 +1988,23 @@ impl DiffView {
                     .with_priority(2),
                 )
             });
+        // Before Claude answers, the comment is the ask: a quiet "Reply" in
+        // the header instead of an input under every thread.
+        let replied = claude_replied(comment);
+        let reply_link =
+            (!collapsed && !replied && !self.threads.replies.contains_key(&id)).then(|| {
+                div()
+                    .id((key.clone(), 6))
+                    .flex_none()
+                    .px_1p5()
+                    .rounded(radius::XS)
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(colors.text_muted)
+                    .hover(|style| style.bg(colors.element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.start_reply(id, cx)))
+                    .child("Reply")
+            });
         // The actions keep their size; the preview (or a spacer) gives way.
         let header = div()
             .flex()
@@ -2051,13 +2020,20 @@ impl DiffView {
             })
             .child(chevron)
             .child(location)
-            .child(status_chip(comment.status, colors))
+            // Open is every new thread's state, and a running one says so
+            // with its "Running…" link: chips only where they tell
+            // something.
+            .when(
+                !matches!(comment.status, CommentStatus::Open | CommentStatus::Running),
+                |header| header.child(status_chip(comment.status, colors)),
+            )
             .when(comment.outdated, |header| {
                 header.child(chip("Outdated", colors.warning))
             })
             .children(preview)
             .when(!collapsed, |header| header.child(div().flex_1()))
             .children(replies)
+            .children(reply_link)
             .children(self.render_run_button(comment, &key, cx))
             .child(menu_button);
 
@@ -2206,6 +2182,7 @@ impl DiffView {
                     self.render_editor(slot, "Send as follow-up run", true, cx)
                 }
                 Some(slot) => self.render_editor(slot, "Reply", false, cx),
+                None if !replied => return None,
                 None => div()
                     .id((key.clone(), 2))
                     .flex()
@@ -2230,10 +2207,9 @@ impl DiffView {
                             .text_color(colors.text_placeholder)
                             .child(REPLY_HINT),
                     )
-                    .child(kbd(submit_keys(), cx))
                     .into_any_element(),
             };
-            div().px_3().py_2().child(content)
+            Some(div().px_3().py_2().child(content))
         });
 
         // Inline in the diff, not floating over it: a border and no shadow.
@@ -2263,7 +2239,7 @@ impl DiffView {
             .children(session_lost)
             .children(confirm)
             .children(confirm_reject)
-            .children(reply_box)
+            .children(reply_box.flatten())
             .when(focused, |card| {
                 card.child(
                     div()
@@ -2278,9 +2254,9 @@ impl DiffView {
             .into_any_element()
     }
 
-    /// One message of a thread: the author, the meta and the body. Claude's
-    /// messages sit on a `claude_soft` band; `run` adds its model, effort
-    /// and duration to the meta.
+    /// One message of a thread: the author, the time and the body. Claude's
+    /// messages sit on a `claude_soft` band; with their `run`, "What Claude
+    /// did" opens its log, where the model, effort, turns and cost are.
     #[allow(clippy::too_many_arguments)]
     fn render_message(
         &self,
@@ -2300,23 +2276,21 @@ impl DiffView {
         } else {
             ("You", colors.text)
         };
-        let choice = run.filter(|_| claude).map(|run| {
-            let choice = if run.effort.trim().is_empty() {
-                run.model.clone()
-            } else {
-                format!("{}, {}", run.model, run.effort)
-            };
+        let log = run.filter(|_| claude).map(|run| {
+            let run_id = run.id;
             div()
+                .id(SharedString::from(format!("reply-log-{run_id}")))
                 .flex_none()
-                .font_family(theme.fonts.code_family.clone())
-                .text_color(colors.text_muted)
-                .child(choice)
+                .px_1()
+                .rounded(radius::XS)
+                .cursor_pointer()
+                .text_color(colors.text_placeholder)
+                .hover(|style| style.bg(colors.element_hover).text_color(colors.text_muted))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(DiffViewEvent::ShowRunLog(run_id));
+                }))
+                .child("What Claude did")
         });
-        let mut when = time;
-        if let Some(ms) = run.filter(|_| claude).and_then(|run| run.duration_ms) {
-            when.push_str(" · ran ");
-            when.push_str(&format_ran(ms));
-        }
         let meta = div()
             .flex()
             .items_center()
@@ -2332,15 +2306,16 @@ impl DiffView {
                     .text_color(name_color)
                     .child(name),
             )
-            .children(choice)
             .child(
                 div()
+                    .flex_1()
                     .min_w_0()
                     .overflow_hidden()
                     .text_ellipsis()
                     .text_color(colors.text_placeholder)
-                    .child(when),
-            );
+                    .child(time),
+            )
+            .children(log);
         // The proposal is a row of the message under a hairline, not a box.
         let inset = inset.map(|inset| {
             div()
@@ -2582,17 +2557,27 @@ impl DiffView {
         if comment.status == CommentStatus::Running {
             return Some(
                 div()
+                    .id((key.clone(), 22))
                     .flex_none()
                     .px_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
                     .text_xs()
-                    .text_color(colors.warning)
+                    .text_color(colors.claude_text)
+                    .hover(|style| style.bg(colors.element_hover))
+                    .tooltip(text_tooltip("Follow Claude's steps in the run log"))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(DiffViewEvent::ShowCommentRun(id));
+                    }))
                     .child("Running…")
                     .into_any_element(),
             );
         }
+        // Model and effort are a default set once; the label stays a verb
+        // and the tooltip (or the ▾ menu) tells which.
         let (model, effort) = self.run_choice(id, cx);
-        let verb = run_verb(comment.status);
-        let label = format!("{verb} · {}", choice_label(&model, &effort));
+        let label = run_verb(comment.status);
+        let choice: SharedString = format!("With {}", choice_label(&model, &effort)).into();
         if let Some(blocker) = self.run_blocker(comment, cx) {
             let hint: SharedString = blocker.into();
             return Some(
@@ -2608,6 +2593,7 @@ impl DiffView {
                     .border_color(colors.border_variant)
                     .text_xs()
                     .text_color(colors.text_placeholder)
+                    .tooltip(text_tooltip(choice))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.hint = Some(hint.clone());
                         cx.notify();
@@ -2638,6 +2624,7 @@ impl DiffView {
                     .cursor_pointer()
                     .whitespace_nowrap()
                     .hover(move |style| style.bg(accent_soft))
+                    .tooltip(text_tooltip(choice))
                     .on_click(cx.listener(move |this, _, _, cx| this.request_run(id, cx)))
                     .child(label),
             )
@@ -2998,19 +2985,14 @@ fn submit_keys() -> String {
         .unwrap_or_default()
 }
 
-/// A run's duration for "ran 42s" / "ran 3m 5s".
-fn format_ran(ms: i64) -> String {
-    let seconds = (ms.max(0) + 500) / 1000;
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else {
-        format!("{}m {}s", seconds / 60, seconds % 60)
-    }
+/// Whether Claude has answered in `comment`'s thread.
+fn claude_replied(comment: &Comment) -> bool {
+    comment
+        .replies
+        .iter()
+        .any(|reply| reply.author == ReplyAuthor::Claude)
 }
 
-/// `sonnet · medium`, or just the model without an effort.
-/// The verb of the Run button: a Proposed comment runs again as a
-/// follow-up, which starts from a reply.
 /// Which status a line ending several threads shows: Claude at work first,
 /// then what waits for the user, then the quiet states.
 fn marker_rank(status: CommentStatus) -> u8 {
@@ -3023,6 +3005,8 @@ fn marker_rank(status: CommentStatus) -> u8 {
     }
 }
 
+/// The verb of the Run button: a Proposed comment runs again as a
+/// follow-up, which starts from a reply.
 fn run_verb(status: CommentStatus) -> &'static str {
     if status == CommentStatus::Proposed {
         "Follow up"
@@ -3031,6 +3015,7 @@ fn run_verb(status: CommentStatus) -> &'static str {
     }
 }
 
+/// `sonnet · medium`, or just the model without an effort.
 fn choice_label(model: &str, effort: &str) -> String {
     if effort.is_empty() {
         model.to_owned()

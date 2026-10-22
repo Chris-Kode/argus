@@ -43,6 +43,8 @@ actions!(
         ToggleRunPanel,
         /// Move the run panel between the right and the bottom.
         ToggleRunPanelPosition,
+        /// Hide both docks to read the diff alone, or bring them back.
+        ToggleFocusMode,
         /// Cycle the theme: system, dark, light.
         CycleTheme,
         /// Make the UI and code fonts larger.
@@ -451,6 +453,13 @@ pub const SHORTCUTS: &[Shortcut] = &[
         None,
         "Layout",
         "Dock the run panel right / bottom"
+    ),
+    shortcut!(
+        "secondary-.",
+        ToggleFocusMode,
+        None,
+        "Layout",
+        "Focus on the diff (hide both docks)"
     ),
     shortcut!(
         "secondary-k secondary-t",
