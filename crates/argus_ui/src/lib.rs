@@ -18,6 +18,7 @@ pub mod file_tree;
 pub mod followup;
 mod fonts;
 pub mod fuzzy;
+pub mod hidden_files;
 pub mod icons;
 pub mod jobs;
 pub mod keymap;
@@ -312,7 +313,9 @@ pub fn run_gpui_app(
             })
             .detach();
 
-            let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
+            // Room for the file tree and a side-by-side diff (see
+            // `DiffViewMode::Auto`).
+            let bounds = Bounds::centered(None, size(px(1400.0), px(880.0)), cx);
             let window = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),

@@ -27,6 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use argus_diff::layout::ViewMode;
@@ -46,15 +47,15 @@ use crate::claude_status::observe_claude_status;
 use crate::comment_list::{CommentList, CommentListEvent};
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
-    button, claude_activity, disabled_button, disabled_ghost_button_with_icon,
-    disabled_icon_button, icon_button, kbd, muted_button_with_icon, panel_header, placeholder,
-    primary_button, primary_button_with_icon, radius, section_header, segmented, text_tooltip,
+    button, claude_activity, disabled_button, disabled_icon_button, icon_button, kbd, panel_header,
+    placeholder, primary_button, primary_button_with_icon, radius, section_header, text_tooltip,
     toggle_button, toggle_icon_button,
 };
 use crate::conflict::{ConflictDialog, ConflictDialogEvent, ConflictSource};
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
 use crate::file_tree::{FileMarker, FileTree, FileTreeEvent};
 use crate::fonts::InstalledFonts;
+use crate::hidden_files::{self, HiddenFiles};
 use crate::icons::{IconName, eye_mark, icon};
 use crate::jobs::BackgroundJobs;
 use crate::keymap::{
@@ -63,9 +64,10 @@ use crate::keymap::{
     OpenRecent4, OpenRecent5, OpenRecent6, OpenRecent7, OpenRecent8, OpenRecent9, OpenRepository,
     OpenSettings, PreviousComment, PreviousFile, PreviousHunk, ResetFontSize, Run, SHORTCUT_GROUPS,
     SHORTCUTS, ToggleAllComments, ToggleCommentList, ToggleDiffMode, ToggleFileListMode,
-    ToggleFileTree, ToggleKeyboardShortcuts, ToggleRunPanel, ToggleRunPanelPosition,
-    ToggleSoftWrap, WELCOME_CONTEXT, WORKSPACE_CONTEXT,
+    ToggleFileTree, ToggleFocusMode, ToggleKeyboardShortcuts, ToggleRunPanel,
+    ToggleRunPanelPosition, ToggleSoftWrap, WELCOME_CONTEXT, WORKSPACE_CONTEXT,
 };
+use crate::markdown;
 use crate::perf;
 use crate::permission::{PermissionDialog, PermissionDialogEvent};
 use crate::proposal::{ProposalEvent, ProposalSource, ProposalView};
@@ -80,6 +82,7 @@ use crate::settings::{
     DEFAULT_RUN_PANEL_HEIGHT, DEFAULT_RUN_PANEL_WIDTH, DEFAULT_UI_FONT_SIZE, DiffViewMode,
     MIN_DOCK_SIZE, RunPanelPosition, UiSettings, clamp_font_size, clamp_tab_width,
 };
+use crate::text_field::{TextField, TextFieldEvent};
 use crate::theme::{ActiveTheme, Theme, ThemeFamily, ThemeFonts, ThemeMode};
 use crate::{AppContext, OpenRequest};
 
@@ -194,6 +197,18 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     settings: UiSettings,
     settings_dirty: bool,
+    /// [`UiSettings::hidden_files`], compiled; shared with the file tree
+    /// and the main diff.
+    hidden_files: Arc<HiddenFiles>,
+    /// The settings field that adds a hidden-file pattern, and why the last
+    /// pattern was refused.
+    hidden_file_input: Entity<TextField>,
+    hidden_file_error: Option<SharedString>,
+    /// Width of the center area at the last render, which resolves
+    /// [`DiffViewMode::Auto`].
+    diff_area_width: f32,
+    /// The docks shown (file tree, run panel) before focus mode hid them.
+    focus_stash: Option<(bool, bool)>,
     /// The Claude section of the settings sheet; it owns the run defaults.
     claude_settings: Entity<ClaudeSettingsForm>,
     fonts: InstalledFonts,
@@ -210,7 +225,9 @@ pub struct Workspace {
     /// The runs of the open repository and their live logs (right or
     /// bottom dock).
     run_panel: Entity<RunPanel>,
-    diff_subscription: Option<Subscription>,
+    /// The main diff's events, and its repaints (the title bar shows its
+    /// summary).
+    diff_subscriptions: Vec<Subscription>,
     /// Proposal tabs, after the main diff tab.
     proposals: Vec<ProposalTab>,
     /// The proposal tab shown in the center; `None` shows the main diff.
@@ -297,8 +314,22 @@ impl Workspace {
             }),
         ];
 
+        let hidden_file_input =
+            cx.new(|cx| TextField::new("A file name such as .test, or a /regex/", cx));
         let accept_flow = cx.new(AcceptFlow::new);
         let mut subscriptions = subscriptions;
+        subscriptions.push(cx.subscribe(
+            &hidden_file_input,
+            |this, input, event: &TextFieldEvent, cx| match event {
+                TextFieldEvent::Submitted => this.add_hidden_file_pattern(cx),
+                TextFieldEvent::Edited => {
+                    if this.hidden_file_error.take().is_some() {
+                        input.update(cx, |input, cx| input.set_invalid(false, cx));
+                        cx.notify();
+                    }
+                }
+            },
+        ));
         subscriptions.push(cx.observe(&accept_flow, |_, _, cx| cx.notify()));
         subscriptions.push(cx.subscribe(&accept_flow, Self::accept_flow_event));
         let push_flow = cx.new(PushFlow::new);
@@ -329,10 +360,16 @@ impl Workspace {
             }
         });
 
+        let hidden_files = Arc::new(HiddenFiles::new(&settings.hidden_files));
         let mut this = Self {
             focus_handle,
             settings,
             settings_dirty: false,
+            hidden_files,
+            hidden_file_input,
+            hidden_file_error: None,
+            diff_area_width: 0.0,
+            focus_stash: None,
             claude_settings: cx.new(ClaudeSettingsForm::new),
             fonts: InstalledFonts::load(cx),
             session: None,
@@ -343,7 +380,7 @@ impl Workspace {
             outdated_comments: Vec::new(),
             diff_view: None,
             run_panel,
-            diff_subscription: None,
+            diff_subscriptions: Vec::new(),
             proposals: Vec::new(),
             active_proposal: None,
             accept_flow,
@@ -473,12 +510,34 @@ impl Workspace {
         DisplayOptions {
             tab_width: self.settings.diff_tab_width,
             soft_wrap: self.settings.diff_soft_wrap,
-            mode: match self.settings.diff_view_mode {
-                DiffViewMode::Unified => ViewMode::Unified,
-                DiffViewMode::SideBySide => ViewMode::Split,
+            mode: if self.is_split() {
+                ViewMode::Split
+            } else {
+                ViewMode::Unified
             },
             link_horizontal_scroll: self.settings.diff_link_horizontal_scroll,
         }
+    }
+
+    /// Whether the diff shows side by side: the setting, with `Auto`
+    /// resolved against the width the diff had at the last render.
+    fn is_split(&self) -> bool {
+        self.settings.diff_view_mode.is_split(self.diff_area_width)
+    }
+
+    /// Width left to the center between the docks of a `viewport_width`
+    /// window.
+    fn center_width(&self, viewport_width: f32) -> f32 {
+        let file_tree = &self.settings.file_tree;
+        let run_panel = &self.settings.run_panel;
+        let mut width = viewport_width;
+        if file_tree.visible {
+            width -= file_tree.width;
+        }
+        if run_panel.visible && run_panel.position == RunPanelPosition::Right {
+            width -= run_panel.width;
+        }
+        width
     }
 
     fn sync_diff_options(&mut self, cx: &mut Context<Self>) {
@@ -490,6 +549,51 @@ impl Workspace {
             tab.view
                 .update(cx, |view, cx| view.set_options(options, cx));
         }
+    }
+
+    /// Adds the pattern typed in the settings, unless it is invalid or
+    /// already listed.
+    fn add_hidden_file_pattern(&mut self, cx: &mut Context<Self>) {
+        let pattern = self.hidden_file_input.read(cx).text().trim().to_owned();
+        if let Err(error) = hidden_files::validate(&pattern) {
+            self.hidden_file_error = Some(error.into());
+            self.hidden_file_input
+                .update(cx, |input, cx| input.set_invalid(true, cx));
+            cx.notify();
+            return;
+        }
+        self.hidden_file_input.update(cx, |input, cx| {
+            input.set_text("", cx);
+            input.set_invalid(false, cx);
+        });
+        self.hidden_file_error = None;
+        if self.settings.hidden_files.contains(&pattern) {
+            cx.notify();
+            return;
+        }
+        let mut patterns = self.settings.hidden_files.clone();
+        patterns.push(pattern);
+        self.set_hidden_file_patterns(patterns, cx);
+    }
+
+    /// Replaces the hidden-file patterns: saves them and re-filters the file
+    /// tree and the main diff.
+    fn set_hidden_file_patterns(&mut self, patterns: Vec<String>, cx: &mut Context<Self>) {
+        if self.settings.hidden_files == patterns {
+            return;
+        }
+        self.settings.hidden_files = patterns;
+        self.hidden_files = Arc::new(HiddenFiles::new(&self.settings.hidden_files));
+        let hidden_files = self.hidden_files.clone();
+        if let Some(tree) = self.file_tree.clone() {
+            let hidden_files = hidden_files.clone();
+            tree.update(cx, |tree, cx| tree.set_hidden_files(hidden_files, cx));
+        }
+        if let Some(view) = self.diff_view.clone() {
+            view.update(cx, |view, cx| view.set_hidden_files(hidden_files, cx));
+        }
+        self.schedule_save(cx);
+        cx.notify();
     }
 
     fn change_font_size(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
@@ -591,7 +695,8 @@ impl Workspace {
             .update(cx, |panel, cx| panel.set_repo(Some(repo_id), cx));
         let session = cx.new(|cx| RepoSession::new(record, repo, cx));
         let flat = self.settings.file_tree.flat_list;
-        let file_tree = cx.new(|cx| FileTree::new(flat, cx));
+        let hidden_files = self.hidden_files.clone();
+        let file_tree = cx.new(|cx| FileTree::new(flat, hidden_files, cx));
         let comments = session.read(cx).comments().clone();
         let comment_list = cx.new(|cx| CommentList::new(comments.clone(), cx));
         self.outdated_comments.clear();
@@ -724,7 +829,7 @@ impl Workspace {
             }
             // Closed threads need nothing more; they do not nag.
             if comment.outdated && !comment.is_closed() {
-                let first = comment.body_md.lines().next().unwrap_or_default();
+                let first = markdown::first_line_plain(&comment.body_md);
                 labels.push(SharedString::from(format!(
                     "{}:{} · {first}",
                     comment.anchor.file_path, comment.anchor.start_line
@@ -776,50 +881,59 @@ impl Workspace {
         else {
             return;
         };
-        let view = cx.new(|cx| DiffView::new(session, target, display, viewed, comments, cx));
+        let hidden_files = self.hidden_files.clone();
+        let view = cx
+            .new(|cx| DiffView::new(session, target, display, viewed, comments, hidden_files, cx));
         perf::watch_diff(view.downgrade(), cx);
-        self.diff_subscription =
-            Some(
-                cx.subscribe(&view, |this, _, event: &DiffViewEvent, cx| match event {
-                    DiffViewEvent::ActiveFileChanged(index) => {
-                        if let Some(tree) = this.file_tree.clone() {
-                            let index = *index;
-                            tree.update(cx, |tree, cx| tree.set_active_file(index, cx));
-                        }
+        self.diff_subscriptions = vec![
+            cx.observe(&view, |_, _, cx| cx.notify()),
+            cx.subscribe(&view, |this, _, event: &DiffViewEvent, cx| match event {
+                DiffViewEvent::ActiveFileChanged(index) => {
+                    if let Some(tree) = this.file_tree.clone() {
+                        let index = *index;
+                        tree.update(cx, |tree, cx| tree.set_active_file(index, cx));
                     }
-                    // The view opens composers itself; logged for debugging.
-                    DiffViewEvent::LinesSelected(selection) => {
-                        tracing::debug!(?selection, "lines selected");
-                    }
-                    DiffViewEvent::CommentRequested(selection) => {
-                        tracing::debug!(?selection, "comment requested");
-                    }
-                    DiffViewEvent::SelectionRejected(hint) => {
-                        tracing::debug!(%hint, "selection rejected");
-                    }
-                    DiffViewEvent::RunRequested {
-                        comment_id,
-                        model,
-                        effort,
-                    } => {
-                        let (comment_id, model, effort) =
-                            (*comment_id, model.clone(), effort.clone());
-                        this.run_panel
-                            .update(cx, |panel, cx| panel.start(comment_id, model, effort, cx));
-                    }
-                    DiffViewEvent::ViewProposal(id) => {
-                        this.open_proposal(ProposalSource::Comment(*id), cx);
-                    }
-                    DiffViewEvent::AcceptProposal(run_id) => {
-                        let run_id = *run_id;
-                        tracing::debug!(run = %run_id, "accept requested from a thread");
-                        this.accept_flow
-                            .update(cx, |flow, cx| flow.accept(run_id, cx));
-                    }
-                    // Only proposal diffs offer "Open in editor".
-                    DiffViewEvent::OpenInEditor(_) => {}
-                }),
-            );
+                }
+                // The view opens composers itself; logged for debugging.
+                DiffViewEvent::LinesSelected(selection) => {
+                    tracing::debug!(?selection, "lines selected");
+                }
+                DiffViewEvent::CommentRequested(selection) => {
+                    tracing::debug!(?selection, "comment requested");
+                }
+                DiffViewEvent::SelectionRejected(hint) => {
+                    tracing::debug!(%hint, "selection rejected");
+                }
+                DiffViewEvent::RunRequested {
+                    comment_id,
+                    model,
+                    effort,
+                } => {
+                    let (comment_id, model, effort) = (*comment_id, model.clone(), effort.clone());
+                    this.run_panel
+                        .update(cx, |panel, cx| panel.start(comment_id, model, effort, cx));
+                }
+                DiffViewEvent::ViewProposal(id) => {
+                    this.open_proposal(ProposalSource::Comment(*id), cx);
+                }
+                DiffViewEvent::AcceptProposal(run_id) => {
+                    let run_id = *run_id;
+                    tracing::debug!(run = %run_id, "accept requested from a thread");
+                    this.accept_flow
+                        .update(cx, |flow, cx| flow.accept(run_id, cx));
+                }
+                // Only proposal diffs offer "Open in editor".
+                DiffViewEvent::OpenInEditor(_) => {}
+                DiffViewEvent::ShowRunLog(run_id) => {
+                    let run_id = *run_id;
+                    this.show_run_panel(cx, |panel, cx| panel.show_run(run_id, cx));
+                }
+                DiffViewEvent::ShowCommentRun(comment_id) => {
+                    let comment_id = *comment_id;
+                    this.show_run_panel(cx, |panel, cx| panel.show_comment_run(comment_id, cx));
+                }
+            }),
+        ];
         self.diff_view = Some(view);
         self.reanchor_comments(cx);
         cx.notify();
@@ -845,10 +959,24 @@ impl Workspace {
         }
     }
 
+    /// Opens the run panel (hidden by default) and points it at a run.
+    fn show_run_panel(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut RunPanel, &mut Context<RunPanel>),
+    ) {
+        if !self.settings.run_panel.visible {
+            self.settings.run_panel.visible = true;
+            self.schedule_save(cx);
+        }
+        self.run_panel.update(cx, f);
+        cx.notify();
+    }
+
     /// Drops the diff view, cancelling its jobs, and keeps its "Viewed"
     /// marks for a refresh of the same branches.
     fn close_diff(&mut self, cx: &mut Context<Self>) {
-        self.diff_subscription = None;
+        self.diff_subscriptions.clear();
         if let Some(view) = self.diff_view.take() {
             let view = view.read(cx);
             let target = view.target();
@@ -1458,16 +1586,19 @@ impl Workspace {
     }
 
     /// Switches the diff between unified and side-by-side; the choice is
-    /// saved as the mode later diffs open in.
+    /// saved as the mode later diffs open in (no longer `Auto`).
     fn toggle_diff_mode(
         &mut self,
         _: &ToggleDiffMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.update_settings(window, cx, |settings| {
-            settings.diff_view_mode = settings.diff_view_mode.toggled();
-        });
+        let mode = if self.is_split() {
+            DiffViewMode::Unified
+        } else {
+            DiffViewMode::SideBySide
+        };
+        self.update_settings(window, cx, |settings| settings.diff_view_mode = mode);
     }
 
     // ---- branch pickers -----------------------------------------------------
@@ -1749,8 +1880,33 @@ impl Workspace {
             return;
         };
         self.show_left_tab(LeftTab::Files, window, cx);
+        file_tree.update(cx, |tree, cx| tree.request_filter(cx));
         let handle = file_tree.read(cx).filter_focus_handle().clone();
         window.focus(&handle, cx);
+    }
+
+    /// Focus mode: hides both docks so the diff takes the window, and brings
+    /// back the ones that were shown on the next press.
+    fn toggle_focus_mode(
+        &mut self,
+        _: &ToggleFocusMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let shown = (
+            self.settings.file_tree.visible,
+            self.settings.run_panel.visible,
+        );
+        let (file_tree, run_panel) = if shown.0 || shown.1 {
+            self.focus_stash = Some(shown);
+            (false, false)
+        } else {
+            self.focus_stash.take().unwrap_or((true, false))
+        };
+        self.update_settings(window, cx, |settings| {
+            settings.file_tree.visible = file_tree;
+            settings.run_panel.visible = run_panel;
+        });
     }
 
     fn toggle_file_list_mode(
@@ -1761,6 +1917,11 @@ impl Workspace {
     ) {
         if let Some(file_tree) = self.file_tree.clone() {
             file_tree.update(cx, |tree, cx| tree.toggle_mode(cx));
+        } else {
+            // No tree to report the change: the next one opens in this mode.
+            self.settings.file_tree.flat_list = !self.settings.file_tree.flat_list;
+            self.schedule_save(cx);
+            cx.notify();
         }
     }
 
@@ -1988,33 +2149,23 @@ impl Workspace {
             )
             .children(branch_controls);
 
+        // Without a remote there is nothing to fetch: no button at all.
         let fetch = match session {
-            Some(session) if session.is_fetching() => disabled_ghost_button_with_icon(
+            Some(session) if session.is_fetching() => Some(disabled_icon_button(
                 "title-fetch",
                 IconName::ArrowLineDown,
                 "Fetching…",
                 cx,
-            ),
-            Some(session) if session.has_remotes() => {
-                muted_button_with_icon("title-fetch", IconName::ArrowLineDown, "Fetch", cx)
-                    .on_click(cx.listener(|this, _, _, cx| {
+            )),
+            Some(session) if session.has_remotes() => Some(
+                icon_button("title-fetch", IconName::ArrowLineDown, "Fetch", cx).on_click(
+                    cx.listener(|this, _, _, cx| {
                         this.update_session(cx, |session, cx| session.fetch(cx));
-                    }))
-            }
-            _ => {
-                disabled_ghost_button_with_icon("title-fetch", IconName::ArrowLineDown, "Fetch", cx)
-            }
-        }
-        .h(px(28.0));
-
-        let split = usize::from(self.settings.diff_view_mode == DiffViewMode::SideBySide);
-        let diff_mode = segmented("title-diff-mode", ["Unified", "Split"], split, cx).on_select(
-            move |index, window, cx| {
-                if index != split {
-                    window.dispatch_action(ToggleDiffMode.boxed_clone(), cx);
-                }
-            },
-        );
+                    }),
+                ),
+            ),
+            _ => None,
+        };
         let push = self.render_push_button(session, cx);
 
         div()
@@ -2036,24 +2187,85 @@ impl Workspace {
                     window.titlebar_double_click();
                 }
             })
-            .child(breadcrumb)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .min_w_0()
+                    .child(breadcrumb)
+                    .children(self.render_diff_summary(cx)),
+            )
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
                     .gap_1p5()
-                    .child(diff_mode)
-                    .child(fetch)
-                    .child(push),
+                    .children(fetch)
+                    .children(push),
             )
+    }
+
+    /// `4 files +27 −5 · 2 hidden` after the breadcrumb, for the main diff;
+    /// "2 hidden" opens the settings, where the patterns are.
+    fn render_diff_summary(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let summary = self.diff_view.as_ref()?.read(cx).summary()?;
+        let theme = cx.theme();
+        let colors = &theme.colors;
+        let mono = |text: String, color| {
+            div()
+                .flex_none()
+                .font_family(theme.fonts.code_family.clone())
+                .text_size(px(12.0))
+                .text_color(color)
+                .child(text)
+        };
+        let files = summary.files;
+        let hidden = (summary.hidden > 0).then(|| {
+            div()
+                .id("title-hidden-files")
+                .flex_none()
+                .px_1()
+                .rounded(radius::SM)
+                .cursor_pointer()
+                .text_color(colors.text_placeholder)
+                .hover(|style| style.bg(colors.element_hover))
+                .tooltip(text_tooltip("Files hidden by your hidden-file patterns"))
+                .on_click(|_, window, cx| window.dispatch_action(OpenSettings.boxed_clone(), cx))
+                .child(format!("· {} hidden", summary.hidden))
+        });
+        Some(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1p5()
+                .text_sm()
+                .child(
+                    div()
+                        .text_color(colors.text_muted)
+                        .child(format!("{files} file{}", if files == 1 { "" } else { "s" })),
+                )
+                .child(mono(format!("+{}", summary.added), colors.diff_added_text))
+                .child(mono(
+                    format!("−{}", summary.removed),
+                    colors.diff_removed_text,
+                ))
+                .children(hidden)
+                .into_any_element(),
+        )
     }
 
     /// The Push split button and its state (spec §5.4): `Push | ↑ahead
     /// ↓behind`, disabled with a tooltip when there is nothing to do or an
     /// Accept is in flight, `Push | No upstream` to offer `git push -u`,
     /// "Pushing…" (which toggles the progress popover) while a Push runs.
-    fn render_push_button(&self, session: Option<&RepoSession>, cx: &Context<Self>) -> AnyElement {
+    fn render_push_button(
+        &self,
+        session: Option<&RepoSession>,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
         let state = |enabled: bool, label: &'static str, detail: PushDetail, tooltip: String| {
             PushButtonState {
                 enabled,
@@ -2159,7 +2371,11 @@ impl Workspace {
                 ),
             }
         };
-        self.render_push_split_button(state, cx)
+        // Push shows up only when there is something to do; the disabled
+        // states would be chrome to read past on every review.
+        state
+            .enabled
+            .then(|| self.render_push_split_button(state, cx))
     }
 
     /// Draws a [`PushButtonState`]: the `arrow-line-up` + label part and,
@@ -2199,7 +2415,8 @@ impl Workspace {
         };
         let detail = match state.detail {
             PushDetail::None => None,
-            PushDetail::NoUpstream => Some(detail_part("No upstream".into_any_element())),
+            // The tooltip says it publishes the branch.
+            PushDetail::NoUpstream => None,
             PushDetail::Counts(ahead, behind) => Some(detail_part(
                 div()
                     .flex()
@@ -2450,20 +2667,12 @@ impl Workspace {
             .child(self.resize_handle(DockResize::FileTree, false, cx))
     }
 
-    /// "Files" | "Comments n" above the left dock (Panoptes #56 §5): SM
-    /// tabs, the selected one on `element_selected`, the count in mono.
+    /// "Files" | "Comments" above the left dock (Panoptes #56 §5): SM
+    /// tabs, the selected one on `element_selected`. The status bar counts
+    /// the comments.
     fn render_left_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let code_family = cx.theme().fonts.code_family.clone();
-        let count = self
-            .comment_list
-            .as_ref()
-            .map_or(0, |list| list.read(cx).count());
-        let tab = |id: &'static str,
-                   label: &'static str,
-                   count: Option<usize>,
-                   tab: LeftTab,
-                   cx: &mut Context<Self>| {
+        let tab = |id: &'static str, label: &'static str, tab: LeftTab, cx: &mut Context<Self>| {
             let active = self.left_tab == tab;
             div()
                 .id(id)
@@ -2489,15 +2698,6 @@ impl Workspace {
                     cx.listener(move |this, _, window, cx| this.show_left_tab(tab, window, cx)),
                 )
                 .child(label)
-                .when_some(count, |tab, count| {
-                    tab.child(
-                        div()
-                            .font_family(code_family.clone())
-                            .text_size(px(11.0))
-                            .text_color(colors.text_placeholder)
-                            .child(count.to_string()),
-                    )
-                })
         };
         div()
             .flex()
@@ -2507,14 +2707,8 @@ impl Workspace {
             .px_2()
             .pt_2()
             .pb(px(6.0))
-            .child(tab("left-tab-files", "Files", None, LeftTab::Files, cx))
-            .child(tab(
-                "left-tab-comments",
-                "Comments",
-                (count > 0).then_some(count),
-                LeftTab::Comments,
-                cx,
-            ))
+            .child(tab("left-tab-files", "Files", LeftTab::Files, cx))
+            .child(tab("left-tab-comments", "Comments", LeftTab::Comments, cx))
             .into_any_element()
     }
 
@@ -2661,20 +2855,23 @@ impl Workspace {
             .min_w_0()
             .min_h_0()
             .bg(colors.background)
-            .child(
-                // Tab bar: the main diff, then one tab per open proposal.
-                div()
-                    .id("center-tabs")
-                    .flex()
-                    .flex_none()
-                    .h(px(32.0))
-                    .overflow_x_scroll()
-                    .bg(colors.surface)
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .child(main_tab)
-                    .children(proposal_tabs),
-            )
+            // Tab bar: the main diff, then one tab per open proposal. With
+            // the diff alone there is nothing to switch to, so no bar.
+            .when(!proposal_tabs.is_empty(), |center| {
+                center.child(
+                    div()
+                        .id("center-tabs")
+                        .flex()
+                        .flex_none()
+                        .h(px(32.0))
+                        .overflow_x_scroll()
+                        .bg(colors.surface)
+                        .border_b_1()
+                        .border_color(colors.border)
+                        .child(main_tab)
+                        .children(proposal_tabs),
+                )
+            })
             .child(content)
     }
 
@@ -2981,6 +3178,71 @@ impl Workspace {
                 .on_click(cx.listener(|this, _, _, cx| this.show_permissions(cx)))
         });
 
+        // The resolved and dismissed threads the diff leaves out, when any.
+        let closed = self.diff_view.as_ref().and_then(|view| {
+            let view = view.read(cx);
+            let count = view.closed_count();
+            (count > 0).then(|| (count, view.shows_closed_threads()))
+        });
+        let closed = closed.map(|(count, shown)| {
+            div()
+                .id("status-closed")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .h(px(20.0))
+                .px_1p5()
+                .rounded(radius::SM)
+                .cursor_pointer()
+                .text_color(colors.text_placeholder)
+                .when(shown, |counter| counter.bg(colors.element_selected))
+                .hover(|style| style.bg(colors.element_hover))
+                .tooltip(text_tooltip(if shown {
+                    "Hide the resolved and dismissed comments"
+                } else {
+                    "Show the resolved and dismissed comments"
+                }))
+                .child(icon(
+                    IconName::Check,
+                    STATUS_ICON_SIZE,
+                    colors.text_placeholder,
+                ))
+                .child(format!("{count} closed"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.update_main_diff(cx, |view, cx| view.toggle_closed_threads(cx));
+                }))
+        });
+
+        // Diff display toggles: quick to reach while reading, out of the
+        // way of the diff itself.
+        let display_toggle = |id: &'static str,
+                              label: &'static str,
+                              on: bool,
+                              tooltip: String,
+                              action: Box<dyn Action>| {
+            toggle_button(id, label, on, cx)
+                .h(px(20.0))
+                .px_1p5()
+                .text_size(STATUS_TEXT_SIZE)
+                .tooltip(text_tooltip(tooltip))
+                .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+        };
+        let split = display_toggle(
+            "status-split",
+            "Split",
+            self.is_split(),
+            with_shortcut::<ToggleDiffMode>("Side by side"),
+            ToggleDiffMode.boxed_clone(),
+        );
+        let wrap = display_toggle(
+            "status-wrap",
+            "Wrap",
+            self.settings.diff_soft_wrap,
+            with_shortcut::<ToggleSoftWrap>("Soft wrap"),
+            ToggleSoftWrap.boxed_clone(),
+        );
+
         let run_panel = toggle_icon_button(
             "status-runs",
             IconName::Sidebar,
@@ -3014,6 +3276,7 @@ impl Workspace {
                     .child(divider)
                     .children(waiting)
                     .children(counters.into_iter().flatten())
+                    .children(closed)
                     .children(notice.map(|notice| notice.ml_1())),
             )
             .child(
@@ -3023,6 +3286,7 @@ impl Workspace {
                     .gap_0p5()
                     .min_w_0()
                     .children(job_indicator.map(|jobs| jobs.mr_1()))
+                    .when(self.diff_view.is_some(), |bar| bar.child(split).child(wrap))
                     .child(
                         icon_button(
                             "status-settings",
@@ -3443,7 +3707,7 @@ impl Workspace {
                 .into_any_element()
             })
             .collect();
-        let diff_mode_buttons = [DiffViewMode::SideBySide, DiffViewMode::Unified]
+        let diff_mode_buttons = DiffViewMode::ALL
             .into_iter()
             .map(|mode| {
                 toggle_button(
@@ -3472,6 +3736,26 @@ impl Workspace {
                         settings.run_panel.position = position;
                     })
                 }))
+                .into_any_element()
+            })
+            .collect();
+        // The tree owns the mode and reports it back; the buttons only ask
+        // it to switch.
+        let flat = settings.file_tree.flat_list;
+        let file_list_buttons = [("Tree", false), ("List", true)]
+            .into_iter()
+            .map(|(label, is_flat)| {
+                toggle_button(
+                    ("file-list-mode", usize::from(is_flat)),
+                    label,
+                    flat == is_flat,
+                    cx,
+                )
+                .on_click(move |_, window, cx| {
+                    if flat != is_flat {
+                        window.dispatch_action(ToggleFileListMode.boxed_clone(), cx);
+                    }
+                })
                 .into_any_element()
             })
             .collect();
@@ -3540,6 +3824,69 @@ impl Workspace {
                 .on_click(|_, window, cx| window.dispatch_action(ToggleSoftWrap.boxed_clone(), cx))
                 .into_any_element(),
             ));
+
+        let hidden_rows: Vec<AnyElement> = settings
+            .hidden_files
+            .iter()
+            .enumerate()
+            .map(|(index, pattern)| {
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .pl_2()
+                    .rounded(radius::SM)
+                    .bg(colors.surface)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .font_family(theme.fonts.code_family.clone())
+                            .text_sm()
+                            .text_color(colors.text)
+                            .child(pattern.clone()),
+                    )
+                    .child(
+                        icon_button(("hidden-file-remove", index), IconName::X, "Remove", cx)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let mut patterns = this.settings.hidden_files.clone();
+                                if index < patterns.len() {
+                                    patterns.remove(index);
+                                }
+                                this.set_hidden_file_patterns(patterns, cx);
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let hidden = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header(
+                "Hidden files",
+                div().when(!settings.hidden_files.is_empty(), |trailing| {
+                    trailing.child(button("clear-hidden-files", "Show all files", cx).on_click(
+                        cx.listener(|this, _, _, cx| this.set_hidden_file_patterns(Vec::new(), cx)),
+                    ))
+                }),
+                cx,
+            ))
+            .child(div().text_sm().text_color(colors.text_muted).child(
+                "Files left out of the file list and the diff. Text must appear in the file \
+                 name (in the path when it has a /); /…/ is a regular expression searched in \
+                 the path. Press Enter to add.",
+            ))
+            .child(self.hidden_file_input.clone())
+            .children(
+                self.hidden_file_error
+                    .clone()
+                    .map(|error| div().text_sm().text_color(colors.error).child(error)),
+            )
+            .children(hidden_rows);
 
         let appearance = div()
             .flex()
@@ -3611,6 +3958,7 @@ impl Workspace {
                     ToggleFileTree.boxed_clone(),
                 ),
             ))
+            .child(row("File list", segmented(file_list_buttons)))
             .child(row(
                 "Run panel",
                 visibility(
@@ -3664,6 +4012,7 @@ impl Workspace {
             .gap_3()
             .child(self.claude_settings.clone())
             .child(diff)
+            .child(hidden)
             .child(appearance)
             .child(layout)
             .child(git)
@@ -3686,6 +4035,13 @@ impl Render for Workspace {
         // Rem-based spacing and text sizes scale with the UI font size, as in
         // Zed.
         window.set_rem_size(theme.fonts.ui_size);
+        // `Auto` follows the room the diff gets: a window resize or a dock
+        // shown, hidden or dragged can switch the layout.
+        let was_split = self.is_split();
+        self.diff_area_width = self.center_width(window.viewport_size().width.as_f32());
+        if self.is_split() != was_split {
+            self.sync_diff_options(cx);
+        }
 
         let run_panel = &self.settings.run_panel;
         let run_panel_bottom = run_panel.visible && run_panel.position == RunPanelPosition::Bottom;
@@ -3767,6 +4123,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_file_tree))
             .on_action(cx.listener(Self::toggle_run_panel))
             .on_action(cx.listener(Self::toggle_run_panel_position))
+            .on_action(cx.listener(Self::toggle_focus_mode))
             .on_action(cx.listener(Self::cycle_theme))
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))

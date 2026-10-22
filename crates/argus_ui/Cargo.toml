@@ -16,6 +16,7 @@ argus_store.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 pulldown-cmark.workspace = true
+regex.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

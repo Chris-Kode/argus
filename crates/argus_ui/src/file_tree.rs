@@ -10,8 +10,12 @@
 //! - The collapsed directories are keyed by path and outlive the file list,
 //!   so a refresh (e.g. after an Accept) keeps them; the selection is
 //!   carried over by path too.
-//! - The filter box fuzzy-matches paths (old paths of renames too); the
-//!   A/M/D/R chips restrict change kinds.
+//! - The filter box fuzzy-matches paths (old paths of renames too). It is
+//!   shown for lists longer than [`FILTER_MIN_FILES`], while it is in use,
+//!   and when asked for (`/`); a short list needs no search.
+//! - Files matching the hidden-file patterns ([`HiddenFiles`]) are left out
+//!   entirely; their mask is computed on the tokio runtime with the list,
+//!   and again when the patterns change.
 //!
 //! The diff view (#9) listens to [`FileTreeEvent::OpenFile`] and reports
 //! its scroll position back through [`FileTree::set_active_file`]; the
@@ -37,8 +41,9 @@ use gpui::{
 };
 
 use crate::BackgroundJobs;
-use crate::components::{BadgeSize, claude_activity, letter_badge, radius, toggle_button};
+use crate::components::{BadgeSize, claude_activity, letter_badge, radius};
 use crate::fuzzy::FuzzyQuery;
+use crate::hidden_files::HiddenFiles;
 use crate::icons::{IconName, icon};
 use crate::keymap::{
     CollapseEntry, Dismiss, ExpandEntry, FILE_TREE_CONTEXT, OpenEntry, SelectNextEntry,
@@ -49,7 +54,7 @@ use crate::runtime::spawn_job;
 use crate::session::DiffTarget;
 use crate::theme::{ActiveTheme, ThemeColors};
 
-use model::{KindFilter, KindGroup, Row, TreeIndex, View};
+use model::{Row, TreeIndex, View};
 
 /// Height of every row (`uniform_list` needs one height).
 const ROW_HEIGHT: f32 = 26.0;
@@ -67,6 +72,8 @@ const ACTIVITY_SIZE: Pixels = px(13.0);
 const COUNTS_TEXT_SIZE: Pixels = px(11.0);
 /// Size of row labels.
 const ROW_TEXT_SIZE: Pixels = px(12.5);
+/// Lists with more files than this show the filter box without asking.
+const FILTER_MIN_FILES: usize = 15;
 
 /// The state marker of a file row (Panoptes #56 §5). A file shows at most
 /// one; [`FileMarker::Running`] wins over [`FileMarker::Proposed`].
@@ -127,6 +134,8 @@ enum Selection {
 struct Loaded {
     list: Arc<FileList>,
     index: Arc<TreeIndex>,
+    /// By file-list index: matched by a hidden-file pattern.
+    hidden: Arc<Vec<bool>>,
 }
 
 /// The file tree dock.
@@ -137,13 +146,20 @@ pub struct FileTree {
     session: Option<DiffSession>,
     list: Option<Arc<FileList>>,
     index: Arc<TreeIndex>,
+    hidden_files: Arc<HiddenFiles>,
+    /// By file-list index: left out of the rows.
+    hidden: Arc<Vec<bool>>,
+    /// How many entries of `hidden` are set.
+    hidden_count: usize,
+    hidden_task: Option<Task<()>>,
     stats: Vec<Option<FileStats>>,
     markers: HashMap<SharedString, FileMarker>,
     outdated: Vec<SharedString>,
     flat: bool,
     query: String,
     fuzzy: FuzzyQuery,
-    kinds: KindFilter,
+    /// The filter box was asked for (`/`) on a short list.
+    filter_requested: bool,
     collapsed: HashSet<SharedString>,
     rows: Vec<Row>,
     selection: Option<Selection>,
@@ -163,8 +179,9 @@ impl Focusable for FileTree {
 }
 
 impl FileTree {
-    /// An empty tree; `flat` restores the persisted list mode.
-    pub fn new(flat: bool, cx: &mut Context<Self>) -> Self {
+    /// An empty tree; `flat` restores the persisted list mode and
+    /// `hidden_files` leaves the matching files out.
+    pub fn new(flat: bool, hidden_files: Arc<HiddenFiles>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
             filter_focus: cx.focus_handle(),
@@ -172,13 +189,17 @@ impl FileTree {
             session: None,
             list: None,
             index: Arc::new(TreeIndex::default()),
+            hidden_files,
+            hidden: Arc::default(),
+            hidden_count: 0,
+            hidden_task: None,
             stats: Vec::new(),
             markers: HashMap::new(),
             outdated: Vec::new(),
             flat,
             query: String::new(),
             fuzzy: FuzzyQuery::default(),
-            kinds: KindFilter::default(),
+            filter_requested: false,
             collapsed: HashSet::new(),
             rows: Vec::new(),
             selection: None,
@@ -216,9 +237,36 @@ impl FileTree {
         &self.filter_focus
     }
 
+    /// Shows the filter box even on a short list, before it gets the focus.
+    pub fn request_filter(&mut self, cx: &mut Context<Self>) {
+        if !self.filter_requested {
+            self.filter_requested = true;
+            cx.notify();
+        }
+    }
+
+    /// Whether the filter box is shown.
+    fn shows_filter(&self, window: &Window) -> bool {
+        let files = self.index.len().saturating_sub(self.hidden_count());
+        files > FILTER_MIN_FILES
+            || self.filter_requested
+            || !self.query.is_empty()
+            || self.filter_focus.is_focused(window)
+    }
+
     /// Whether the flat list is shown instead of the tree.
     pub fn is_flat(&self) -> bool {
         self.flat
+    }
+
+    /// Number of changed files left out by the hidden-file patterns.
+    pub fn hidden_count(&self) -> usize {
+        self.hidden_count
+    }
+
+    fn set_hidden(&mut self, hidden: Arc<Vec<bool>>) {
+        self.hidden_count = hidden.iter().filter(|&&hidden| hidden).count();
+        self.hidden = hidden;
     }
 
     // ---- loading ------------------------------------------------------------
@@ -258,11 +306,17 @@ impl FileTree {
         self.stats_task = None;
         self.status = Status::Loading;
         self.set_loading_flag(true, cx);
+        let hidden_files = self.hidden_files.clone();
         let job = spawn_job(cx, async move {
             let list = session.file_list().await?;
             // Building the index walks every path; keep it off the UI thread.
             let index = Arc::new(TreeIndex::new(list.entries()));
-            Ok::<_, argus_diff::DiffError>(Loaded { list, index })
+            let hidden = Arc::new(hidden_files.mask(&list));
+            Ok::<_, argus_diff::DiffError>(Loaded {
+                list,
+                index,
+                hidden,
+            })
         });
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let result = job.await;
@@ -308,11 +362,17 @@ impl FileTree {
     /// following the counts.
     fn install(&mut self, loaded: Loaded, cx: &mut Context<Self>) {
         let selected_path = self.selection_path();
-        let Loaded { list, index } = loaded;
+        let Loaded {
+            list,
+            index,
+            hidden,
+        } = loaded;
         tracing::debug!(files = list.len(), "file tree loaded");
         perf::file_list_computed(list.len(), cx);
         self.stats = vec![None; list.len()];
         self.index = index;
+        self.set_hidden(hidden);
+        self.hidden_task = None;
         self.list = Some(list.clone());
         self.status = Status::Ready;
         self.selection = selected_path.and_then(|(is_dir, path)| {
@@ -370,6 +430,28 @@ impl FileTree {
 
     // ---- inputs from other views ------------------------------------------
 
+    /// Applies new hidden-file patterns: the mask of the current list is
+    /// recomputed on the tokio runtime, then the rows are rebuilt.
+    pub fn set_hidden_files(&mut self, hidden_files: Arc<HiddenFiles>, cx: &mut Context<Self>) {
+        self.hidden_files = hidden_files.clone();
+        let Some(list) = self.list.clone() else {
+            return;
+        };
+        let job = spawn_job(cx, async move { hidden_files.mask(&list) });
+        self.hidden_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(mask) = job.await else {
+                return;
+            };
+            // A list installed meanwhile drops this task with its own mask.
+            this.update(cx, |this, cx| {
+                this.hidden_task = None;
+                this.set_hidden(Arc::new(mask));
+                this.after_filter_change(cx);
+            })
+            .ok();
+        }));
+    }
+
     /// State markers by file path (#14): files without an entry show none.
     pub fn set_file_markers(
         &mut self,
@@ -413,14 +495,14 @@ impl FileTree {
         View {
             flat: self.flat,
             query: &self.fuzzy,
-            kinds: self.kinds,
+            hidden: &self.hidden,
             collapsed: &self.collapsed,
             outdated: self.outdated.len(),
         }
     }
 
     fn filtering(&self) -> bool {
-        !self.fuzzy.is_empty() || !self.kinds.is_empty()
+        !self.fuzzy.is_empty()
     }
 
     /// Recomputes the visible rows and the selected row.
@@ -599,11 +681,6 @@ impl FileTree {
         self.after_filter_change(cx);
     }
 
-    fn toggle_kind(&mut self, group: KindGroup, cx: &mut Context<Self>) {
-        self.kinds.toggle(group);
-        self.after_filter_change(cx);
-    }
-
     /// Rebuilds the rows; when the selection got filtered out, the best
     /// match is selected so Enter opens it.
     fn after_filter_change(&mut self, cx: &mut Context<Self>) {
@@ -674,10 +751,13 @@ impl FileTree {
         cx.stop_propagation();
     }
 
-    /// Escape in the filter: clear it, then leave it.
+    /// Escape in the filter: clear it, then leave it (and hide it again on
+    /// a short list).
     fn filter_dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
         if self.query.is_empty() {
+            self.filter_requested = false;
             window.focus(&self.focus_handle, cx);
+            cx.notify();
         } else {
             self.set_query(String::new(), cx);
         }
@@ -912,71 +992,6 @@ impl FileTree {
             ))
     }
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors.clone();
-        let total = self.index.len();
-        let summary: SharedString = match &self.status {
-            Status::Loading if self.list.is_some() => "Refreshing…".into(),
-            Status::Loading => "Loading…".into(),
-            _ if self.list.is_none() => SharedString::default(),
-            _ if self.filtering() => {
-                let shown = self
-                    .rows
-                    .iter()
-                    .filter(|row| matches!(row, Row::File { .. }))
-                    .count();
-                format!("{shown} of {total}").into()
-            }
-            _ => format!("{total} {}", if total == 1 { "file" } else { "files" }).into(),
-        };
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .gap_1()
-            .h(px(32.0))
-            .pl_3()
-            .pr_1()
-            .border_b_1()
-            .border_color(colors.border_variant)
-            .text_xs()
-            .text_color(colors.text_muted)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .min_w_0()
-                    .child("FILES")
-                    .child(
-                        div()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_color(colors.text_placeholder)
-                            .child(summary),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .child(
-                        toggle_button("file-tree-mode-tree", "Tree", !self.flat, cx)
-                            .h(px(20.0))
-                            .text_xs()
-                            .on_click(cx.listener(|this, _, _, cx| this.set_flat(false, cx))),
-                    )
-                    .child(
-                        toggle_button("file-tree-mode-flat", "List", self.flat, cx)
-                            .h(px(20.0))
-                            .text_xs()
-                            .on_click(cx.listener(|this, _, _, cx| this.set_flat(true, cx))),
-                    ),
-            )
-    }
-
     fn render_filter(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
         let focused = self.filter_focus.is_focused(window);
@@ -1029,39 +1044,6 @@ impl FileTree {
             )
             .when(focused && !self.query.is_empty(), |row| row.child(caret()));
 
-        let chips = KindGroup::ALL.into_iter().map(|group| {
-            let active = self.kinds.contains(group);
-            let color = kind_color(
-                match group {
-                    KindGroup::Added => ChangeKind::Added,
-                    KindGroup::Modified => ChangeKind::Modified,
-                    KindGroup::Deleted => ChangeKind::Deleted,
-                    KindGroup::Renamed => ChangeKind::Renamed,
-                },
-                &colors,
-            );
-            div()
-                .id(SharedString::from(format!("file-kind-{}", group.letter())))
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .size(px(20.0))
-                .rounded(radius::SM)
-                .text_xs()
-                .font_weight(gpui::FontWeight::BOLD)
-                .cursor_pointer()
-                .text_color(if active {
-                    color
-                } else {
-                    colors.text_placeholder
-                })
-                .when(active, |chip| chip.bg(colors.element_selected))
-                .hover(|style| style.bg(colors.element_hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_kind(group, cx)))
-                .child(group.letter())
-        });
-
         div()
             .flex()
             .flex_none()
@@ -1070,7 +1052,6 @@ impl FileTree {
             .px_2()
             .py_1()
             .child(input)
-            .children(chips)
     }
 
     fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1104,6 +1085,8 @@ impl FileTree {
         if self.rows.is_empty() {
             let text = if self.index.is_empty() {
                 "No changes between base and head."
+            } else if self.hidden_count == self.index.len() {
+                "Every file is hidden."
             } else {
                 "No file matches the filter."
             };
@@ -1126,17 +1109,6 @@ impl FileTree {
                 .py_1(),
             )
             .into_any_element()
-    }
-}
-
-/// The colour of a change-kind letter, matching [`letter_badge`].
-fn kind_color(kind: ChangeKind, colors: &ThemeColors) -> Hsla {
-    match kind {
-        ChangeKind::Added => colors.diff_added_text,
-        ChangeKind::Deleted => colors.diff_removed_text,
-        ChangeKind::Renamed => colors.accent,
-        ChangeKind::Modified => colors.file_modified,
-        ChangeKind::ModeChanged | ChangeKind::TypeChanged => colors.text_muted,
     }
 }
 
@@ -1198,8 +1170,9 @@ impl Render for FileTree {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .child(self.render_header(cx))
-            .child(self.render_filter(window, cx))
+            .when(self.shows_filter(window), |tree| {
+                tree.child(self.render_filter(window, cx))
+            })
             .when(renames_limited, |tree| {
                 tree.child(
                     div()

@@ -108,10 +108,10 @@ push it.
 3. **Comment.** Hover a line and click the gutter **+** (or select lines in the
    gutter and press `c`). Write what you want changed, in Markdown, and save with
    `⌘↩`.
-4. **Run it with Claude.** Click **Run · sonnet · medium** on the thread (or press
-   `r`). Claude Code runs headless in its own worktree under `~/.argus/worktrees/`;
-   follow it live in the run panel (`⌘J`). Runs go in parallel, so you can keep
-   commenting.
+4. **Run it with Claude.** Click **Run** on the thread (or press `r`). Claude
+   Code runs headless in its own worktree under `~/.argus/worktrees/`; the thread
+   shows *Running…*, which opens the live log in the run panel (`⌘J`). Runs go in
+   parallel, so you can keep commenting.
 
    ![A live run in the run panel](docs/screenshots/runs-light.png)
 
@@ -156,6 +156,7 @@ shortcuts work whenever the focus is not in a text field.
 | `⌘⇧L` | Toggle tree / flat file list |
 | `⌘J` | Toggle the run panel |
 | `⌘⇧J` | Dock the run panel right / bottom |
+| `⌘.` | Focus on the diff (hide both docks, press again to bring them back) |
 | `⌘⇧D` | Toggle unified / side-by-side diff |
 | `⌥Z` | Toggle soft wrap |
 | `⌘K ⌘T` | Cycle theme (system, dark, light) |
@@ -197,12 +198,31 @@ file in one virtualized list, laid out lazily as it scrolls into view. `j`/`k`
 jump between files, `n`/`p` between hunks, and `alt-z` toggles soft wrap. Click
 or drag the gutter to select lines, and use the "Expand" rows to reveal context.
 
-The diff opens side by side by default: old lines on the left, new lines on the
-right, each column with its own gutter (the left one selects old lines, the
-right one new lines). `cmd-shift-d` (`ctrl-shift-d` on Linux) or the "Side by
-side" title-bar button switches to the unified layout and back, keeping the
-line at the top of the viewport in place. The settings choose the default
-layout and whether both columns scroll horizontally together.
+The diff picks its layout from the room it has: side by side (old lines on the
+left, new lines on the right, each column with its own gutter; the left one
+selects old lines, the right one new lines) when it is at least 1100 px wide,
+unified otherwise, so showing a dock or narrowing the window never cuts every
+line. `cmd-shift-d` (`ctrl-shift-d` on Linux) or the status bar's **Split**
+switches between the two and keeps that choice, keeping the line at the top of
+the viewport in place; **Wrap** next to it toggles soft wrap. The settings
+choose the layout (Auto, Side by side or Unified) and whether both columns
+scroll horizontally together. The title bar shows how many files changed and
+the lines added and removed.
+
+**Hidden files** keep noise out of a review: generated code, snapshots, lock
+files, tests. Add a pattern in **Settings → Hidden files**, press Enter, and the
+matching files leave both the file list and the diff. A pattern without slashes
+around it is plain text that must appear in the file name (`.test` hides
+`cache.test.ts`; with a `/` in it, it must appear in the path: `vendor/`). A
+pattern between slashes is a regular expression searched in the whole path
+(`/\.snap$/`, `/^docs/.*\.md$/`). The title bar counts the hidden files; click
+it to edit the patterns. Patterns apply to every repository. Hiding never
+drops comments (they keep following their code) and a proposal always shows
+everything Claude changed.
+
+The file list shows a filter box when it holds more than 15 files; on a shorter
+list, `/` brings it up. **Settings → Layout → File list** switches between the
+tree and a flat list (`cmd-shift-l`).
 
 Comment on any line, or a range, on either side: hover a line and click the
 gutter "+", or select lines (click, shift-click or drag the gutter) and press
@@ -214,11 +234,14 @@ drafts are kept while Argus runs. Threads show inline under their lines with a
 status chip (Open, Running, Proposed, Resolved, Dismissed), replies and a menu
 to edit, delete, dismiss or reopen. `]c` / `[c` jump between threads, `shift-c`
 folds them all, and the "Comments" tab of the left dock (`cmd-shift-c`) lists
-every thread by file, filterable by status. File-tree rows show a comment
-count. Closed threads (Resolved after Accept, or Dismissed) leave the diff
-and the Comments tab, so both show only what still needs you: the toolbar's
-**Show closed** puts them back inline, and the Resolved and Dismissed chips
-list them again. Debug builds add "Advance status (debug)" to the thread menu, to walk
+every thread by file, filterable by status. File-tree rows show whether Claude
+is working on a file or has a proposal in it. A thread shows its status chip
+only when it says something (Proposed, Resolved, Dismissed); before Claude
+answers, the comment itself is the ask, so the thread offers a quiet **Reply**
+instead of an input. Closed threads (Resolved after Accept, or Dismissed) leave
+the diff and the Comments tab, so both show only what still needs you: the
+status bar's **N closed** puts them back inline, and the Resolved and Dismissed
+chips list them again. Debug builds add "Advance status (debug)" to the thread menu, to walk
 the status chips by hand.
 
 Comments follow their code. Every time the diff is refreshed (branch change,
@@ -238,9 +261,9 @@ comments are moved too, but are never flagged outdated, and neither are
 running or proposed ones while their file is still in the diff: they keep
 their place, with the run's progress and the proposal's Accept.
 
-Run a comment with Claude from its thread: the "Run · sonnet · medium ▾"
-split button runs with the shown model and effort, and its arrow opens the Run
-menu with every model and effort on offer. `r` runs the focused
+Run a comment with Claude from its thread: the "Run ▾" split button runs with
+the default model and effort (its tooltip names them), and its arrow opens the
+Run menu with every model and effort on offer. `r` runs the focused
 thread. The last choice becomes the default for the next run and survives a
 restart. Run is disabled for outdated comments and while Claude Code is
 missing or too old. Each run gets its own worktree, and runs go in parallel.
@@ -266,14 +289,16 @@ status bar's "waiting for you" counter brings the dialog back. Whatever the
 mode, a run can never `git commit`, `git push`, or edit files in your own
 checkout.
 
-The run panel (`cmd-j`, docked right or bottom with `cmd-shift-j`) lists the
-repository's active runs first, then the ones waiting for you: a proposal to
-review, or a failure on a comment that is still open. Finished runs (accepted,
-rejected, dismissed, stopped, empty, or followed by a newer run of the same
-comment) fold behind the header's **Show finished**. Each row shows the comment,
-`file:line`, model and effort, status, elapsed time, turns, cost and a Stop
-button, and the header totals the active runs and their cost. Clicking a row
-jumps to its comment and shows the run's live log: assistant text as
+The run panel (`cmd-j`, docked right or bottom with `cmd-shift-j`) is hidden
+until you want it: threads already show a run's progress and its proposal, and
+a thread's *Running…* or Claude's **What Claude did** opens the panel on that
+run's log. It lists the repository's active runs first, then the ones waiting
+for you: a proposal to review, or a failure on a comment that is still open.
+Finished runs (accepted, rejected, dismissed, stopped, empty, or followed by a
+newer run of the same comment) fold behind the header's **Show finished**. Each
+row shows the comment, `file:line`, status, the elapsed time while it runs and
+a Stop button; the model, effort, turns, cost and duration are in the run's
+log. Clicking a row jumps to its comment and shows the run's live log: assistant text as
 Markdown, tool calls as compact rows (`Edit src/foo.rs (+3 −1)`,
 `Bash git diff`) that expand to their input and output, errors in red, and the
 final summary. The log follows new output until you scroll up. "View prompt"
@@ -284,8 +309,8 @@ When a run finishes with a change, its comment turns Proposed. "View proposal"
 (on the thread, or in its menu) opens a proposal tab next to the diff tab. The
 tab shows only what Claude changed: the diff from the commit the run started at
 to its worktree, including new and deleted files, in the same viewer. Above the
-diff are the comment (its location links back to the thread), the model, effort,
-turns, cost and duration, and Claude's final summary. Files other than the
+diff are the comment (its location links back to the thread) and Claude's final
+summary; the model, effort, turns, cost and duration are in the run's log. Files other than the
 commented one are listed first and badged "outside comment scope". A banner
 warns when the head branch moved after the run started. `a` accepts the
 proposal, `x` rejects it (press it again to confirm), and `r` opens the reply

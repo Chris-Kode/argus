@@ -9,8 +9,9 @@
 //! first, badged "outside comment scope".
 //!
 //! Above the diff: the comment (linking back to its thread in the main
-//! diff), the run's model · effort · turns · cost · duration, Claude's final
-//! summary, and a banner when the head branch moved since the run started.
+//! diff), Claude's final summary, and a banner when the head branch moved
+//! since the run started. The run's model, effort, turns, cost and duration
+//! are in its log (run panel), not here.
 //!
 //! Actions: Accept (`a`), Reject (`x`, asks first), Reply (`r`) and Open in
 //! editor. A reply is sent as a follow-up run by default (the same Claude
@@ -1069,33 +1070,12 @@ impl ProposalView {
             )
         });
 
-        let mut meta = vec![run.model.clone()];
-        if !run.effort.trim().is_empty() {
-            meta.push(run.effort.clone());
-        }
-        if let Some(turns) = run.num_turns {
-            meta.push(format!("{turns} turn{}", if turns == 1 { "" } else { "s" }));
-        }
-        if let Some(cost) = run.cost_usd {
-            meta.push(format_cost(cost));
-        }
-        if let Some(ms) = run.duration_ms {
-            meta.push(format_duration(ms));
-        }
         let status_note = (run.status == RunStatus::Stopped).then(|| {
             div()
-                .flex_none()
+                .text_xs()
                 .text_color(colors.warning)
                 .child("Stopped: partial change")
         });
-        let meta_row = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .text_xs()
-            .text_color(colors.text_muted)
-            .child(meta.join(" · "))
-            .children(status_note);
 
         // A rebase resolution starts from the rebased commits, never the
         // head tip: the banner would always show.
@@ -1146,7 +1126,7 @@ impl ProposalView {
             .children(comment_section)
             .children(resolution)
             .children(markers)
-            .child(meta_row)
+            .children(status_note)
             .children(moved)
             .children(scope)
             .child(
@@ -1512,29 +1492,6 @@ async fn launch_editor(editor: String, file: PathBuf) -> Result<(), String> {
         }
     });
     Ok(())
-}
-
-/// `$0.0123`, or `$1.23` from a dollar up.
-fn format_cost(cost: f64) -> String {
-    if cost >= 1.0 {
-        format!("${cost:.2}")
-    } else {
-        format!("${cost:.4}")
-    }
-}
-
-/// `850 ms`, `42 s`, `3 m 12 s`, `1 h 4 m`.
-fn format_duration(ms: i64) -> String {
-    let ms = ms.max(0);
-    if ms < 1000 {
-        return format!("{ms} ms");
-    }
-    let seconds = ms / 1000;
-    match seconds {
-        0..60 => format!("{seconds} s"),
-        60..3600 => format!("{} m {} s", seconds / 60, seconds % 60),
-        _ => format!("{} h {} m", seconds / 3600, (seconds % 3600) / 60),
-    }
 }
 
 /// The formatted keys bound to action `A`.

@@ -396,6 +396,25 @@ impl MarkdownCache {
 
 /// Renders a parsed body. `id` must be unique among the documents shown
 /// together (element ids of the clickable texts derive from it).
+/// The first non-blank line of `body` as plain text, for one-line
+/// previews: inline code, emphasis and link syntax are dropped, their text
+/// kept (`` `get` takes **two** `` → `get takes two`).
+pub fn first_line_plain(body: &str) -> String {
+    let line = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    let mut text = String::with_capacity(line.len());
+    for event in Parser::new(line) {
+        match event {
+            Event::Text(part) | Event::Code(part) => text.push_str(&part),
+            Event::SoftBreak | Event::HardBreak => text.push(' '),
+            _ => {}
+        }
+    }
+    text
+}
+
 pub fn render(doc: &Markdown, id: SharedString, cx: &App) -> AnyElement {
     let mut counter = 0;
     div()

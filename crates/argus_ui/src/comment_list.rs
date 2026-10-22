@@ -29,6 +29,7 @@ use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
     button, chip, disabled_button, primary_button, status_chip, status_style, text_tooltip,
 };
+use crate::markdown;
 use crate::theme::ActiveTheme;
 
 /// Height of every row (`uniform_list` needs one height).
@@ -424,12 +425,7 @@ impl CommentList {
                         } else {
                             line
                         };
-                        let first = comment
-                            .body_md
-                            .lines()
-                            .find(|line| !line.trim().is_empty())
-                            .unwrap_or_default()
-                            .to_owned();
+                        let first = markdown::first_line_plain(&comment.body_md);
                         let replies = comment.replies.len();
                         div()
                             .id(("comment-row", row_index))
@@ -484,33 +480,39 @@ impl CommentList {
 
     fn render_filter(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
-        let chips = STATUSES.into_iter().map(|status| {
+        // A status no thread is in has nothing to filter: no chip.
+        let chips = STATUSES.into_iter().filter_map(|status| {
             let (label, color) = status_style(status, &colors);
             let count = self
                 .snapshot
                 .iter()
                 .filter(|comment| comment.status == status)
                 .count();
+            if count == 0 {
+                return None;
+            }
             let active = !self.hidden.contains(&status);
             let chip = if active {
                 chip(label, color)
             } else {
                 chip(label, colors.text_placeholder).opacity(0.6)
             };
-            div()
-                .id(SharedString::from(format!("comment-filter-{status}")))
-                .flex()
-                .items_center()
-                .gap_0p5()
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_status(status, cx)))
-                .child(chip)
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(colors.text_placeholder)
-                        .child(count.to_string()),
-                )
+            Some(
+                div()
+                    .id(SharedString::from(format!("comment-filter-{status}")))
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_status(status, cx)))
+                    .child(chip)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors.text_placeholder)
+                            .child(count.to_string()),
+                    ),
+            )
         });
         div()
             .flex()
@@ -523,20 +525,26 @@ impl CommentList {
             .border_b_1()
             .border_color(colors.border_variant)
             .children(chips)
-            .when(!self.hidden.is_empty(), |row| {
-                row.child(
-                    div()
-                        .id("comment-filter-all")
-                        .px_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .text_xs()
-                        .text_color(colors.accent)
-                        .hover(|style| style.bg(colors.element_hover))
-                        .on_click(cx.listener(|this, _, _, cx| this.show_all(cx)))
-                        .child("Show all"),
-                )
-            })
+            // Only when the filter leaves a thread out.
+            .when(
+                self.snapshot
+                    .iter()
+                    .any(|comment| self.hidden.contains(&comment.status)),
+                |row| {
+                    row.child(
+                        div()
+                            .id("comment-filter-all")
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(colors.accent)
+                            .hover(|style| style.bg(colors.element_hover))
+                            .on_click(cx.listener(|this, _, _, cx| this.show_all(cx)))
+                            .child("Show all"),
+                    )
+                },
+            )
     }
 }
 
