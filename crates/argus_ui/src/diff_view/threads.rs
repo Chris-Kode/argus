@@ -61,7 +61,7 @@ use super::{
 };
 use crate::AppContext;
 use crate::components::{
-    accept_button, button, chip, disabled_button, disabled_button_with_icon, icon_button,
+    accept_button, button, chip, disabled_button, disabled_button_with_icon, icon_button, kbd,
     primary_button, radius, reject_button, status_chip, text_tooltip,
 };
 use crate::followup::FollowupKind;
@@ -459,13 +459,7 @@ impl DiffView {
                 .iter()
                 .find(|comment| comment.is_closed() && was_open.contains(&comment.id));
             if let Some(comment) = closed {
-                self.hint = Some(
-                    format!(
-                        "Comment {} and hidden. “Show closed” in the toolbar brings it back.",
-                        comment.status
-                    )
-                    .into(),
-                );
+                self.hint = Some(format!("Comment {} and hidden.", comment.status).into());
             }
         }
         let threads = &mut self.threads;
@@ -2776,16 +2770,6 @@ impl DiffView {
 
     fn render_composer(&self, composer: &Composer, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let selection = &composer.selection;
-        let lines = if selection.end > selection.start {
-            format!("lines {}–{}", selection.start, selection.end)
-        } else {
-            format!("line {}", selection.start)
-        };
-        let side = match selection.side {
-            DiffSide::Old => "old side",
-            DiffSide::New => "new side",
-        };
         div()
             .flex()
             .flex_col()
@@ -2797,12 +2781,6 @@ impl DiffView {
             .bg(colors.elevated_surface)
             .text_color(colors.text)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(colors.text_muted)
-                    .child(format!("New comment on {lines} ({side})")),
-            )
             .child(self.render_editor(&composer.slot, "Comment", false, cx))
             .into_any_element()
     }
@@ -2845,11 +2823,14 @@ impl DiffView {
             if followup {
                 button((key.clone(), 1), save, cx)
                     .on_click(on_save)
+                    .child(kbd(save_keys, cx))
                     .into_any_element()
             } else {
                 primary_button((key.clone(), 1), save, cx)
                     .h(px(24.0))
+                    .gap_1()
                     .on_click(on_save)
+                    .child(kbd(save_keys, cx))
                     .into_any_element()
             }
         };
@@ -2895,11 +2876,6 @@ impl DiffView {
             Some((choice, note)) => (Some(choice), Some(note)),
             None => (None, None),
         };
-        let hint = if followup {
-            format!("{save_keys} to send as a follow-up · Esc to cancel")
-        } else {
-            format!("Markdown · {save_keys} to save · Esc to cancel")
-        };
         div()
             .flex()
             .flex_col()
@@ -2913,21 +2889,15 @@ impl DiffView {
                     .items_center()
                     .justify_end()
                     .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(120.0))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_xs()
-                            .text_color(colors.text_placeholder)
-                            .child(hint),
-                    )
+                    .child(div().flex_1())
                     .children(choice)
-                    .child(button((key.clone(), 0), "Cancel", cx).on_click(
-                        cx.listener(move |this, _, _, cx| this.cancel_editor(&cancel_draft, cx)),
-                    ))
+                    .child(
+                        button((key.clone(), 0), "Cancel", cx)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.cancel_editor(&cancel_draft, cx)
+                            }))
+                            .child(kbd("Esc", cx)),
+                    )
                     .children(note_button)
                     .child(save_button),
             )

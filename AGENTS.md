@@ -96,6 +96,19 @@ service handles plus the tokio runtime handle.
    open the conflict dialog, never fail silently.
 5. Argus never reads or modifies uncommitted changes, and stores no API keys.
 
+## UI copy
+
+Avoid unnecessary secondary labels and descriptions. Let the layout do the
+explaining.
+
+- No taglines, subtitles, eyebrow labels or helper text under a control when
+  its position, title, icon or placeholder already says what it is.
+- Section headers only where the grouping is not already obvious; counts and
+  status are shown once, in one place.
+- Keep text that tells the user something they cannot see: errors, why an
+  action is disabled (in its tooltip), and what an action will do when that is
+  not obvious (e.g. a confirm prompt).
+
 ## Style
 
 - Rustfmt defaults, edition 2024; keep standard clippy lints clean.

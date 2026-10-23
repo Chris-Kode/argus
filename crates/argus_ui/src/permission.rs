@@ -337,10 +337,7 @@ impl Render for PermissionDialog {
         } else {
             format!("Claude wants to use {}", self.request.display_name)
         };
-        let mut subtitle = vec!["RUN WAITING FOR YOU".to_owned()];
-        if self.waiting > 1 {
-            subtitle.push(format!("1 OF {}", self.waiting));
-        }
+        let position = (self.waiting > 1).then(|| format!("1 of {}", self.waiting));
         let body = if question {
             self.render_questions(cx)
         } else {
@@ -381,14 +378,14 @@ impl Render for PermissionDialog {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(colors.text)
                             .child(div().text_color(colors.claude).child("?"))
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(colors.text_muted)
-                            .child(subtitle.join(" · ")),
+                            .child(div().flex_1().child(title))
+                            .children(position.map(|position| {
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(colors.text_muted)
+                                    .child(position)
+                            })),
                     )
                     .children(self.context.clone().map(|context| {
                         div()
