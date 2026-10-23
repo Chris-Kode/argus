@@ -224,13 +224,7 @@ impl AcceptFlow {
             }
             AcceptEvent::CommitMessage { draft, reply } => {
                 let subject = cx.new(|cx| TextEditor::new(draft.subject.clone(), "Subject", cx));
-                let body = cx.new(|cx| {
-                    TextEditor::new(
-                        draft.body.clone(),
-                        "Commit body (optional): what changed and why",
-                        cx,
-                    )
-                });
+                let body = cx.new(|cx| TextEditor::new(draft.body.clone(), "Body (optional)", cx));
                 let on_edit =
                     |this: &mut Self, _, event: &TextEditorEvent, cx: &mut Context<Self>| {
                         match event {
@@ -469,13 +463,6 @@ impl AcceptFlow {
         let theme = cx.theme().clone();
         let colors = &theme.colors;
         let draft = &dialog.draft;
-        let label = |text: &'static str| {
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors.text_muted)
-                .child(text)
-        };
         let field = |editor: Entity<TextEditor>, invalid: bool, min_height: f32| {
             div()
                 .min_h(px(min_height))
@@ -491,22 +478,11 @@ impl AcceptFlow {
                 .text_sm()
                 .child(editor)
         };
-        let files = draft.files.len();
         let mut content = vec![
-            div()
-                .text_xs()
-                .text_color(colors.text_muted)
-                .child(format!(
-                    "One local commit on `{}` ({files} file{}). Nothing is pushed.",
-                    draft.head,
-                    if files == 1 { "" } else { "s" }
-                ))
-                .into_any_element(),
             div()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(label("SUBJECT"))
                 .child(field(dialog.subject.clone(), dialog.empty_subject, 0.0))
                 .when(dialog.empty_subject, |column| {
                     column.child(
@@ -521,7 +497,6 @@ impl AcceptFlow {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(label("BODY"))
                 .child(field(dialog.body.clone(), false, 96.0))
                 .when_some(draft.body_note.clone(), |column, note| {
                     column.child(div().text_xs().text_color(colors.warning).child(format!(
@@ -585,7 +560,7 @@ impl AcceptFlow {
         ];
         self.frame(
             "accept-commit-dialog",
-            "Commit the accepted proposal".into(),
+            format!("Commit on `{}`", draft.head).into(),
             content,
             actions,
             cx,

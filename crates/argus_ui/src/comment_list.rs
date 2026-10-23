@@ -321,12 +321,6 @@ impl CommentList {
                 )
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(colors.text_placeholder)
-                        .child("The code under this comment is no longer in the diff."),
-                )
-                .child(
-                    div()
                         .id("outdated-snippet")
                         .flex()
                         .flex_col()
@@ -558,7 +552,7 @@ impl Render for CommentList {
             } else if self.snapshot.is_empty() {
                 "No comments yet. Hover a line and click “+”, or press c."
             } else if self.snapshot.iter().all(Comment::is_closed) {
-                "Nothing left to review. Click “Resolved” or “Dismissed” to list closed comments."
+                "Nothing left to review."
             } else {
                 "No comment matches the filter."
             };

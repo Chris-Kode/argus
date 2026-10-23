@@ -3014,10 +3014,7 @@ impl Workspace {
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(colors.text)
                                     .child("Argus"),
-                            )
-                            .child(div().text_sm().text_color(colors.text_muted).child(
-                                "Review a branch, comment on lines, and let Claude propose the fixes.",
-                            )),
+                            ),
                     )
                     .child(
                         div()
@@ -3875,11 +3872,6 @@ impl Workspace {
                 }),
                 cx,
             ))
-            .child(div().text_sm().text_color(colors.text_muted).child(
-                "Files left out of the file list and the diff. Text must appear in the file \
-                 name (in the path when it has a /); /…/ is a regular expression searched in \
-                 the path. Press Enter to add.",
-            ))
             .child(self.hidden_file_input.clone())
             .children(
                 self.hidden_file_error
@@ -3987,7 +3979,7 @@ impl Workspace {
             .gap_1()
             .child(section_header("Git", div(), cx))
             .child(row(
-                "Background fetch of the head's upstream (every minute)",
+                "Background fetch",
                 toggle_button(
                     "background-fetch-setting",
                     if settings.background_fetch {

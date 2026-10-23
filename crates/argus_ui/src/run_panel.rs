@@ -1045,7 +1045,7 @@ impl RunPanel {
             } else if self.list_task.is_some() && self.runs.is_empty() {
                 "Loading runs…"
             } else if self.runs.is_empty() {
-                "No runs yet. Comment on a line and run it with Claude (r)."
+                "No runs yet."
             } else {
                 "Nothing running or waiting for review."
             };

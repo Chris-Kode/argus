@@ -1038,18 +1038,15 @@ impl ProposalView {
         let resolution = proposal.resolution.as_ref().map(|resolution| {
             let text = match resolution {
                 Resolution::Accept => format!(
-                    "Conflict resolution: the comment's proposal conflicted with `{}`. This \
-                     proposal re-applies it on {} with the conflicts resolved. Accept commits \
-                     it with the comment's subject; Reject keeps the original proposal.",
+                    "Resolves the conflict with `{}` ({}). Accept commits it with the comment's \
+                     subject; Reject keeps the original proposal.",
                     proposal.head,
                     proposal.start_sha.short(8)
                 ),
                 Resolution::Rebase(rebase) => format!(
-                    "Pull before push: rebasing `{}` onto `{}` stopped at local commit {} \
-                     “{}” (commit {}). This proposal is its resolution, on top of the commits \
-                     replayed so far. Accept continues the rebase (`git rebase --continue`), \
-                     then the push; Reject cancels the rebase and abandons the push. Nothing \
-                     has moved yet.",
+                    "Rebasing `{}` onto `{}` stopped at {} “{}” (commit {}). Accept continues \
+                     the rebase, then the push; Reject abandons the push. Nothing has moved \
+                     yet.",
                     rebase.head,
                     rebase.upstream,
                     rebase.commit.short(8),
@@ -1063,8 +1060,8 @@ impl ProposalView {
             banner(
                 "proposal-markers",
                 format!(
-                    "Conflict markers remain at {markers}. Accept is blocked until they are \
-                     resolved: reply to Claude, or open the file in your editor."
+                    "Conflict markers remain at {markers}; Accept is blocked until they are \
+                     resolved."
                 ),
                 colors.error,
             )
@@ -1092,8 +1089,7 @@ impl ProposalView {
             banner(
                 "proposal-scope",
                 format!(
-                    "{count} file{} outside the comment's scope (listed first). Claude should say \
-                     why in its summary.",
+                    "{count} file{} outside the comment's scope (listed first).",
                     if count == 1 { " is" } else { "s are" }
                 ),
                 colors.warning,
@@ -1345,20 +1341,6 @@ impl ProposalView {
                             .items_center()
                             .justify_end()
                             .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_xs()
-                                    .text_color(colors.text_placeholder)
-                                    .child(
-                                        "A follow-up resumes the same Claude session in this \
-                                         worktree · Esc to close",
-                                    ),
-                            )
                             .child(followup::choice_buttons("proposal-reply", cx))
                             .child(
                                 button("proposal-reply-cancel", "Cancel", cx)

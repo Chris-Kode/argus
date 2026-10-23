@@ -284,36 +284,25 @@ impl ConflictDialog {
     fn description(&self) -> String {
         match &self.source {
             ConflictSource::Accept(conflict) => format!(
-                "The proposal does not apply cleanly on the tip of `{}` ({}). Nothing was \
-                 committed, the head branch did not move, and the proposal stays open. Resolve \
-                 with Claude applies it again in a new worktree, with the conflict markers in \
-                 the files, and starts a resolve run; its result comes back as a proposal of \
-                 this comment.",
+                "The proposal does not apply cleanly on `{}` ({}). Nothing was committed and \
+                 the proposal stays open.",
                 conflict.head,
                 conflict.head_tip.short(8)
             ),
             ConflictSource::Push { conflict, .. } => match &conflict.resolve {
                 None => format!(
-                    "`{}` is behind `{}` ({}), and its commits do not rebase cleanly on the \
-                     remote's. The rebase was aborted: `{}` did not move ({}) and nothing was \
-                     pushed. Resolve with Claude replays the rebase in a new worktree, stopped \
-                     at the first conflicting commit, and starts a resolve run; accepting its \
-                     result continues the rebase, then the push.",
-                    conflict.upstream,
+                    "`{}` does not rebase cleanly on `{}` ({}). The rebase was aborted and \
+                     nothing was pushed.",
+                    conflict.head,
                     conflict.upstream,
                     conflict.upstream_tip.short(8),
-                    conflict.head,
-                    conflict.head_tip.short(8),
                 ),
                 Some(progress) => format!(
-                    "The resolution of the previous commit is in, and the rebase onto `{}` \
-                     stopped at the next conflicting local commit, {} “{}”. `{}` has not moved \
-                     and nothing was pushed. Resolve with Claude starts the next resolve run in \
-                     the same worktree; Cancel deletes it and abandons the push.",
+                    "The rebase onto `{}` stopped at {} “{}”. Nothing was pushed; Cancel \
+                     abandons the push.",
                     progress.upstream,
                     progress.commit.short(8),
                     progress.subject,
-                    progress.head,
                 ),
             },
         }
@@ -409,12 +398,6 @@ impl ConflictDialog {
 impl Render for ConflictDialog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
-        let operation = match &self.source {
-            ConflictSource::Accept(_) => "OPERATION: ACCEPT".to_owned(),
-            ConflictSource::Push { conflict, .. } => {
-                format!("OPERATION: {}", conflict.operation.to_uppercase())
-            }
-        };
         let files = self.render_files(cx);
         let preview = self.render_preview(cx);
         let error = self.error.clone().map(|message| {
@@ -447,14 +430,7 @@ impl Render for ConflictDialog {
                 .on_click(cx.listener(|this, _, _, cx| this.resolve(cx)))
                 .into_any_element()
         };
-        let picker = div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .text_xs()
-            .text_color(colors.text_muted)
-            .child("Model · effort")
-            .child(followup::choice_buttons("conflict", cx));
+        let picker = followup::choice_buttons("conflict", cx);
         div()
             .id("conflict-backdrop")
             .absolute()
@@ -493,26 +469,9 @@ impl Render for ConflictDialog {
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(colors.text_muted)
-                            .child(operation),
-                    )
-                    .child(
-                        div()
                             .text_sm()
                             .text_color(colors.text_muted)
                             .child(self.description()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(colors.text_muted)
-                            .child(format!(
-                                "CONFLICTED FILES ({}) · click one to preview it",
-                                self.source.files().len()
-                            )),
                     )
                     .child(files)
                     .children(preview)
