@@ -2153,7 +2153,7 @@ impl DiffView {
                         .border_r(CARD_BORDER)
                         .border_b(CARD_BORDER)
                         .border_color(colors.border)
-                        .rounded_b(radius::LG.min(cap))
+                        .rounded_b(radius::lg(cx).min(cap))
                         .bg(colors.background),
                 )
             })
@@ -2625,7 +2625,7 @@ impl DiffView {
                                 .items_center()
                                 .justify_center()
                                 .size(px(16.0))
-                                .rounded(radius::XS)
+                                .rounded(radius::xs(cx))
                                 .bg(accent)
                                 .text_color(colors.accent_text)
                                 .font_weight(FontWeight::BOLD)
@@ -2888,7 +2888,7 @@ impl DiffView {
             div()
                 .flex_none()
                 .px_1p5()
-                .rounded(radius::SM)
+                .rounded(radius::sm(cx))
                 .border_1()
                 .border_color(colors.border)
                 .font_family(theme.fonts.code_family.clone())
@@ -2951,7 +2951,7 @@ impl DiffView {
             .gap_1p5()
             .h(px(24.0))
             .px_2()
-            .rounded(radius::SM)
+            .rounded(radius::sm(cx))
             .cursor_pointer()
             .text_color(if viewed {
                 colors.text
@@ -2967,7 +2967,7 @@ impl DiffView {
                     .items_center()
                     .justify_center()
                     .size(px(14.0))
-                    .rounded(radius::XS)
+                    .rounded(radius::xs(cx))
                     .border_1()
                     .when(viewed, |check| {
                         check
@@ -2985,7 +2985,7 @@ impl DiffView {
             .items_center()
             .justify_center()
             .size(px(22.0))
-            .rounded(radius::SM)
+            .rounded(radius::sm(cx))
             .cursor_pointer()
             .hover(|style| style.bg(colors.element_hover))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(file, cx)))
@@ -3039,7 +3039,7 @@ impl DiffView {
             .border_l(CARD_BORDER)
             .border_r(CARD_BORDER)
             .when(collapsed, |header| {
-                header.border_b(CARD_BORDER).rounded(radius::LG)
+                header.border_b(CARD_BORDER).rounded(radius::lg(cx))
             })
             .when(!collapsed, |header| {
                 // The outline stays `border`; the line under the header is
@@ -3047,7 +3047,7 @@ impl DiffView {
                 // Stuck to the top, the card's top edge has scrolled away:
                 // square corners, or the rows scrolling under show through.
                 header
-                    .when(!stuck, |header| header.rounded_t(radius::LG))
+                    .when(!stuck, |header| header.rounded_t(radius::lg(cx)))
                     .child(
                         div()
                             .absolute()
@@ -3094,7 +3094,7 @@ impl DiffView {
                         .max_w(px(640.0))
                         .px_3()
                         .py_1p5()
-                        .rounded(radius::MD)
+                        .rounded(radius::md(cx))
                         .border_1()
                         .border_color(colors.warning.opacity(0.5))
                         .bg(colors.elevated_surface)
@@ -3198,7 +3198,7 @@ impl Render for DiffView {
                         .m_3()
                         .px_3()
                         .py_2()
-                        .rounded_md()
+                        .rounded(radius::sm(cx))
                         .border_1()
                         .border_color(colors.error.opacity(0.6))
                         .bg(colors.error.opacity(0.08))
@@ -3355,7 +3355,7 @@ impl Render for DiffView {
                         .left(CARD_INSET)
                         .right(CARD_INSET)
                         .h(row_height * HEADER_ROWS as f32)
-                        .when(!stuck, |sticky| sticky.rounded_t(radius::LG))
+                        .when(!stuck, |sticky| sticky.rounded_t(radius::lg(cx)))
                         .when(stuck, |sticky| sticky.shadow(vec![sticky_shadow]))
                         .block_mouse_except_scroll()
                         .child(sticky),

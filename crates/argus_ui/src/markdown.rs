@@ -23,6 +23,7 @@ use gpui::{
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::AppContext;
+use crate::components::radius;
 use crate::theme::{ActiveTheme, Theme};
 
 /// Parsed bodies a cache keeps beyond the ones in use.
@@ -600,7 +601,7 @@ fn render_code(language: Option<Language>, code: &str, cx: &App) -> AnyElement {
         .w_full()
         .px_2()
         .py_1()
-        .rounded_md()
+        .rounded(radius::sm(cx))
         .bg(colors.surface)
         .border_1()
         .border_color(colors.border_variant)

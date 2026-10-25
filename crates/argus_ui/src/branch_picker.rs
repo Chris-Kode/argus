@@ -14,6 +14,7 @@ use gpui::{
     uniform_list,
 };
 
+use crate::components::radius;
 use crate::fuzzy::FuzzyQuery;
 use crate::keymap::{Dismiss, TEXT_INPUT_CONTEXT};
 use crate::session::{Side, now_seconds, relative_time};
@@ -276,7 +277,7 @@ impl BranchPicker {
                         .h(px(ROW_HEIGHT))
                         .px_3()
                         .mx_1()
-                        .rounded_md()
+                        .rounded(radius::sm(cx))
                         .cursor_pointer()
                         .when(highlighted, |row| row.bg(colors.element_selected))
                         .hover(|style| style.bg(colors.element_hover))
@@ -375,7 +376,7 @@ impl Render for BranchPicker {
             .flex()
             .flex_col()
             .w(px(PICKER_WIDTH))
-            .rounded_lg()
+            .rounded(radius::md(cx))
             .border_1()
             .border_color(colors.border)
             .bg(colors.elevated_surface)

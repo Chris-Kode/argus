@@ -18,20 +18,34 @@ use crate::file_tree::model::kind_letter;
 use crate::icons::{IconName, icon};
 use crate::theme::{ActiveTheme, ThemeColors};
 
-/// The corner-radius scale (Panoptes #56 §4). Components use these instead
-/// of GPUI's `rounded_*` helpers so every surface shares one shape language.
+/// The corner-radius scale (Panoptes #56 §4), sized by the active
+/// [`crate::UiStyle`]. Components use these instead of GPUI's `rounded_*`
+/// helpers so every surface shares one shape language.
 pub mod radius {
-    use gpui::{Pixels, px};
+    use gpui::{App, Pixels};
+
+    use crate::theme::ActiveTheme;
 
     /// Letter badges (A/M/D), keycaps, inline code.
-    pub const XS: Pixels = px(4.0);
+    pub fn xs(cx: &App) -> Pixels {
+        cx.theme().radius.xs
+    }
+
     /// Buttons, inputs, tabs, segmented items, tree rows.
-    pub const SM: Pixels = px(6.0);
+    pub fn sm(cx: &App) -> Pixels {
+        cx.theme().radius.sm
+    }
+
     /// Control groups (breadcrumb, segmented control, split buttons), insets
     /// and swatches.
-    pub const MD: Pixels = px(8.0);
+    pub fn md(cx: &App) -> Pixels {
+        cx.theme().radius.md
+    }
+
     /// Cards: file, thread and run cards, sheets, popovers.
-    pub const LG: Pixels = px(12.0);
+    pub fn lg(cx: &App) -> Pixels {
+        cx.theme().radius.lg
+    }
 }
 
 /// Icon size inside buttons and chips.
@@ -61,7 +75,7 @@ fn ghost_button(
         .gap_1()
         .h(px(24.0))
         .px_2()
-        .rounded(radius::SM)
+        .rounded(radius::sm(cx))
         .text_sm()
         .text_color(text_color)
         .cursor_pointer()
@@ -132,7 +146,7 @@ pub fn disabled_ghost_button_with_icon(
         .gap_1()
         .h(px(24.0))
         .px_2()
-        .rounded(radius::SM)
+        .rounded(radius::sm(cx))
         .text_sm()
         .text_color(color)
         .child(icon(icon_name, BUTTON_ICON_SIZE, color))
@@ -157,7 +171,7 @@ pub fn disabled_icon_button(
         .justify_center()
         .w(px(26.0))
         .h(px(22.0))
-        .rounded(radius::SM)
+        .rounded(radius::sm(cx))
         .child(icon(icon_name, BUTTON_ICON_SIZE, color))
         .tooltip(text_tooltip(tooltip.into()))
 }
@@ -241,7 +255,7 @@ fn icon_button_inner(
         .justify_center()
         .w(px(26.0))
         .h(px(22.0))
-        .rounded(radius::SM)
+        .rounded(radius::sm(cx))
         .cursor_pointer()
         .when(selected, |this| this.bg(colors.element_selected))
         .hover(|style| style.bg(colors.element_hover))
@@ -287,7 +301,7 @@ fn primary_button_inner(
         .gap_1()
         .h(px(28.0))
         .px_3()
-        .rounded(radius::SM)
+        .rounded(radius::sm(cx))
         .bg(colors.accent)
         .text_sm()
         .font_weight(FontWeight::MEDIUM)
@@ -371,7 +385,7 @@ fn disabled_button_inner(
         .gap_1()
         .h(px(24.0))
         .px_2()
-        .rounded(radius::SM)
+        .rounded(radius::sm(cx))
         .border_1()
         .border_color(colors.border_variant)
         .text_sm()
@@ -438,7 +452,7 @@ impl RenderOnce for Segmented {
             .items_center()
             .gap_0p5()
             .p(px(2.0))
-            .rounded(radius::MD)
+            .rounded(radius::md(cx))
             .bg(colors.surface)
             .border_1()
             .border_color(colors.border_variant)
@@ -452,7 +466,7 @@ pub fn kbd(keys: impl Into<SharedString>, cx: &App) -> Div {
     div()
         .flex_none()
         .px_1()
-        .rounded(radius::XS)
+        .rounded(radius::xs(cx))
         .border_1()
         .border_color(theme.colors.border)
         .bg(theme.colors.background)
@@ -600,7 +614,7 @@ pub fn letter_badge(kind: ChangeKind, size: BadgeSize, cx: &App) -> Div {
         .items_center()
         .justify_center()
         .size(side)
-        .rounded(radius::XS)
+        .rounded(radius::xs(cx))
         .bg(color.opacity(0.16))
         .font_family(theme.fonts.code_family.clone())
         .text_size(text_size)
@@ -675,7 +689,7 @@ impl gpui::Render for TextTooltip {
             .max_w(px(320.0))
             .px_2()
             .py_1()
-            .rounded(radius::LG)
+            .rounded(radius::lg(cx))
             .border_1()
             .border_color(colors.border)
             .bg(colors.elevated_surface)

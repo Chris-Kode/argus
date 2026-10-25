@@ -10,6 +10,7 @@ use gpui::{
     prelude::*, px,
 };
 
+use crate::components::radius;
 use crate::keymap::TEXT_INPUT_CONTEXT;
 use crate::theme::ActiveTheme;
 
@@ -152,7 +153,7 @@ impl Render for TextField {
             .gap_0p5()
             .h(px(24.0))
             .px_2()
-            .rounded_md()
+            .rounded(radius::sm(cx))
             .border_1()
             .border_color(if self.invalid {
                 colors.error

@@ -27,7 +27,7 @@ use gpui::{
 
 use crate::AppContext;
 use crate::claude_status::observe_claude_status;
-use crate::components::{button, section_header, toggle_button};
+use crate::components::{button, radius, section_header, toggle_button};
 use crate::runtime::spawn_job;
 use crate::text_field::{TextField, TextFieldEvent};
 use crate::theme::ActiveTheme;
@@ -458,7 +458,7 @@ impl ClaudeSettingsForm {
                     .items_center()
                     .gap_0p5()
                     .p_0p5()
-                    .rounded_md()
+                    .rounded(radius::sm(cx))
                     .border_1()
                     .border_color(colors.border_variant)
                     .children(buttons),

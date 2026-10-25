@@ -18,7 +18,7 @@ use gpui::{
 };
 
 use crate::AppContext;
-use crate::components::{button, disabled_button, kbd, primary_button, toggle_button};
+use crate::components::{button, disabled_button, kbd, primary_button, radius, toggle_button};
 use crate::text_field::TextField;
 use crate::theme::ActiveTheme;
 
@@ -183,7 +183,7 @@ impl PermissionDialog {
                     .max_h(px(240.0))
                     .overflow_y_scroll()
                     .p_2()
-                    .rounded_md()
+                    .rounded(radius::sm(cx))
                     .border_1()
                     .border_color(colors.border_variant)
                     .bg(colors.background)
@@ -364,7 +364,7 @@ impl Render for PermissionDialog {
                     .max_h(px(680.0))
                     .overflow_y_scroll()
                     .p_4()
-                    .rounded_lg()
+                    .rounded(radius::md(cx))
                     .border_1()
                     .border_color(colors.claude.opacity(0.6))
                     .bg(colors.elevated_surface)

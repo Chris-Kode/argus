@@ -27,7 +27,7 @@ use gpui::{
 
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
-    button, chip, disabled_button, primary_button, status_chip, status_style, text_tooltip,
+    button, chip, disabled_button, primary_button, radius, status_chip, status_style, text_tooltip,
 };
 use crate::markdown;
 use crate::theme::ActiveTheme;
@@ -327,7 +327,7 @@ impl CommentList {
                         .min_h_0()
                         .overflow_scroll()
                         .py_1()
-                        .rounded_md()
+                        .rounded(radius::sm(cx))
                         .border_1()
                         .border_color(colors.border_variant)
                         .bg(colors.background)
@@ -429,7 +429,7 @@ impl CommentList {
                             .h(px(ROW_HEIGHT))
                             .px_2()
                             .mx_1()
-                            .rounded_md()
+                            .rounded(radius::sm(cx))
                             .cursor_pointer()
                             .when(selected, |row| row.bg(colors.element_selected))
                             .hover(|style| style.bg(colors.element_hover))

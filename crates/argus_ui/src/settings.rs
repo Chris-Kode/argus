@@ -1,7 +1,7 @@
 //! Settings persisted in the `settings` table (spec §10).
 //!
 //! [`Settings`] bundles the two typed records: [`UiSettings`] under the
-//! [`UI_SETTINGS_KEY`] key (theme, fonts, dock sizes and visibility, diff
+//! [`UI_SETTINGS_KEY`] key (UI style, theme, fonts, dock sizes and visibility, diff
 //! display options) and [`ClaudeSettings`] under
 //! [`argus_runs::settings::CLAUDE_SETTINGS_KEY`] (the run defaults). Both
 //! default every missing field and ignore unknown ones, so records written by
@@ -14,7 +14,7 @@ use argus_runs::ClaudeSettings;
 use argus_store::SettingsStore;
 use serde::{Deserialize, Serialize};
 
-use crate::theme::ThemeMode;
+use crate::theme::{ThemeMode, UiStyle};
 
 /// Settings key holding the JSON-encoded [`UiSettings`].
 pub const UI_SETTINGS_KEY: &str = "ui";
@@ -199,6 +199,8 @@ impl Default for RunPanelDock {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiSettings {
+    /// Zed or VS Code chrome.
+    pub ui_style: UiStyle,
     /// System, dark or light.
     pub theme: ThemeMode,
     /// UI font family override; `None` picks the bundled IBM Plex Sans.
@@ -239,6 +241,7 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            ui_style: UiStyle::Zed,
             theme: ThemeMode::System,
             ui_font_family: None,
             code_font_family: None,
@@ -286,10 +289,11 @@ impl UiSettings {
         self.diff_link_horizontal_scroll = defaults.diff_link_horizontal_scroll;
     }
 
-    /// Resets the Appearance section: theme mode, fonts and
+    /// Resets the Appearance section: UI style, theme mode, fonts and
     /// reduce motion.
     pub fn reset_appearance(&mut self) {
         let defaults = Self::default();
+        self.ui_style = defaults.ui_style;
         self.theme = defaults.theme;
         self.ui_font_family = defaults.ui_font_family;
         self.code_font_family = defaults.code_font_family;

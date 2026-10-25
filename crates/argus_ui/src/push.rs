@@ -37,7 +37,7 @@ use gpui::{
 use tokio::sync::oneshot;
 
 use crate::AppContext;
-use crate::components::{button, primary_button, toggle_button};
+use crate::components::{button, primary_button, radius, toggle_button};
 use crate::runtime::{RuntimeJob, spawn_job};
 use crate::theme::ActiveTheme;
 
@@ -502,7 +502,7 @@ impl PushFlow {
                     .max_h(px(240.0))
                     .overflow_y_scroll()
                     .p_2()
-                    .rounded_md()
+                    .rounded(radius::sm(cx))
                     .border_1()
                     .border_color(colors.border_variant)
                     .bg(colors.background)
@@ -596,7 +596,7 @@ impl PushFlow {
             .flex_col()
             .gap_2()
             .p_3()
-            .rounded_lg()
+            .rounded(radius::md(cx))
             .border_1()
             .border_color(colors.border)
             .bg(colors.elevated_surface)
@@ -644,7 +644,7 @@ impl PushFlow {
                     .max_h(px(600.0))
                     .overflow_y_scroll()
                     .p_4()
-                    .rounded_lg()
+                    .rounded(radius::md(cx))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.elevated_surface)
