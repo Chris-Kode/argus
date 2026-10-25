@@ -49,7 +49,7 @@ use crate::icons::{IconName, icon};
 use crate::jobs::BackgroundJobs;
 use crate::markdown::{self, MarkdownCache};
 use crate::runtime::spawn_job;
-use crate::theme::{ActiveTheme, ThemeColors};
+use crate::theme::{ActiveTheme, Theme, ThemeColors};
 
 /// Recent runs listed per repository.
 const RECENT_RUNS: usize = 200;
@@ -957,7 +957,7 @@ impl RunPanel {
             .pr(px(4.0))
             .py(px(4.0))
             .min_w_0()
-            .rounded(radius::MD)
+            .rounded(radius::md(cx))
             .border_1()
             .border_color(colors.border_variant)
             .cursor_pointer()
@@ -1031,7 +1031,7 @@ impl RunPanel {
                         .max_w(px(DIALOG_WIDTH))
                         .h(relative(0.85))
                         .max_h(px(DIALOG_HEIGHT))
-                        .rounded_lg()
+                        .rounded(radius::md(cx))
                         .border_1()
                         .border_color(colors.border)
                         .bg(colors.elevated_surface)
@@ -1335,9 +1335,7 @@ impl RunPanel {
                     expanded,
                     cx,
                 )
-                .when(expanded, |row| {
-                    row.child(detail_block(&text, colors, &code_font))
-                })
+                .when(expanded, |row| row.child(detail_block(&text, &theme)))
                 .into_any_element()
             }
             LogEntry::Tool(call) => {
@@ -1355,10 +1353,10 @@ impl RunPanel {
                     .font_family(code_font.clone())
                     .when(expanded, |row| {
                         row.child(detail_label("Input", colors))
-                            .child(detail_block(&call.input, colors, &code_font))
+                            .child(detail_block(&call.input, &theme))
                             .when_some(call.output.clone(), |row, output| {
                                 row.child(detail_label("Output", colors)).child(
-                                    detail_block(&output, colors, &code_font)
+                                    detail_block(&output, &theme)
                                         .when(call.is_error, |b| b.text_color(colors.error)),
                                 )
                             })
@@ -1377,7 +1375,7 @@ impl RunPanel {
                     div()
                         .px_2()
                         .py_1()
-                        .rounded_md()
+                        .rounded(radius::sm(cx))
                         .border_1()
                         .border_color(colors.error.opacity(0.5))
                         .bg(colors.error.opacity(0.08))
@@ -1446,9 +1444,7 @@ impl RunPanel {
                 expanded,
                 cx,
             )
-            .when(expanded, |row| {
-                row.child(detail_block(&json, colors, &code_font))
-            })
+            .when(expanded, |row| row.child(detail_block(&json, &theme)))
             .into_any_element(),
         }
     }
@@ -1560,7 +1556,8 @@ fn detail_label(label: &'static str, colors: &ThemeColors) -> gpui::Div {
 }
 
 /// A tool payload in the code font, cut to [`MAX_DETAIL_LINES`].
-fn detail_block(text: &str, colors: &ThemeColors, font: &SharedString) -> gpui::Div {
+fn detail_block(text: &str, theme: &Theme) -> gpui::Div {
+    let colors = &theme.colors;
     let mut lines = text.lines();
     let mut shown: String = lines
         .by_ref()
@@ -1578,9 +1575,9 @@ fn detail_block(text: &str, colors: &ThemeColors, font: &SharedString) -> gpui::
         .ml_4()
         .px_2()
         .py_1()
-        .rounded_md()
+        .rounded(theme.radius.sm)
         .bg(colors.surface)
-        .font_family(font.clone())
+        .font_family(theme.fonts.code_family.clone())
         .text_xs()
         .text_color(colors.text)
         .child(shown)

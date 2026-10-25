@@ -22,6 +22,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::components::radius;
 use crate::keymap::{
     Backspace, COMMENT_EDITOR_CONTEXT, Copy, Cut, Delete, Dismiss, MoveDown, MoveLeft, MoveRight,
     MoveToLineEnd, MoveToLineStart, MoveUp, MoveWordLeft, MoveWordRight, Newline, Paste, SelectAll,
@@ -676,7 +677,7 @@ impl Render for TextEditor {
             .min_h(px(64.0))
             .px_2()
             .py_1p5()
-            .rounded_md()
+            .rounded(radius::sm(cx))
             .border_1()
             .border_color(if focused {
                 colors.accent

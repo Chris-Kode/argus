@@ -53,7 +53,7 @@ use crate::AppContext;
 use crate::comments::ReviewComments;
 use crate::components::{
     accept_button, button, disabled_button, disabled_button_with_icon, kbd, placeholder,
-    primary_button, reject_button, reply_button, status_chip,
+    primary_button, radius, reject_button, reply_button, status_chip,
 };
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
 use crate::followup::{self, FollowupKind};
@@ -977,7 +977,7 @@ impl ProposalView {
                 .id(id)
                 .px_2()
                 .py_1()
-                .rounded_md()
+                .rounded(radius::sm(cx))
                 .border_1()
                 .border_color(tint.opacity(0.4))
                 .bg(tint.opacity(0.1))
@@ -1412,7 +1412,7 @@ impl Render for ProposalView {
                 .m_3()
                 .px_3()
                 .py_2()
-                .rounded_md()
+                .rounded(radius::sm(cx))
                 .border_1()
                 .border_color(colors.error.opacity(0.6))
                 .bg(colors.error.opacity(0.08))

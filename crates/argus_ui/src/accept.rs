@@ -32,7 +32,7 @@ use gpui::{
 use tokio::sync::oneshot;
 
 use crate::AppContext;
-use crate::components::{button, kbd, primary_button};
+use crate::components::{button, kbd, primary_button, radius};
 use crate::runtime::spawn_job;
 use crate::text_editor::{TextEditor, TextEditorEvent};
 use crate::theme::ActiveTheme;
@@ -380,7 +380,7 @@ impl AcceptFlow {
                     .max_h(px(640.0))
                     .overflow_y_scroll()
                     .p_4()
-                    .rounded_lg()
+                    .rounded(radius::md(cx))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.elevated_surface)
@@ -470,7 +470,7 @@ impl AcceptFlow {
                 .overflow_hidden()
                 .px_2()
                 .py_1()
-                .rounded_md()
+                .rounded(radius::sm(cx))
                 .border_1()
                 .border_color(if invalid { colors.error } else { colors.border })
                 .bg(colors.background)
@@ -513,7 +513,7 @@ impl AcceptFlow {
                     .gap_1()
                     .px_2()
                     .py_1()
-                    .rounded_md()
+                    .rounded(radius::sm(cx))
                     .border_1()
                     .border_color(colors.error.opacity(0.6))
                     .bg(colors.error.opacity(0.08))

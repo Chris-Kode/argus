@@ -850,7 +850,7 @@ impl FileTree {
                 .gap_2()
                 .h(px(ROW_HEIGHT))
                 .pr(px(6.0))
-                .rounded(radius::SM)
+                .rounded(radius::sm(cx))
                 .text_size(ROW_TEXT_SIZE)
                 .whitespace_nowrap()
                 .cursor_pointer()
@@ -1016,7 +1016,7 @@ impl FileTree {
             .gap_0p5()
             .h(px(24.0))
             .px_2()
-            .rounded(radius::SM)
+            .rounded(radius::sm(cx))
             .border_1()
             .border_color(if focused {
                 colors.accent

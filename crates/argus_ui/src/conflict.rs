@@ -23,7 +23,7 @@ use gpui::{
 };
 
 use crate::AppContext;
-use crate::components::{button, disabled_button, kbd, primary_button};
+use crate::components::{button, disabled_button, kbd, primary_button, radius};
 use crate::followup;
 use crate::runtime::spawn_job;
 use crate::theme::ActiveTheme;
@@ -383,7 +383,7 @@ impl ConflictDialog {
                 .max_h(px(300.0))
                 .overflow_scroll()
                 .p_2()
-                .rounded_md()
+                .rounded(radius::sm(cx))
                 .border_1()
                 .border_color(colors.border_variant)
                 .bg(colors.background)
@@ -404,7 +404,7 @@ impl Render for ConflictDialog {
             div()
                 .px_2()
                 .py_1()
-                .rounded_md()
+                .rounded(radius::sm(cx))
                 .border_1()
                 .border_color(colors.error.opacity(0.6))
                 .bg(colors.error.opacity(0.08))
@@ -451,7 +451,7 @@ impl Render for ConflictDialog {
                     .max_h(px(680.0))
                     .overflow_y_scroll()
                     .p_4()
-                    .rounded_lg()
+                    .rounded(radius::md(cx))
                     .border_1()
                     .border_color(colors.warning.opacity(0.6))
                     .bg(colors.elevated_surface)

@@ -369,6 +369,12 @@ default rules to `~/.argus/review-rules.md`. It never overwrites that file, and
 every run appends it to Claude's system prompt. "Open in editor" opens it with
 the system's default application.
 
+The Appearance section picks the UI style and the theme. **Zed** uses One Dark
+and One Light with rounded controls. **VS Code** uses Dark Modern and Light
+Modern with Dark+ / Light+ syntax colors, square controls, an activity bar
+(Files, Comments, Settings) and a centered title. Either style follows the
+system appearance or stays dark or light.
+
 ![Settings](docs/screenshots/settings-light.png)
 
 Code is syntax-highlighted with tree-sitter, Zed-style, for Rust,

@@ -84,16 +84,26 @@ use crate::settings::{
     MIN_DOCK_SIZE, RunPanelPosition, UiSettings, clamp_font_size, clamp_tab_width,
 };
 use crate::text_field::{TextField, TextFieldEvent};
-use crate::theme::{ActiveTheme, Theme, ThemeFonts, ThemeMode};
+use crate::theme::{ActiveTheme, Theme, ThemeFonts, ThemeMode, UiStyle};
 use crate::update::{UpdateStatus, Updater, UpdaterEvent};
 use crate::{AppContext, OpenRequest};
 
 /// Height of the title bar.
 const TITLE_BAR_HEIGHT: Pixels = px(40.0);
+/// Height of the title bar in the VS Code style.
+const VSCODE_TITLE_BAR_HEIGHT: Pixels = px(35.0);
 /// Tooltip of the title-bar swap button.
 const SWAP_TOOLTIP: &str = "Swap base and head";
 /// Height of the status bar.
 const STATUS_BAR_HEIGHT: Pixels = px(28.0);
+/// Height of the status bar in the VS Code style.
+const VSCODE_STATUS_BAR_HEIGHT: Pixels = px(22.0);
+/// Width of the VS Code style's activity bar.
+const ACTIVITY_BAR_WIDTH: Pixels = px(48.0);
+/// Icon size in the activity bar.
+const ACTIVITY_ICON_SIZE: Pixels = px(24.0);
+/// Height of the center tab bar and of the VS Code sidebar title.
+const VSCODE_HEADER_HEIGHT: Pixels = px(35.0);
 /// Text size of the status bar.
 const STATUS_TEXT_SIZE: Pixels = px(11.5);
 /// Icon size of the status-bar counters.
@@ -451,7 +461,7 @@ impl Workspace {
             code_size: px(self.settings.code_font_size),
         };
         let appearance = self.settings.theme.resolve(window.appearance());
-        cx.set_global(Theme::new(appearance, fonts));
+        cx.set_global(Theme::new(self.settings.ui_style, appearance, fonts));
         cx.refresh_windows();
     }
 
@@ -467,7 +477,8 @@ impl Workspace {
         if self.settings == before {
             return;
         }
-        let theme_changed = self.settings.theme != before.theme
+        let theme_changed = self.settings.ui_style != before.ui_style
+            || self.settings.theme != before.theme
             || self.settings.ui_font_family != before.ui_font_family
             || self.settings.code_font_family != before.code_font_family
             || self.settings.ui_font_size != before.ui_font_size
@@ -527,6 +538,37 @@ impl Workspace {
         }
     }
 
+    /// Whether the chrome follows VS Code rather than Zed.
+    fn is_vscode(&self) -> bool {
+        self.settings.ui_style == UiStyle::VsCode
+    }
+
+    fn title_bar_height(&self) -> Pixels {
+        if self.is_vscode() {
+            VSCODE_TITLE_BAR_HEIGHT
+        } else {
+            TITLE_BAR_HEIGHT
+        }
+    }
+
+    fn status_bar_height(&self) -> Pixels {
+        if self.is_vscode() {
+            VSCODE_STATUS_BAR_HEIGHT
+        } else {
+            STATUS_BAR_HEIGHT
+        }
+    }
+
+    /// Width of the activity bar left of the file tree; none in the Zed
+    /// style.
+    fn activity_bar_width(&self) -> f32 {
+        if self.is_vscode() {
+            ACTIVITY_BAR_WIDTH.as_f32()
+        } else {
+            0.0
+        }
+    }
+
     /// Whether the diff shows side by side: the setting, with `Auto`
     /// resolved against the width the diff had at the last render.
     fn is_split(&self) -> bool {
@@ -538,7 +580,7 @@ impl Workspace {
     fn center_width(&self, viewport_width: f32) -> f32 {
         let file_tree = &self.settings.file_tree;
         let run_panel = &self.settings.run_panel;
-        let mut width = viewport_width;
+        let mut width = viewport_width - self.activity_bar_width();
         if file_tree.visible {
             width -= file_tree.width;
         }
@@ -2010,17 +2052,21 @@ impl Workspace {
         } else {
             0.0
         };
-        let left_dock_width = if self.settings.file_tree.visible {
-            self.settings.file_tree.width
-        } else {
-            0.0
-        };
+        let activity_bar_width = self.activity_bar_width();
+        let left_dock_width = activity_bar_width
+            + if self.settings.file_tree.visible {
+                self.settings.file_tree.width
+            } else {
+                0.0
+            };
+        let (title_bar_height, status_bar_height) =
+            (self.title_bar_height(), self.status_bar_height());
         let x = position.x.as_f32();
         let y = position.y.as_f32();
         self.update_settings(window, cx, |settings| match dock {
             DockResize::FileTree => {
-                let max = width - right_dock_width - MIN_CENTER_SIZE;
-                settings.file_tree.width = clamp_size(x, max);
+                let max = width - activity_bar_width - right_dock_width - MIN_CENTER_SIZE;
+                settings.file_tree.width = clamp_size(x - activity_bar_width, max);
             }
             DockResize::RunPanel => match settings.run_panel.position {
                 RunPanelPosition::Right => {
@@ -2028,8 +2074,8 @@ impl Workspace {
                     settings.run_panel.width = clamp_size(width - x, max);
                 }
                 RunPanelPosition::Bottom => {
-                    let bottom = height - STATUS_BAR_HEIGHT.as_f32();
-                    let max = bottom - TITLE_BAR_HEIGHT.as_f32() - MIN_CENTER_SIZE;
+                    let bottom = height - status_bar_height.as_f32();
+                    let max = bottom - title_bar_height.as_f32() - MIN_CENTER_SIZE;
                     settings.run_panel.height = clamp_size(bottom - y, max);
                 }
             },
@@ -2100,7 +2146,7 @@ impl Workspace {
     /// The title bar (Panoptes #56 §5): the breadcrumb group (eye mark,
     /// repo, base, swap, head) on the left; the diff mode segmented control,
     /// Fetch and the Push split button on the right.
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let session = self.session.as_ref().map(|session| session.read(cx));
         let repo_label: SharedString = session
@@ -2144,7 +2190,7 @@ impl Workspace {
             .h(px(28.0))
             .pl_2()
             .pr(px(3.0))
-            .rounded(radius::MD)
+            .rounded(radius::md(cx))
             .bg(colors.surface)
             .border_1()
             .border_color(colors.border_variant)
@@ -2179,15 +2225,23 @@ impl Workspace {
         };
         let push = self.render_push_button(session, cx);
         let update = self.render_update_button(cx);
+        let actions = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1p5()
+            .children(update)
+            .children(fetch)
+            .children(push);
 
-        div()
+        let bar = div()
             .id("title-bar")
             .window_control_area(WindowControlArea::Drag)
             .flex()
             .flex_none()
             .items_center()
             .justify_between()
-            .h(TITLE_BAR_HEIGHT)
+            .h(self.title_bar_height())
             .pl(TRAFFIC_LIGHTS_WIDTH)
             .pr(px(10.0))
             .gap_2()
@@ -2198,8 +2252,23 @@ impl Workspace {
                 if event.click_count() == 2 && cfg!(target_os = "macos") {
                     window.titlebar_double_click();
                 }
-            })
-            .child(
+            });
+        if self.is_vscode() {
+            // VS Code's command center: the breadcrumb centered between two
+            // equal sides.
+            bar.child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .min_w_0()
+                    .children(self.render_diff_summary(cx)),
+            )
+            .child(breadcrumb)
+            .child(div().flex().flex_1().justify_end().min_w_0().child(actions))
+            .into_any_element()
+        } else {
+            bar.child(
                 div()
                     .flex()
                     .items_center()
@@ -2208,16 +2277,9 @@ impl Workspace {
                     .child(breadcrumb)
                     .children(self.render_diff_summary(cx)),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_1p5()
-                    .children(update)
-                    .children(fetch)
-                    .children(push),
-            )
+            .child(actions)
+            .into_any_element()
+        }
     }
 
     /// `4 files +27 −5 · 2 hidden` after the breadcrumb, for the main diff;
@@ -2240,7 +2302,7 @@ impl Workspace {
                 .id("title-hidden-files")
                 .flex_none()
                 .px_1()
-                .rounded(radius::SM)
+                .rounded(radius::sm(cx))
                 .cursor_pointer()
                 .text_color(colors.text_placeholder)
                 .hover(|style| style.bg(colors.element_hover))
@@ -2498,7 +2560,7 @@ impl Workspace {
             .flex_none()
             .items_center()
             .h(px(28.0))
-            .rounded(radius::MD)
+            .rounded(radius::md(cx))
             .border_1()
             .border_color(colors.border)
             .overflow_hidden()
@@ -2561,7 +2623,7 @@ impl Workspace {
             .h(px(22.0))
             .max_w(px(260.0))
             .px_1p5()
-            .rounded(radius::SM)
+            .rounded(radius::sm(cx))
             .overflow_hidden()
             .whitespace_nowrap()
             .font_family(theme.fonts.code_family.clone())
@@ -2706,7 +2768,9 @@ impl Workspace {
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .child(panel_header("Files", cx))
+                    .when(!self.is_vscode(), |body| {
+                        body.child(panel_header("Files", cx))
+                    })
                     .child(placeholder(text, cx))
                     .into_any_element()
             }
@@ -2731,6 +2795,23 @@ impl Workspace {
     /// the comments.
     fn render_left_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
+        if self.is_vscode() {
+            // The activity bar switches the view; the sidebar only names it.
+            let title = match self.left_tab {
+                LeftTab::Files => "FILES",
+                LeftTab::Comments => "COMMENTS",
+            };
+            return div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(VSCODE_HEADER_HEIGHT)
+                .px(px(20.0))
+                .text_size(px(11.0))
+                .text_color(colors.text)
+                .child(title)
+                .into_any_element();
+        }
         let tab = |id: &'static str, label: &'static str, tab: LeftTab, cx: &mut Context<Self>| {
             let active = self.left_tab == tab;
             div()
@@ -2741,7 +2822,7 @@ impl Workspace {
                 .gap(px(6.0))
                 .h(px(24.0))
                 .px(px(10.0))
-                .rounded(radius::SM)
+                .rounded(radius::sm(cx))
                 .text_size(px(12.0))
                 .cursor_pointer()
                 .text_color(if active {
@@ -2769,6 +2850,101 @@ impl Workspace {
             .child(tab("left-tab-files", "Files", LeftTab::Files, cx))
             .child(tab("left-tab-comments", "Comments", LeftTab::Comments, cx))
             .into_any_element()
+    }
+
+    /// VS Code's activity bar: one icon per left-dock view, settings at the
+    /// bottom. Clicking the shown view hides the dock, as in VS Code.
+    fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors.clone();
+        let dock_visible = self.settings.file_tree.visible;
+        let item = |id: &'static str, icon_name: IconName, tooltip: String, active: bool| {
+            let color = if active {
+                colors.text
+            } else {
+                colors.text_muted
+            };
+            div()
+                .id(id)
+                .relative()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(ACTIVITY_BAR_WIDTH)
+                .cursor_pointer()
+                .tooltip(text_tooltip(tooltip))
+                .child(icon(icon_name, ACTIVITY_ICON_SIZE, color))
+                .when(active, |item| {
+                    item.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .w(px(2.0))
+                            .bg(colors.accent),
+                    )
+                })
+                .when(!active, |item| {
+                    item.opacity(0.8).hover(|style| style.opacity(1.0))
+                })
+        };
+        let view = |id: &'static str,
+                    icon_name: IconName,
+                    tooltip: String,
+                    tab: LeftTab,
+                    cx: &mut Context<Self>| {
+            let active = dock_visible && self.left_tab == tab;
+            item(id, icon_name, tooltip, active).on_click(cx.listener(
+                move |this, _, window, cx| {
+                    if active {
+                        this.update_settings(window, cx, |settings| {
+                            settings.file_tree.visible = false;
+                        });
+                    } else {
+                        this.show_left_tab(tab, window, cx);
+                    }
+                },
+            ))
+        };
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .justify_between()
+            .h_full()
+            .w(ACTIVITY_BAR_WIDTH)
+            .bg(colors.surface)
+            .border_r_1()
+            .border_color(colors.border)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(view(
+                        "activity-files",
+                        IconName::Files,
+                        with_shortcut::<ToggleFileTree>("Files"),
+                        LeftTab::Files,
+                        cx,
+                    ))
+                    .child(view(
+                        "activity-comments",
+                        IconName::ChatText,
+                        with_shortcut::<ToggleCommentList>("Comments"),
+                        LeftTab::Comments,
+                        cx,
+                    )),
+            )
+            .child(
+                item(
+                    "activity-settings",
+                    IconName::GearSix,
+                    with_shortcut::<OpenSettings>("Settings"),
+                    self.sheet == Some(Sheet::Settings),
+                )
+                .on_click(|_, window, cx| window.dispatch_action(OpenSettings.boxed_clone(), cx)),
+            )
     }
 
     fn render_run_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2922,7 +3098,11 @@ impl Workspace {
                         .id("center-tabs")
                         .flex()
                         .flex_none()
-                        .h(px(32.0))
+                        .h(if self.is_vscode() {
+                            VSCODE_HEADER_HEIGHT
+                        } else {
+                            px(32.0)
+                        })
                         .overflow_x_scroll()
                         .bg(colors.surface)
                         .border_b_1()
@@ -2957,7 +3137,7 @@ impl Workspace {
                         .id("comparison-error")
                         .px_3()
                         .py_2()
-                        .rounded_md()
+                        .rounded(radius::sm(cx))
                         .border_1()
                         .border_color(colors.error.opacity(0.6))
                         .bg(colors.error.opacity(0.08))
@@ -3014,7 +3194,7 @@ impl Workspace {
                                 .min_w_0()
                                 .h(px(28.0))
                                 .px_2()
-                                .rounded(radius::SM)
+                                .rounded(radius::sm(cx))
                                 .text_sm()
                                 .cursor_pointer()
                                 .hover(|style| style.bg(colors.element_hover))
@@ -3223,7 +3403,7 @@ impl Workspace {
                 .gap_1()
                 .h(px(20.0))
                 .px_1p5()
-                .rounded(radius::SM)
+                .rounded(radius::sm(cx))
                 .cursor_pointer()
                 .text_color(colors.claude_text)
                 .bg(colors.claude_soft)
@@ -3249,7 +3429,7 @@ impl Workspace {
                 .gap_1()
                 .h(px(20.0))
                 .px_1p5()
-                .rounded(radius::SM)
+                .rounded(radius::sm(cx))
                 .cursor_pointer()
                 .text_color(colors.text_placeholder)
                 .when(shown, |counter| counter.bg(colors.element_selected))
@@ -3308,14 +3488,42 @@ impl Workspace {
         )
         .on_click(|_, window, cx| window.dispatch_action(ToggleRunPanel.boxed_clone(), cx));
 
+        // VS Code moves the dock toggles and the settings to the activity
+        // bar, and opens the bar on its accent-filled remote indicator.
+        let vscode = self.is_vscode();
+        let indicator = vscode.then(|| {
+            div()
+                .id("status-open-repository")
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .h_full()
+                .px(px(9.0))
+                .mr_1()
+                .cursor_pointer()
+                .bg(colors.accent)
+                .hover(|style| style.opacity(0.9))
+                .tooltip(text_tooltip(with_shortcut::<OpenRepository>(
+                    "Open Repository…",
+                )))
+                .child(icon(
+                    IconName::ArgusEyeMono,
+                    STATUS_ICON_SIZE,
+                    colors.accent_text,
+                ))
+                .on_click(|_, window, cx| window.dispatch_action(OpenRepository.boxed_clone(), cx))
+        });
+
         div()
             .flex()
             .flex_none()
             .items_center()
             .justify_between()
             .gap_2()
-            .h(STATUS_BAR_HEIGHT)
-            .px_1()
+            .h(self.status_bar_height())
+            .when(vscode, |bar| bar.pr_1())
+            .when(!vscode, |bar| bar.px_1())
             .bg(colors.status_bar)
             .border_t_1()
             .border_color(colors.border_variant)
@@ -3327,9 +3535,11 @@ impl Workspace {
                     .items_center()
                     .gap_0p5()
                     .min_w_0()
-                    .child(files)
-                    .child(comments)
-                    .child(divider)
+                    .h_full()
+                    .children(indicator)
+                    .when(!vscode, |bar| {
+                        bar.child(files).child(comments).child(divider)
+                    })
                     .children(waiting)
                     .children(counters.into_iter().flatten())
                     .children(closed)
@@ -3343,17 +3553,19 @@ impl Workspace {
                     .min_w_0()
                     .children(job_indicator.map(|jobs| jobs.mr_1()))
                     .when(self.diff_view.is_some(), |bar| bar.child(split).child(wrap))
-                    .child(
-                        icon_button(
-                            "status-settings",
-                            IconName::SlidersHorizontal,
-                            with_shortcut::<OpenSettings>("Settings"),
-                            cx,
+                    .when(!vscode, |bar| {
+                        bar.child(
+                            icon_button(
+                                "status-settings",
+                                IconName::SlidersHorizontal,
+                                with_shortcut::<OpenSettings>("Settings"),
+                                cx,
+                            )
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(OpenSettings.boxed_clone(), cx)
+                            }),
                         )
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(OpenSettings.boxed_clone(), cx)
-                        }),
-                    )
+                    })
                     .child(
                         icon_button(
                             "status-shortcuts",
@@ -3389,7 +3601,7 @@ impl Workspace {
             .gap_1()
             .h(px(20.0))
             .px_1p5()
-            .rounded(radius::SM)
+            .rounded(radius::sm(cx))
             .cursor_pointer()
             .text_color(color)
             .hover(|style| style.bg(colors.element_hover))
@@ -3452,7 +3664,7 @@ impl Workspace {
                         Sheet::Settings => 640.0,
                     }))
                     .max_h(px(600.0))
-                    .rounded_lg()
+                    .rounded(radius::md(cx))
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.elevated_surface)
@@ -3565,7 +3777,7 @@ impl Workspace {
                         .gap_3()
                         .w(px(460.0))
                         .p_4()
-                        .rounded_lg()
+                        .rounded(radius::md(cx))
                         .border_1()
                         .border_color(colors.border)
                         .bg(colors.elevated_surface)
@@ -3693,7 +3905,7 @@ impl Workspace {
                 .items_center()
                 .gap_0p5()
                 .p_0p5()
-                .rounded_md()
+                .rounded(radius::sm(cx))
                 .border_1()
                 .border_color(colors.border_variant)
                 .children(children)
@@ -3731,6 +3943,21 @@ impl Workspace {
                 .into_any_element()
         };
 
+        let style_buttons = UiStyle::ALL
+            .into_iter()
+            .map(|style| {
+                toggle_button(
+                    ("ui-style", style as usize),
+                    style.label(),
+                    settings.ui_style == style,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.update_settings(window, cx, |settings| settings.ui_style = style)
+                }))
+                .into_any_element()
+            })
+            .collect();
         let theme_buttons = ThemeMode::ALL
             .iter()
             .map(|mode| {
@@ -3876,7 +4103,7 @@ impl Workspace {
                     .justify_between()
                     .gap_2()
                     .pl_2()
-                    .rounded(radius::SM)
+                    .rounded(radius::sm(cx))
                     .bg(colors.surface)
                     .child(
                         div()
@@ -3932,6 +4159,7 @@ impl Workspace {
                 reset("reset-appearance-settings", UiSettings::reset_appearance),
                 cx,
             ))
+            .child(row("UI style", segmented(style_buttons)))
             .child(row("Theme", segmented(theme_buttons)))
             .child(row("Active theme", muted(theme.name.clone())))
             .child(row(
@@ -4097,6 +4325,9 @@ impl Render for Workspace {
             .flex_1()
             .min_h_0()
             .w_full()
+            .when(self.is_vscode(), |body| {
+                body.child(self.render_activity_bar(cx))
+            })
             .when(self.settings.file_tree.visible, |body| {
                 body.child(self.render_file_tree(cx))
             })
