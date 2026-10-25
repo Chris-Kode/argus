@@ -14,7 +14,7 @@ use argus_runs::ClaudeSettings;
 use argus_store::SettingsStore;
 use serde::{Deserialize, Serialize};
 
-use crate::theme::{ThemeFamily, ThemeMode};
+use crate::theme::ThemeMode;
 
 /// Settings key holding the JSON-encoded [`UiSettings`].
 pub const UI_SETTINGS_KEY: &str = "ui";
@@ -201,9 +201,6 @@ impl Default for RunPanelDock {
 pub struct UiSettings {
     /// System, dark or light.
     pub theme: ThemeMode,
-    /// Panoptes (default) or One. Records written before the field existed
-    /// load as Panoptes.
-    pub theme_family: ThemeFamily,
     /// UI font family override; `None` picks the bundled IBM Plex Sans.
     pub ui_font_family: Option<String>,
     /// Code font family override; `None` picks the bundled IBM Plex Mono.
@@ -243,7 +240,6 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             theme: ThemeMode::System,
-            theme_family: ThemeFamily::Panoptes,
             ui_font_family: None,
             code_font_family: None,
             ui_font_size: DEFAULT_UI_FONT_SIZE,
@@ -290,12 +286,11 @@ impl UiSettings {
         self.diff_link_horizontal_scroll = defaults.diff_link_horizontal_scroll;
     }
 
-    /// Resets the Appearance section: theme mode, theme family, fonts and
+    /// Resets the Appearance section: theme mode, fonts and
     /// reduce motion.
     pub fn reset_appearance(&mut self) {
         let defaults = Self::default();
         self.theme = defaults.theme;
-        self.theme_family = defaults.theme_family;
         self.ui_font_family = defaults.ui_font_family;
         self.code_font_family = defaults.code_font_family;
         self.ui_font_size = defaults.ui_font_size;

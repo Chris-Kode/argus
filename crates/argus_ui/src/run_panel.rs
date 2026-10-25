@@ -5,16 +5,14 @@
 //!   runs (accepted, dismissed, rejected, stopped, empty, or followed by a
 //!   newer run of their comment) are folded away behind "Show finished", so
 //!   the list holds what is running or waiting for the reviewer
-//!   ([`finished_runs`]). Each run
-//!   is a card styled by its state (Panoptes #56 §3, §5): a running run is
-//!   gold with the pulsing eye, its elapsed time and its latest steps; a
-//!   run ready to review is teal with its `+n −m`; failed runs carry an
-//!   `error` label and the quiet states stay neutral. A card shows the
-//!   comment's first line and `file:line`, the elapsed time while the run
-//!   is live, and Stop. Model, effort, turns, cost and duration belong to
-//!   the log. Clicking a card selects it and asks the workspace to scroll
-//!   the diff to its comment ([`RunPanelEvent::OpenComment`]); a thread's
-//!   "What Claude did" opens a run's log directly ([`RunPanel::show_run`]).
+//!   ([`finished_runs`]). Each run is a compact, neutral card: the comment's
+//!   first line, its state and `file:line`, the elapsed time and Stop while
+//!   the run is live, and its latest step while it runs; only the status
+//!   icon is colored. Model, effort, turns, cost and duration belong to the
+//!   log. Clicking a card opens its log in a dialog and asks the workspace
+//!   to scroll the diff to its comment ([`RunPanelEvent::OpenComment`]); a
+//!   thread's "What Claude did" opens a run's log directly
+//!   ([`RunPanel::show_run`]).
 //! - **Log.** The selected run's events are folded into rows by
 //!   [`RunLog`]: a stored log is rebuilt on the tokio runtime, then live
 //!   events are appended as they stream. The log is a virtualized [`list`],
@@ -37,14 +35,15 @@ use argus_runs::stream::{AssistantContent, StreamEvent, UserContent};
 use argus_runs::{LogEntry, RunLog, RunStreamEvent, RunUpdate};
 use argus_store::{CommentId, CommentStatus, RepoId, RunId, RunListing, RunStatus};
 use gpui::{
-    AnyElement, Context, EventEmitter, FollowMode, FontWeight, Hsla, ListAlignment, ListState,
-    SharedString, Task, Window, div, list, prelude::*, px,
+    AnyElement, App, Context, EventEmitter, FollowMode, FontWeight, Hsla, ListAlignment, ListState,
+    MouseButton, SharedString, Task, Window, div, list, prelude::*, px, relative,
 };
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::AppContext;
 use crate::components::{
-    button, claude_activity, disabled_button, icon_button, placeholder, radius, toggle_button,
+    button, claude_activity, disabled_button, disabled_icon_button, icon_button, kbd, placeholder,
+    radius, toggle_button,
 };
 use crate::icons::{IconName, icon};
 use crate::jobs::BackgroundJobs;
@@ -54,19 +53,23 @@ use crate::theme::{ActiveTheme, ThemeColors};
 
 /// Recent runs listed per repository.
 const RECENT_RUNS: usize = 200;
-/// Height the card list takes when a log is shown under it.
-const LIST_HEIGHT_WITH_LOG: f32 = 280.0;
 /// Pixels of cards rendered beyond the list's viewport.
 const CARD_OVERDRAW: f32 = 200.0;
-/// Space around the card list and between cards (Panoptes #56 §5).
-const CARD_GAP: f32 = 8.0;
-const LIST_PADDING: f32 = 10.0;
+/// Space around the card list and between cards.
+const CARD_GAP: f32 = 4.0;
+const LIST_PADDING: f32 = 6.0;
+/// Width of a card's status icon column; the lines under it are indented
+/// by it plus the gap, so they line up with the summary.
+const STATUS_ICON: f32 = 14.0;
+const CARD_INDENT: f32 = STATUS_ICON + 8.0;
 /// Latest steps a running card shows.
-const LIVE_STEPS: usize = 4;
-/// Text sizes of a card (Panoptes #56 §5).
+const LIVE_STEPS: usize = 1;
+/// Text sizes of a card.
 const TITLE_TEXT: f32 = 12.5;
-const LABEL_TEXT: f32 = 12.0;
 const MONO_TEXT: f32 = 11.0;
+/// Largest size of the log dialog; it shrinks with the window.
+const DIALOG_WIDTH: f32 = 880.0;
+const DIALOG_HEIGHT: f32 = 720.0;
 /// Live events applied per repaint at most; the rest follow at once.
 const EVENT_BATCH: usize = 512;
 /// Pixels rendered beyond the log's viewport, so short scrolls do not
@@ -100,7 +103,6 @@ pub enum RunPanelEvent {
 struct Step {
     id: String,
     label: String,
-    finished: bool,
     failed: bool,
 }
 
@@ -124,7 +126,6 @@ impl LiveSteps {
                         self.steps.push_back(Step {
                             id: id.clone(),
                             label: tool_label(name, input, self.cwd.as_deref()),
-                            finished: false,
                             failed: false,
                         });
                         if self.steps.len() > LIVE_STEPS {
@@ -142,7 +143,6 @@ impl LiveSteps {
                             .iter_mut()
                             .find(|step| step.id == result.tool_use_id)
                     {
-                        step.finished = true;
                         step.failed = result.is_error;
                         changed = true;
                     }
@@ -186,11 +186,10 @@ pub struct RunPanel {
     line_counts: HashMap<RunId, Option<(u64, u64)>>,
     /// Comments whose run is being started.
     starting: HashSet<CommentId>,
+    /// The run whose log dialog is open.
     selected: Option<RunId>,
     log: Option<LogView>,
     show_prompt: bool,
-    /// Docked at the bottom: list and log side by side.
-    horizontal: bool,
     /// The card list; cards differ in height, so it is a measured [`list`].
     cards: ListState,
     markdown: MarkdownCache,
@@ -279,7 +278,6 @@ impl RunPanel {
             selected: None,
             log: None,
             show_prompt: false,
-            horizontal: false,
             cards: ListState::new(0, ListAlignment::Top, px(CARD_OVERDRAW)),
             markdown: MarkdownCache::default(),
             list_task: None,
@@ -307,14 +305,6 @@ impl RunPanel {
         self.show_prompt = false;
         self.reload(cx);
         cx.notify();
-    }
-
-    /// Shows the list and the log side by side (bottom dock) or stacked.
-    pub fn set_horizontal(&mut self, horizontal: bool, cx: &mut Context<Self>) {
-        if self.horizontal != horizontal {
-            self.horizontal = horizontal;
-            cx.notify();
-        }
     }
 
     /// Where a listed run works and the first line of its comment, e.g.
@@ -346,8 +336,8 @@ impl RunPanel {
 
     /// Starts a run of `comment_id` with `model` and `effort`. The start
     /// itself runs on the tokio runtime and is never cut short; once the
-    /// process runs, the panel selects the run and reports
-    /// [`RunPanelEvent::Started`].
+    /// process runs, the panel reports [`RunPanelEvent::Started`]. Its log
+    /// stays closed: the card shows its progress.
     pub fn start(
         &mut self,
         comment_id: CommentId,
@@ -368,10 +358,7 @@ impl RunPanel {
             this.update(cx, |this, cx| {
                 this.starting.remove(&comment_id);
                 match result {
-                    Ok(Ok(run_id)) => {
-                        this.select(run_id, cx);
-                        cx.emit(RunPanelEvent::Started(run_id));
-                    }
+                    Ok(Ok(run_id)) => cx.emit(RunPanelEvent::Started(run_id)),
                     Ok(Err(error)) => {
                         tracing::warn!(comment = %comment_id, %error, "cannot start the run");
                         cx.emit(RunPanelEvent::Notice {
@@ -576,13 +563,13 @@ impl RunPanel {
         cx.notify();
     }
 
-    /// Opens the log of `run_id` (a thread's "What Claude did").
+    /// Opens the log dialog of `run_id` (a thread's "What Claude did").
     pub fn show_run(&mut self, run_id: RunId, cx: &mut Context<Self>) {
         self.select(run_id, cx);
     }
 
-    /// Opens the log of the newest run of `comment_id` (a running thread's
-    /// "Running…"); nothing when it has none listed yet.
+    /// Opens the log dialog of the newest run of `comment_id` (a running
+    /// thread's "Running…"); nothing when it has none listed yet.
     pub fn show_comment_run(&mut self, comment_id: CommentId, cx: &mut Context<Self>) {
         let newest = self
             .runs
@@ -595,7 +582,7 @@ impl RunPanel {
         }
     }
 
-    /// Selects a run and loads its log.
+    /// Opens the log dialog of a run and loads its log.
     fn select(&mut self, run_id: RunId, cx: &mut Context<Self>) {
         if self.selected != Some(run_id) {
             self.selected = Some(run_id);
@@ -605,7 +592,13 @@ impl RunPanel {
         cx.notify();
     }
 
-    fn close_log(&mut self, cx: &mut Context<Self>) {
+    /// Whether a run's log dialog is open.
+    pub fn has_dialog(&self) -> bool {
+        self.log.is_some()
+    }
+
+    /// Closes the log dialog.
+    pub fn close_dialog(&mut self, cx: &mut Context<Self>) {
         self.selected = None;
         self.log = None;
         self.show_prompt = false;
@@ -837,198 +830,148 @@ impl RunPanel {
             .then(|| self.line_counts.get(&id).copied().flatten())
             .flatten();
 
-        let status_icon = match status {
-            RunStatus::Running => claude_activity(px(14.0), cx),
-            // Starting: the eye, still and muted (motion is for live work).
-            RunStatus::Queued => {
-                icon(IconName::ArgusEyeMono, px(14.0), style.label).into_any_element()
+        let stop = status.is_active().then(|| {
+            if self.stopping.contains(&id) {
+                disabled_icon_button(("run-stop", index), IconName::X, "Stopping…", cx)
+                    .into_any_element()
+            } else {
+                let tooltip = if status == RunStatus::Queued {
+                    "Cancel"
+                } else {
+                    "Stop"
+                };
+                icon_button(("run-stop", index), IconName::X, tooltip, cx)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.stop(id, cx);
+                    }))
+                    .into_any_element()
             }
-            RunStatus::Succeeded => {
-                icon(IconName::GitPullRequest, px(13.0), style.label).into_any_element()
-            }
-            RunStatus::Failed => icon(IconName::Warning, px(13.0), style.label).into_any_element(),
-            RunStatus::NoChanges => icon(IconName::Check, px(12.0), style.label).into_any_element(),
-            RunStatus::Stopped | RunStatus::Rejected => {
-                icon(IconName::X, px(12.0), style.label).into_any_element()
-            }
-        };
-        let header = div()
+        });
+        let top = div()
             .flex()
             .items_center()
             .gap_2()
             .min_w_0()
-            .child(status_icon)
+            .h(px(22.0))
             .child(
                 div()
+                    .flex()
                     .flex_none()
-                    .text_size(px(LABEL_TEXT))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(style.label)
-                    .child(style.text),
+                    .justify_center()
+                    .w(px(STATUS_ICON))
+                    .child(status_icon(status, &style, cx)),
             )
-            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(TITLE_TEXT))
+                    .text_color(if style.quiet {
+                        colors.text_muted
+                    } else {
+                        colors.text
+                    })
+                    .child(snippet),
+            )
             .children(elapsed.map(|elapsed| {
                 div()
                     .flex_none()
                     .font_family(mono.clone())
                     .text_size(px(MONO_TEXT))
-                    .text_color(style.secondary)
+                    .text_color(colors.text_placeholder)
                     .child(elapsed)
-            }));
-        let summary = div()
-            .min_w_0()
-            .overflow_hidden()
-            .text_ellipsis()
-            .whitespace_nowrap()
-            .text_size(px(TITLE_TEXT))
-            .text_color(style.summary)
-            .child(snippet);
-        let location_row = div()
+            }))
+            .children(stop);
+
+        let meta = div()
             .flex()
             .items_center()
             .gap(px(6.0))
             .min_w_0()
-            .font_family(mono.clone())
+            .pl(px(CARD_INDENT))
             .text_size(px(MONO_TEXT))
+            .text_color(colors.text_placeholder)
+            .child(div().flex_none().child(style.text))
+            .child(div().flex_none().child("·"))
             .child(
                 div()
-                    .flex_none()
-                    .max_w_full()
+                    .min_w_0()
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_color(style.secondary)
+                    .font_family(mono.clone())
                     .child(location),
             )
             .when_some(line_counts, |row, (added, removed)| {
                 row.child(
                     div()
                         .flex_none()
+                        .font_family(mono.clone())
                         .text_color(colors.diff_added_text)
                         .child(format!("+{added}")),
                 )
                 .child(
                     div()
                         .flex_none()
+                        .font_family(mono.clone())
                         .text_color(colors.diff_removed_text)
                         .child(format!("−{removed}")),
                 )
             });
 
-        let steps = (status == RunStatus::Running).then(|| {
-            let steps = self
-                .steps
-                .get(&id)
-                .map(|live| live.steps.iter().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-            let inset = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_2()
-                .rounded(radius::MD)
-                .bg(colors.background)
-                .font_family(mono.clone())
-                .text_size(px(MONO_TEXT))
-                .text_color(colors.text_muted);
-            if steps.is_empty() {
-                return inset
-                    .child(
-                        div()
-                            .text_color(colors.text_placeholder)
-                            .child("Waiting for Claude…"),
-                    )
-                    .into_any_element();
-            }
-            inset
-                .children(steps.into_iter().map(|step| {
-                    let (name, color) = match (step.finished, step.failed) {
-                        (true, true) => (IconName::Warning, colors.error),
-                        (true, false) => (IconName::Check, colors.text_muted),
-                        (false, _) => (IconName::CaretRight, colors.text),
-                    };
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .min_w_0()
-                        .text_color(color)
-                        .child(icon(name, px(11.0), color))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(step.label),
-                        )
-                }))
-                .into_any_element()
-        });
+        let step = (status == RunStatus::Running)
+            .then(|| {
+                self.steps
+                    .get(&id)
+                    .and_then(|live| live.steps.back().cloned())
+            })
+            .flatten()
+            .map(|step| {
+                let color = if step.failed {
+                    colors.error
+                } else {
+                    colors.text_muted
+                };
+                div()
+                    .min_w_0()
+                    .pl(px(CARD_INDENT))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .font_family(mono.clone())
+                    .text_size(px(MONO_TEXT))
+                    .text_color(color)
+                    .child(step.label)
+            });
 
-        let stop = status.is_active().then(|| {
-            let label = if status == RunStatus::Queued {
-                "Cancel"
-            } else {
-                "Stop"
-            };
-            let control = if self.stopping.contains(&id) {
-                disabled_button(("run-stop", index), "Stopping…", cx)
-                    .h(px(22.0))
-                    .text_size(px(LABEL_TEXT))
-                    .into_any_element()
-            } else {
-                button(("run-stop", index), label, cx)
-                    .h(px(22.0))
-                    .text_size(px(LABEL_TEXT))
-                    .text_color(colors.text_muted)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.stop(id, cx);
-                    }))
-                    .into_any_element()
-            };
-            // Ghost buttons pad their label; line it up with the text above.
-            div().flex().ml(px(-8.0)).child(control)
-        });
-
-        let border = if selected {
-            colors.accent
-        } else {
-            style.border
-        };
         let card = div()
             .id(("run-card", index))
             .flex()
             .flex_col()
-            .gap(px(if status == RunStatus::Running {
-                8.0
-            } else {
-                6.0
-            }))
-            .px(px(12.0))
-            .py(px(10.0))
+            .gap(px(2.0))
+            .pl(px(8.0))
+            .pr(px(4.0))
+            .py(px(4.0))
             .min_w_0()
-            .rounded(radius::LG)
+            .rounded(radius::MD)
             .border_1()
-            .border_color(border)
+            .border_color(colors.border_variant)
             .cursor_pointer()
-            .when_some(style.fill, |card, fill| card.bg(fill))
-            .when(style.fill.is_none(), |card| {
-                card.hover(|style| style.bg(colors.element_hover))
-            })
+            .when(selected, |card| card.bg(colors.element_selected))
+            .hover(|style| style.bg(colors.element_hover))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.select(id, cx);
                 if let Some(comment_id) = comment_id {
                     cx.emit(RunPanelEvent::OpenComment(comment_id));
                 }
             }))
-            .child(header)
-            .child(summary)
-            .child(location_row)
-            .children(steps)
-            .children(stop);
+            .child(top)
+            .child(meta)
+            .children(step);
         let last = index + 1 == self.shown.len();
         div()
             .px(px(LIST_PADDING))
@@ -1060,25 +1003,79 @@ impl RunPanel {
         .into_any_element()
     }
 
+    /// The open run's log dialog, drawn by the workspace over the window;
+    /// `None` when no run is open.
+    pub fn render_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let detail = self.log.as_ref().map(|view| self.render_detail(view, cx))?;
+        let colors = cx.theme().colors.clone();
+        Some(
+            div()
+                .id("run-dialog-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(colors.overlay)
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.close_dialog(cx)),
+                )
+                .child(
+                    div()
+                        .id("run-dialog")
+                        .flex()
+                        .flex_col()
+                        .w(relative(0.85))
+                        .max_w(px(DIALOG_WIDTH))
+                        .h(relative(0.85))
+                        .max_h(px(DIALOG_HEIGHT))
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.elevated_surface)
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(detail),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_detail(&self, view: &LogView, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
+        let mono = cx.theme().fonts.code_family.clone();
         let listing = self.listing(view.run_id);
+        let title = listing
+            .map(|listing| markdown::first_line_plain(&listing.body_md))
+            .unwrap_or_else(|| "Run".into());
+        let status = listing.map(|listing| {
+            let finished = self
+                .finished
+                .contains(&listing.run.id)
+                .then_some(listing.comment_status);
+            let style = card_style(listing.run.status, finished, &colors);
+            (status_icon(listing.run.status, &style, cx), style.text)
+        });
         // The log is where the run's details live: model and effort here,
         // turns, cost and duration in its summary.
-        let title = listing
-            .map(|listing| {
-                let run = &listing.run;
-                let mut title = format!(
-                    "{}:{} · {}",
-                    listing.file_path, listing.start_line, run.model
-                );
-                if !run.effort.is_empty() {
-                    title.push_str(" · ");
-                    title.push_str(&run.effort);
-                }
-                title
-            })
-            .unwrap_or_else(|| "Run".to_owned());
+        let meta = listing.map(|listing| {
+            let run = &listing.run;
+            let mut meta = if run.comment_id.is_some() {
+                format!("{}:{}", listing.file_path, listing.start_line)
+            } else {
+                listing.file_path.clone()
+            };
+            meta.push_str(" · ");
+            meta.push_str(&run.model);
+            if !run.effort.is_empty() {
+                meta.push_str(" · ");
+                meta.push_str(&run.effort);
+            }
+            meta
+        });
         // A rejected run's worktree is gone.
         let worktree = listing
             .filter(|listing| listing.run.status != RunStatus::Rejected)
@@ -1086,14 +1083,74 @@ impl RunPanel {
         let proposal = listing
             .filter(|listing| self.is_reviewable(listing))
             .map(|listing| listing.run.id);
+        let stop = listing
+            .filter(|listing| listing.run.status.is_active())
+            .map(|listing| {
+                let id = listing.run.id;
+                if self.stopping.contains(&id) {
+                    disabled_button("run-dialog-stop", "Stopping…", cx)
+                        .h(px(22.0))
+                        .text_xs()
+                        .into_any_element()
+                } else {
+                    let label = if listing.run.status == RunStatus::Queued {
+                        "Cancel"
+                    } else {
+                        "Stop"
+                    };
+                    button("run-dialog-stop", label, cx)
+                        .h(px(22.0))
+                        .text_xs()
+                        .on_click(cx.listener(move |this, _, _, cx| this.stop(id, cx)))
+                        .into_any_element()
+                }
+            });
+
+        let header = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .h(px(40.0))
+            .px_4()
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .children(status.map(|(icon, label)| {
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .child(icon)
+                    .child(div().text_sm().text_color(colors.text_muted).child(label))
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.text)
+                    .child(title),
+            )
+            .child(
+                kbd("Esc", cx)
+                    .id("run-dialog-close")
+                    .cursor_pointer()
+                    .hover(|style| style.bg(colors.element_hover))
+                    .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
+            );
         let toolbar =
             div()
                 .flex()
                 .flex_none()
                 .items_center()
                 .gap_1()
-                .h(px(30.0))
-                .px_2()
+                .h(px(32.0))
+                .pl_4()
+                .pr_2()
                 .border_b_1()
                 .border_color(colors.border_variant)
                 .text_xs()
@@ -1104,21 +1161,24 @@ impl RunPanel {
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .text_color(colors.text_muted)
-                        .child(title),
+                        .font_family(mono.clone())
+                        .text_color(colors.text_placeholder)
+                        .children(meta),
                 )
+                .children(stop)
                 .children(proposal.map(|run_id| {
                     button("run-view-proposal", "View proposal", cx)
-                        .h(px(20.0))
+                        .h(px(22.0))
                         .text_xs()
                         .text_color(colors.accent)
-                        .on_click(cx.listener(move |_, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_dialog(cx);
                             cx.emit(RunPanelEvent::ViewProposal(run_id));
                         }))
                 }))
                 .child(
                     toggle_button("run-view-prompt", "View prompt", self.show_prompt, cx)
-                        .h(px(20.0))
+                        .h(px(22.0))
                         .text_xs()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.show_prompt = !this.show_prompt;
@@ -1127,7 +1187,7 @@ impl RunPanel {
                 )
                 .children(worktree.clone().map(|path| {
                     button("run-reveal", reveal_label(), cx)
-                        .h(px(20.0))
+                        .h(px(22.0))
                         .text_xs()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_worktree(path.clone(), false, cx)
@@ -1135,16 +1195,12 @@ impl RunPanel {
                 }))
                 .children(worktree.map(|path| {
                     button("run-terminal", "Terminal", cx)
-                        .h(px(20.0))
+                        .h(px(22.0))
                         .text_xs()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_worktree(path.clone(), true, cx)
                         }))
-                }))
-                .child(
-                    icon_button("run-close-log", IconName::X, "Close the log", cx)
-                        .on_click(cx.listener(|this, _, _, cx| this.close_log(cx))),
-                );
+                }));
 
         let run_error = listing
             .and_then(|listing| listing.run.error.clone())
@@ -1203,8 +1259,8 @@ impl RunPanel {
             .py_1()
             .into_any_element()
         };
-        // The log and the prompt fill the panel under the toolbar, on the
-        // same background as a running card's steps, in the code font.
+        // The log and the prompt fill the dialog under the toolbar, on the
+        // editor background, in the code font.
         let body = div()
             .flex()
             .flex_col()
@@ -1222,6 +1278,7 @@ impl RunPanel {
             .flex_1()
             .min_h_0()
             .min_w_0()
+            .child(header)
             .child(toolbar)
             .children(run_error)
             .child(body)
@@ -1399,33 +1456,8 @@ impl RunPanel {
 
 impl Render for RunPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors.clone();
         let header = self.render_header(cx);
         let list = self.render_list(cx);
-        let detail = self.log.as_ref().map(|view| self.render_detail(view, cx));
-        let has_detail = detail.is_some();
-        let list_pane = div().flex().flex_col().min_h_0().min_w_0().child(list);
-        let list_pane = match (has_detail, self.horizontal) {
-            (false, _) => list_pane.flex_1(),
-            (true, true) => list_pane
-                .h_full()
-                .w(px(320.0))
-                .flex_none()
-                .border_r_1()
-                .border_color(colors.border_variant),
-            (true, false) => list_pane
-                .flex_none()
-                .h(px(LIST_HEIGHT_WITH_LOG))
-                .border_b_1()
-                .border_color(colors.border_variant),
-        };
-        let body = div()
-            .flex()
-            .flex_1()
-            .min_h_0()
-            .when(!self.horizontal, |body| body.flex_col())
-            .child(list_pane)
-            .children(detail);
         div()
             .id("run-panel")
             .flex()
@@ -1434,7 +1466,7 @@ impl Render for RunPanel {
             .min_h_0()
             .min_w_0()
             .child(header)
-            .child(body)
+            .child(list)
     }
 }
 
@@ -1554,17 +1586,14 @@ fn detail_block(text: &str, colors: &ThemeColors, font: &SharedString) -> gpui::
         .child(shown)
 }
 
-/// How a run card looks in each state (Panoptes #56 §3, §5).
+/// How a run card looks in each state: neutral, with the state in its
+/// label and the color of its icon.
 struct CardStyle {
     text: &'static str,
-    /// Status label and icon.
-    label: Hsla,
-    border: Hsla,
-    fill: Option<Hsla>,
-    /// The comment summary.
-    summary: Hsla,
-    /// `file:line` and the elapsed time.
-    secondary: Hsla,
+    /// The status icon.
+    icon: Hsla,
+    /// Over and done with: the summary is muted.
+    quiet: bool,
 }
 
 /// The style of a card; `finished` is `Some(comment status)` for a run that
@@ -1574,53 +1603,44 @@ fn card_style(
     finished: Option<Option<CommentStatus>>,
     colors: &ThemeColors,
 ) -> CardStyle {
-    let quiet = |text, label| CardStyle {
+    let quiet = |text| CardStyle {
         text,
-        label,
-        border: colors.border_variant,
-        fill: None,
-        summary: colors.text_muted,
-        secondary: colors.text_placeholder,
+        icon: colors.text_placeholder,
+        quiet: true,
+    };
+    let live = |text, icon| CardStyle {
+        text,
+        icon,
+        quiet: false,
     };
     match status {
         RunStatus::Succeeded if finished.is_some() => match finished.flatten() {
-            Some(CommentStatus::Resolved) => quiet("Accepted", colors.text_muted),
-            Some(CommentStatus::Dismissed) => quiet("Dismissed", colors.text_placeholder),
-            _ => quiet("Followed up", colors.text_placeholder),
+            Some(CommentStatus::Resolved) => quiet("Accepted"),
+            Some(CommentStatus::Dismissed) => quiet("Dismissed"),
+            _ => quiet("Followed up"),
         },
-        RunStatus::Queued => CardStyle {
-            summary: colors.text,
-            secondary: colors.text_muted,
-            ..quiet("Starting", colors.text_muted)
-        },
-        RunStatus::Running => CardStyle {
-            text: "Running",
-            label: colors.claude_text,
-            border: colors.claude_border,
-            fill: Some(colors.claude_soft),
-            summary: colors.text,
-            secondary: colors.text_muted,
-        },
-        RunStatus::Succeeded => CardStyle {
-            text: "Ready to review",
-            label: colors.accent,
-            border: colors.accent_border,
-            fill: None,
-            summary: colors.text,
-            secondary: colors.text_muted,
-        },
-        RunStatus::Failed => CardStyle {
-            text: "Failed",
-            label: colors.error,
-            border: colors.border,
-            fill: None,
-            summary: colors.text,
-            secondary: colors.text_muted,
-        },
-        RunStatus::NoChanges => quiet("No changes", colors.text_muted),
-        RunStatus::Stopped => quiet("Stopped", colors.text_placeholder),
-        RunStatus::Rejected => quiet("Rejected", colors.text_placeholder),
+        RunStatus::Queued => live("Starting", colors.text_muted),
+        RunStatus::Running => live("Running", colors.claude),
+        RunStatus::Succeeded => live("Ready to review", colors.accent),
+        RunStatus::Failed => live("Failed", colors.error),
+        RunStatus::NoChanges => quiet("No changes"),
+        RunStatus::Stopped => quiet("Stopped"),
+        RunStatus::Rejected => quiet("Rejected"),
     }
+}
+
+/// The icon of a run's state, on cards and in the log dialog.
+fn status_icon(status: RunStatus, style: &CardStyle, cx: &App) -> AnyElement {
+    let (name, size) = match status {
+        RunStatus::Running => return claude_activity(px(STATUS_ICON), cx),
+        // Starting: the eye, still (motion is for live work).
+        RunStatus::Queued => (IconName::ArgusEyeMono, STATUS_ICON),
+        RunStatus::Succeeded => (IconName::GitPullRequest, 13.0),
+        RunStatus::Failed => (IconName::Warning, 13.0),
+        RunStatus::NoChanges => (IconName::Check, 12.0),
+        RunStatus::Stopped | RunStatus::Rejected => (IconName::X, 12.0),
+    };
+    icon(name, px(size), style.icon).into_any_element()
 }
 
 /// Whether each of `runs` is over and done with: not active, and not the
