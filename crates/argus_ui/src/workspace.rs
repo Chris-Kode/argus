@@ -47,7 +47,8 @@ use crate::claude_status::observe_claude_status;
 use crate::comment_list::{CommentList, CommentListEvent};
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
-    button, claude_activity, disabled_button, disabled_icon_button, icon_button, kbd, panel_header,
+    accent_button_with_icon, button, claude_activity, disabled_button,
+    disabled_ghost_button_with_icon, disabled_icon_button, icon_button, kbd, panel_header,
     placeholder, primary_button, primary_button_with_icon, radius, section_header, text_tooltip,
     toggle_button, toggle_icon_button,
 };
@@ -59,12 +60,12 @@ use crate::hidden_files::{self, HiddenFiles};
 use crate::icons::{IconName, eye_mark, icon};
 use crate::jobs::BackgroundJobs;
 use crate::keymap::{
-    Accept, AdvanceCommentStatus, Comment, CycleTheme, DecreaseFontSize, Dismiss, FocusFileFilter,
-    IncreaseFontSize, NextComment, NextFile, NextHunk, OpenRecent1, OpenRecent2, OpenRecent3,
-    OpenRecent4, OpenRecent5, OpenRecent6, OpenRecent7, OpenRecent8, OpenRecent9, OpenRepository,
-    OpenSettings, PreviousComment, PreviousFile, PreviousHunk, ResetFontSize, Run, SHORTCUT_GROUPS,
-    SHORTCUTS, ToggleAllComments, ToggleCommentList, ToggleDiffMode, ToggleFileListMode,
-    ToggleFileTree, ToggleFocusMode, ToggleKeyboardShortcuts, ToggleRunPanel,
+    Accept, AdvanceCommentStatus, CheckForUpdates, Comment, CycleTheme, DecreaseFontSize, Dismiss,
+    FocusFileFilter, IncreaseFontSize, NextComment, NextFile, NextHunk, OpenRecent1, OpenRecent2,
+    OpenRecent3, OpenRecent4, OpenRecent5, OpenRecent6, OpenRecent7, OpenRecent8, OpenRecent9,
+    OpenRepository, OpenSettings, PreviousComment, PreviousFile, PreviousHunk, ResetFontSize, Run,
+    SHORTCUT_GROUPS, SHORTCUTS, ToggleAllComments, ToggleCommentList, ToggleDiffMode,
+    ToggleFileListMode, ToggleFileTree, ToggleFocusMode, ToggleKeyboardShortcuts, ToggleRunPanel,
     ToggleRunPanelPosition, ToggleSoftWrap, WELCOME_CONTEXT, WORKSPACE_CONTEXT,
 };
 use crate::markdown;
@@ -84,6 +85,7 @@ use crate::settings::{
 };
 use crate::text_field::{TextField, TextFieldEvent};
 use crate::theme::{ActiveTheme, Theme, ThemeFonts, ThemeMode};
+use crate::update::{UpdateStatus, Updater, UpdaterEvent};
 use crate::{AppContext, OpenRequest};
 
 /// Height of the title bar.
@@ -251,6 +253,8 @@ pub struct Workspace {
     resolve_watches: HashMap<argus_store::RunId, Task<()>>,
     /// Fetches the head's upstream every minute, when the setting is on.
     _background_fetch: Task<()>,
+    /// Release checks and the self-update.
+    updater: Entity<Updater>,
     /// Focus the workspace at the next render (e.g. after leaving a tab).
     focus_requested: bool,
     /// "Viewed" marks of the last closed diff view, by (base, head), so a
@@ -333,6 +337,15 @@ impl Workspace {
         let push_flow = cx.new(PushFlow::new);
         subscriptions.push(cx.observe(&push_flow, |_, _, cx| cx.notify()));
         subscriptions.push(cx.subscribe(&push_flow, Self::push_flow_event));
+        let updater = cx.new(Updater::new);
+        subscriptions.push(cx.observe(&updater, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.subscribe(&updater, |this, _, event: &UpdaterEvent, cx| {
+            this.notice = Some(Notice {
+                message: event.message.clone(),
+                is_error: event.is_error,
+            });
+            cx.notify();
+        }));
         let background_fetch = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -383,6 +396,7 @@ impl Workspace {
             active_proposal: None,
             accept_flow,
             push_flow,
+            updater,
             conflict: None,
             permissions: Vec::new(),
             permission_dialog: None,
@@ -2164,6 +2178,7 @@ impl Workspace {
             _ => None,
         };
         let push = self.render_push_button(session, cx);
+        let update = self.render_update_button(cx);
 
         div()
             .id("title-bar")
@@ -2199,6 +2214,7 @@ impl Workspace {
                     .flex_none()
                     .items_center()
                     .gap_1p5()
+                    .children(update)
                     .children(fetch)
                     .children(push),
             )
@@ -2258,6 +2274,52 @@ impl Workspace {
     /// ↓behind`, disabled with a tooltip when there is nothing to do or an
     /// Accept is in flight, `Push | No upstream` to offer `git push -u`,
     /// "Pushing…" (which toggles the progress popover) while a Push runs.
+    /// "Update" while a newer release is available; disabled, with the reason
+    /// in its tooltip, when this copy of the app cannot replace itself.
+    fn render_update_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let updater = self.updater.read(cx);
+        let element = match updater.status() {
+            UpdateStatus::Idle => return None,
+            UpdateStatus::Installing(release) => disabled_ghost_button_with_icon(
+                "title-update",
+                IconName::ArrowLineDown,
+                "Updating…",
+                cx,
+            )
+            .tooltip(text_tooltip(format!(
+                "Installing Argus {}; Argus restarts when it is done.",
+                release.version
+            )))
+            .into_any_element(),
+            UpdateStatus::Available(release) => match updater.blocker() {
+                Some(blocker) => disabled_ghost_button_with_icon(
+                    "title-update",
+                    IconName::ArrowLineDown,
+                    "Update",
+                    cx,
+                )
+                .tooltip(text_tooltip(format!(
+                    "Argus {} is available. {blocker}",
+                    release.version
+                )))
+                .into_any_element(),
+                None => {
+                    accent_button_with_icon("title-update", IconName::ArrowLineDown, "Update", cx)
+                        .tooltip(text_tooltip(format!(
+                            "Install Argus {} and restart",
+                            release.version
+                        )))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.updater
+                                .update(cx, |updater, cx| updater.install(window, cx));
+                        }))
+                        .into_any_element()
+                }
+            },
+        };
+        Some(element)
+    }
+
     fn render_push_button(
         &self,
         session: Option<&RepoSession>,
@@ -4090,6 +4152,10 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenRecent8, _, cx| this.open_recent(7, cx)))
             .on_action(cx.listener(|this, _: &OpenRecent9, _, cx| this.open_recent(8, cx)))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| {
+                this.updater
+                    .update(cx, |updater, cx| updater.check(true, cx));
+            }))
             .on_action(cx.listener(Self::toggle_shortcuts))
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::toggle_file_tree))

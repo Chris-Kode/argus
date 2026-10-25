@@ -102,6 +102,18 @@ pub fn muted_button_with_icon(
     ghost_button(id, Some(icon_name), label.into(), text, cx)
 }
 
+/// [`button_with_icon`] drawn in `accent`, for a chrome action that waits on
+/// the user (e.g. Update in the title bar).
+pub fn accent_button_with_icon(
+    id: impl Into<ElementId>,
+    icon_name: IconName,
+    label: impl Into<SharedString>,
+    cx: &App,
+) -> Stateful<Div> {
+    let text = cx.theme().colors.accent;
+    ghost_button(id, Some(icon_name), label.into(), text, cx)
+}
+
 /// A ghost button for an action that is not available right now: same
 /// shape as [`muted_button_with_icon`] but in `text_placeholder`, without a
 /// border and without hover feedback.

@@ -57,6 +57,8 @@ actions!(
         Dismiss,
         /// Quit Argus.
         Quit,
+        /// Look for a newer Argus release now.
+        CheckForUpdates,
         /// Move the file-tree selection down one row.
         SelectNextEntry,
         /// Move the file-tree selection up one row.
