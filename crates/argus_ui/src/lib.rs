@@ -34,6 +34,7 @@ pub mod settings;
 pub mod text_editor;
 pub mod text_field;
 pub mod theme;
+pub mod update;
 mod workspace;
 
 pub use assets::Assets;
@@ -296,6 +297,7 @@ pub fn run_gpui_app(
             cx.set_menus([Menu::new("Argus").items([
                 MenuItem::action("Open Repository…", keymap::OpenRepository),
                 MenuItem::action("Settings…", keymap::OpenSettings),
+                MenuItem::action("Check for Updates…", keymap::CheckForUpdates),
                 MenuItem::action("Keyboard Shortcuts", keymap::ToggleKeyboardShortcuts),
                 MenuItem::separator(),
                 MenuItem::action("Quit Argus", keymap::Quit),

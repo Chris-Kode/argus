@@ -35,6 +35,12 @@ Download `Argus-<version>-macos-universal.dmg` from the
 and drag Argus to Applications. Release builds are not notarized yet, so the
 first launch needs the step in [Signing and Gatekeeper](#signing-and-gatekeeper).
 
+Argus then keeps itself up to date: it checks for a new release at launch and
+every 12 hours (or on **Argus → Check for Updates…**), and shows **Update** in
+the title bar when there is one. Clicking it downloads the release, replaces
+the app and restarts it. Argus must run from a folder it can write to, such as
+Applications, not from the disk image.
+
 To build from source instead (a release build takes a few minutes):
 
 ```sh
@@ -178,6 +184,10 @@ Everything Argus writes lives in `~/.argus/`, never inside a reviewed repository
 | `~/.argus/review-rules.md` | Rules appended to every run's system prompt; edit freely, never overwritten |
 | `~/.argus/worktrees/` | One git worktree per run, plus each repository's `_integration` worktree for Accept and Push |
 | `~/.argus/logs/argus.log` | Log file |
+| `~/.argus/updates/` | An update while it downloads |
+
+Installing an update is the one write outside it: the new `Argus.app` replaces
+the old one in its folder.
 
 Set `ARGUS_HOME` to use another directory, e.g. `ARGUS_HOME=/tmp/argus-dev`.
 Deleting `~/.argus` resets Argus; your repositories are not affected, though

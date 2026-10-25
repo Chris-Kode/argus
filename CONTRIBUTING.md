@@ -85,6 +85,13 @@ The rev corresponds to Zed tag **v1.24.2**.
 To build without releasing, run the workflow by hand (Actions → Release → Run
 workflow); the files are kept as a workflow artifact.
 
+Installed copies find the release through GitHub's "latest release" API and
+download the `Argus-<version>-macos-universal.zip` asset, so keep that name.
+Pre-releases are never offered. To try the update flow without publishing,
+point `ARGUS_UPDATE_FEED` at a local copy of the release JSON (a `file://` URL
+works, for the assets too) and launch the bundled binary,
+`Argus.app/Contents/MacOS/argus`, with it set.
+
 ### Signing and notarization (not enabled yet)
 
 Releases are signed ad hoc. Once there is an Apple Developer Program
@@ -105,6 +112,9 @@ membership:
 4. Give **Bundle** `ARGUS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}` and
    `ARGUS_NOTARY_PROFILE: argus-notary`, and drop the Gatekeeper paragraph from
    the release notes and the README.
+
+Once an installed copy is Developer-ID signed, it accepts only updates signed
+by the same team.
 
 ## Commits
 

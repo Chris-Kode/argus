@@ -8,6 +8,7 @@ members = [
     "crates/argus_highlight",
     "crates/argus_runs",
     "crates/argus_store",
+    "crates/argus_update",
     "xtask",
 ]
 # `cargo run` / `cargo build` without `-p` stay on the app; `xtask` is a dev
@@ -20,6 +21,7 @@ default-members = [
     "crates/argus_highlight",
     "crates/argus_runs",
     "crates/argus_store",
+    "crates/argus_update",
 ]
 
 [workspace.package]
@@ -38,6 +40,7 @@ argus_highlight = { path = "crates/argus_highlight" }
 argus_runs = { path = "crates/argus_runs" }
 argus_store = { path = "crates/argus_store" }
 argus_ui = { path = "crates/argus_ui" }
+argus_update = { path = "crates/argus_update" }
 
 # GPUI is not reliably published on crates.io, so it is pinned to one exact Zed
 # commit. Both crates must always point at the same rev. See CONTRIBUTING.md for

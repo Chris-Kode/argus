@@ -305,6 +305,7 @@ dependencies = [
  "argus_highlight",
  "argus_runs",
  "argus_store",
+ "argus_update",
  "gpui",
  "gpui_platform",
  "libc",
@@ -315,6 +316,17 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "argus_update"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

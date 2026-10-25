@@ -13,6 +13,7 @@ argus_git.workspace = true
 argus_highlight.workspace = true
 argus_runs.workspace = true
 argus_store.workspace = true
+argus_update.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 pulldown-cmark.workspace = true
