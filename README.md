@@ -30,7 +30,12 @@ Feature work is tracked as sub-issues of that spec.
 
 ### macOS
 
-Build the app bundle (a release build takes a few minutes):
+Download `Argus-<version>-macos-universal.dmg` from the
+[latest release](https://github.com/Chris-Kode/argus/releases/latest), open it
+and drag Argus to Applications. Release builds are not notarized yet, so the
+first launch needs the step in [Signing and Gatekeeper](#signing-and-gatekeeper).
+
+To build from source instead (a release build takes a few minutes):
 
 ```sh
 git clone https://github.com/Chris-Kode/argus.git

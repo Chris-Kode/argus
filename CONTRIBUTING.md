@@ -64,6 +64,48 @@ The rev corresponds to Zed tag **v1.24.2**.
    and fix any API breakage — GPUI changes often and breaks consumers.
 5. Update the table above (rev and tag) and call out the bump in the PR.
 
+## Releasing
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) builds
+`cargo xtask bundle --universal` on a macOS runner and publishes the `.dmg` and
+`.zip` as a GitHub Release.
+
+1. Bump `version` under `[workspace.package]` in the root `Cargo.toml`, run
+   `cargo build` so `Cargo.lock` follows, and merge it to `main`.
+2. Tag that commit and push the tag; it must be the version with a `v`:
+
+   ```sh
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+   The job fails if the tag and `Cargo.toml` disagree. A tag with a `-`
+   (`v0.2.0-beta.1`) is published as a pre-release.
+
+To build without releasing, run the workflow by hand (Actions → Release → Run
+workflow); the files are kept as a workflow artifact.
+
+### Signing and notarization (not enabled yet)
+
+Releases are signed ad hoc. Once there is an Apple Developer Program
+membership:
+
+1. Export the **Developer ID Application** certificate as a `.p12` and create an
+   App Store Connect API key (Users and Access → Integrations, role
+   *Developer*).
+2. Add repository secrets: `MACOS_CERT_P12` (the `.p12`, base64),
+   `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY` (as `security find-identity`
+   prints it), and `NOTARY_KEY` (the `.p8` contents), `NOTARY_KEY_ID`,
+   `NOTARY_ISSUER_ID`.
+3. In the workflow, before **Bundle**: import the `.p12` into a temporary
+   keychain (`security create-keychain`, `security import … -T
+   /usr/bin/codesign`, `security set-key-partition-list`), then store a notary
+   profile in it with `xcrun notarytool store-credentials argus-notary --key …
+   --key-id … --issuer … --keychain …`.
+4. Give **Bundle** `ARGUS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}` and
+   `ARGUS_NOTARY_PROFILE: argus-notary`, and drop the Gatekeeper paragraph from
+   the release notes and the README.
+
 ## Commits
 
 - Keep the subject short and imperative.

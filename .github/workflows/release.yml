@@ -1,0 +1,93 @@
+# Builds the macOS app with `cargo xtask bundle --universal` and publishes it.
+#
+# - Pushing a `vX.Y.Z` tag creates a GitHub Release with the `.dmg` and `.zip`
+#   (a tag with a `-`, e.g. `v0.2.0-beta.1`, makes a pre-release).
+# - Running it by hand (Actions → Release → Run workflow) only builds, and
+#   keeps the files as a workflow artifact.
+#
+# The app is signed ad hoc for now; see "Releasing" in CONTRIBUTING.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    # macOS 15's default Xcode ships the Metal compiler GPUI's build script
+    # needs; Xcode 26 makes it a separate download.
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the toolchain and both Apple targets
+        run: |
+          # Reads rust-toolchain.toml.
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Check the tag matches the workspace version
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "argus") | .version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the workspace version $version in Cargo.toml"
+            exit 1
+          fi
+
+      - name: Make sure the Metal compiler is available
+        run: xcrun -f metal || xcodebuild -downloadComponent MetalToolchain
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Release-profile builds only; kept apart from any debug CI cache.
+          shared-key: release-macos
+
+      - name: Bundle
+        run: cargo xtask bundle --universal
+
+      - name: Keep the files (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: argus-macos
+          path: |
+            target/bundle/*.dmg
+            target/bundle/*.zip
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<'EOF'
+          ## Install
+
+          Download the `.dmg`, open it and drag Argus to Applications.
+
+          This build is not notarized yet, so macOS blocks the first launch. Open
+          **System Settings → Privacy & Security** and click **Open Anyway**, or run:
+
+          ```sh
+          xattr -dr com.apple.quarantine /Applications/Argus.app
+          ```
+          EOF
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Argus ${GITHUB_REF_NAME#v}" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --generate-notes \
+            --verify-tag \
+            "${prerelease[@]}" \
+            target/bundle/*.dmg target/bundle/*.zip
