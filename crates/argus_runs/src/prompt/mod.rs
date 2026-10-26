@@ -36,7 +36,7 @@ pub use excerpt::{
 
 /// Version of the prompt templates. Bump it whenever the rendered text
 /// changes in a way that matters for auditing or comparing runs.
-pub const PROMPT_VERSION: u32 = 2;
+pub const PROMPT_VERSION: u32 = 3;
 
 /// Scope rule of comment and follow-up runs (spec §6.1).
 pub const SCOPE_RULE: &str = "Change only what the comment asks. Touch other files only if needed, and say why in your final message.";
@@ -95,11 +95,11 @@ pub struct CommentContext {
     pub old_file_path: Option<String>,
     /// Side the line numbers refer to.
     pub side: Side,
-    /// First commented line, 1-based.
+    /// First commented line, 1-based; `0` for a comment on the whole file.
     pub start_line: u32,
-    /// Last commented line, 1-based, inclusive.
+    /// Last commented line, 1-based, inclusive; `0` for a file comment.
     pub end_line: u32,
-    /// The diff around the commented lines.
+    /// The diff around the commented lines, or of the whole file.
     pub excerpt: DiffExcerpt,
     /// The comment's Markdown body, verbatim.
     pub body: String,
@@ -108,21 +108,26 @@ pub struct CommentContext {
 impl CommentContext {
     /// Builds the context of `comment` from the current line diff of its
     /// file. Falls back to the snippet saved with the comment when there is
-    /// no line diff (binary or too-large file) or the lines are gone.
+    /// no line diff (binary or too-large file) or the lines are gone. A file
+    /// comment gets every change of the file instead.
     ///
     /// This walks the whole file diff: call it off the UI thread.
     pub fn from_comment(comment: &Comment, diff: Option<&TextDiff>) -> Self {
         let anchor = &comment.anchor;
-        let excerpt = diff
-            .and_then(|diff| DiffExcerpt::from_diff(diff, anchor.side, anchor.lines()))
-            .unwrap_or_else(|| {
-                DiffExcerpt::from_snippet(
-                    &anchor.snippet,
-                    anchor.snippet_start_line(),
-                    anchor.side,
-                    anchor.lines(),
-                )
-            });
+        let excerpt = if anchor.is_file() {
+            diff.and_then(DiffExcerpt::from_file)
+                .unwrap_or_else(DiffExcerpt::no_diff)
+        } else {
+            diff.and_then(|diff| DiffExcerpt::from_diff(diff, anchor.side, anchor.lines()))
+                .unwrap_or_else(|| {
+                    DiffExcerpt::from_snippet(
+                        &anchor.snippet,
+                        anchor.snippet_start_line(),
+                        anchor.side,
+                        anchor.lines(),
+                    )
+                })
+        };
         Self {
             file_path: anchor.file_path.clone(),
             old_file_path: anchor.old_file_path.clone(),
@@ -443,6 +448,10 @@ fn repo_intro(out: &mut String, repo: &RepoContext) {
 }
 
 fn comment_section(out: &mut String, comment: &CommentContext, level: &str) {
+    if comment.start_line == 0 {
+        file_comment_section(out, comment, level);
+        return;
+    }
     let lines = if comment.start_line == comment.end_line {
         format!("line {}", comment.start_line)
     } else {
@@ -502,6 +511,53 @@ fn comment_section(out: &mut String, comment: &CommentContext, level: &str) {
         }
     }
     fenced(out, "diff", &comment.excerpt.text);
+
+    let _ = write!(out, "\n{level} Comment (verbatim)\n\n");
+    fenced(out, "markdown", &comment.body);
+}
+
+/// [`comment_section`] of a comment on a whole file: no commented lines,
+/// and every change of the file as the diff.
+fn file_comment_section(out: &mut String, comment: &CommentContext, level: &str) {
+    let _ = write!(out, "\n{level} Location\n\n");
+    let _ = writeln!(out, "- File: {}", code(&comment.file_path));
+    if let Some(old) = &comment.old_file_path {
+        let _ = writeln!(out, "- Renamed from: {}", code(old));
+    }
+    match comment.side {
+        Side::New => out.push_str(
+            "- Commented: the whole file, not specific lines. The comment is about the file \
+             as a whole, as it is in this working directory.\n",
+        ),
+        Side::Old => out.push_str(
+            "- Commented: the whole file, not specific lines. This branch deleted the file: \
+             it exists at the merge-base but not in this working directory.\n",
+        ),
+    }
+
+    let _ = write!(out, "\n{level} Diff of the file\n\n");
+    match comment.excerpt.trimmed {
+        Some(ExcerptTrim::NoDiff | ExcerptTrim::SnippetOnly) => out.push_str(
+            "There is no line diff to show for this file (it is binary, too large, or its \
+             content did not change on this branch); read the file itself as needed.\n",
+        ),
+        trimmed => {
+            out.push_str(
+                "Every change this branch made to the file. Each row shows the old line number, \
+                 the new line number, the change (`-` removed, `+` added, space unchanged) and \
+                 the code.",
+            );
+            if let Some(ExcerptTrim::Oversized { original_chars }) = trimmed {
+                let _ = write!(
+                    out,
+                    " The diff was too large ({original_chars} characters), so it was cut after \
+                     its first part; read the file for the rest."
+                );
+            }
+            out.push_str("\n\n");
+            fenced(out, "diff", &comment.excerpt.text);
+        }
+    }
 
     let _ = write!(out, "\n{level} Comment (verbatim)\n\n");
     fenced(out, "markdown", &comment.body);

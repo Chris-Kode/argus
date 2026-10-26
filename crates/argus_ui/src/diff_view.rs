@@ -121,8 +121,8 @@ use gpui::{
 use crate::AppContext;
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
-    BadgeSize, button, chip, claude_activity, letter_badge, muted_button_with_icon, placeholder,
-    radius,
+    BadgeSize, button, chip, claude_activity, icon_button, letter_badge, muted_button_with_icon,
+    placeholder, radius,
 };
 use crate::hidden_files::HiddenFiles;
 use crate::icons::{IconName, icon};
@@ -2941,8 +2941,27 @@ impl DiffView {
                     .gap_1p5()
                     .text_color(colors.claude_text)
                     .child(claude_activity(HEADER_ICON_SIZE, cx))
-                    .child(format!("Claude is working on line {line}"))
+                    .child(if line == 0 {
+                        "Claude is working on this file".to_owned()
+                    } else {
+                        format!("Claude is working on line {line}")
+                    })
             });
+        // Proposals take no comments; see `PROPOSAL_COMMENT_HINT`.
+        let comment_on_file = (!self.proposal).then(|| {
+            let id = if sticky {
+                "diff-sticky-comment"
+            } else {
+                "diff-header-comment"
+            };
+            let tooltip = if self.is_reattaching() {
+                "Re-attach to this file"
+            } else {
+                "Comment on file"
+            };
+            icon_button((id, file), IconName::ChatText, tooltip, cx)
+                .on_click(cx.listener(move |this, _, _, cx| this.comment_on_file(file, cx)))
+        });
         let viewed_toggle = div()
             .id((id_base, file * 3 + 2))
             .flex()
@@ -3070,6 +3089,7 @@ impl DiffView {
             .children(running)
             .children(force_highlight)
             .children(open_in_editor)
+            .children(comment_on_file)
             .child(viewed_toggle)
             .into_any_element()
     }

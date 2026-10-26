@@ -117,8 +117,9 @@ push it.
    under review) in the title bar. The center shows the three-dot diff
    `base...head`; `j`/`k` move between files and `n`/`p` between hunks.
 3. **Comment.** Hover a line and click the gutter **+** (or select lines in the
-   gutter and press `c`). Write what you want changed, in Markdown, and save with
-   `⌘↩`.
+   gutter and press `c`), or click the comment button in a file's header to
+   comment on the whole file. Write what you want changed, in Markdown, and save
+   with `⌘↩`.
 4. **Run it with Claude.** Click **Run** on the thread (or press `r`). Claude
    Code runs headless in its own worktree under `~/.argus/worktrees/`; the thread
    shows *Running…*, which opens the live log in the run panel (`⌘J`). Runs go in
@@ -243,7 +244,10 @@ Comment on any line, or a range, on either side: hover a line and click the
 gutter "+", or select lines (click, shift-click or drag the gutter) and press
 `c`. Removed lines are commented on the old side; added and context lines on the
 new side (in side-by-side mode, the column you pick decides). A range cannot
-cross a hunk header. The composer opens under the last line: write Markdown,
+cross a hunk header. To comment on a whole file instead (say, "split this into
+smaller modules" or "delete this file"), click the comment button in its
+header; binary and too-large files take file comments too. The composer opens
+under the last line (a file comment's at the top of the file): write Markdown,
 save with `cmd-enter` (`ctrl-enter` on Linux), cancel with `esc`; unsaved
 drafts are kept while Argus runs. Threads show inline under their lines with a
 status chip (Open, Running, Proposed, Resolved, Dismissed), replies and a menu
@@ -262,6 +266,8 @@ the status chips by hand.
 Comments follow their code. Every time the diff is refreshed (branch change,
 Fetch, Accept), each comment looks for its lines and their context in the new
 diff: unchanged, moved (lines inserted above, or the file renamed), or gone.
+A file comment follows its file, through renames, and is gone only when the
+file leaves the diff.
 A commit that edits the lines around a comment does not lose it: the commented
 lines are found again by themselves, and lines edited in place are found
 between their unchanged neighbours. When the code is really gone, the comment
@@ -269,7 +275,8 @@ becomes **outdated**. Outdated comments are not shown inline. They are listed
 in the "Outdated" group of the file tree and the Comments tab, which shows the
 original code at its original line numbers. From there, **Re-attach…** scrolls
 the diff to where the code was and selects those lines, so Save re-attaches it
-there (or pick other lines: gutter "+", `c` on a selection), and **Dismiss**
+there (or pick other lines: gutter "+", `c` on a selection, or a file header's
+comment button to re-attach it to a whole file), and **Dismiss**
 closes the comment. Outdated comments cannot be run. A comment that finds its
 code again (for example after a revert) is no longer outdated. Resolved
 comments are moved too, but are never flagged outdated, and neither are

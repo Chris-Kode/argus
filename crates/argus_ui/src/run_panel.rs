@@ -317,11 +317,7 @@ impl RunPanel {
             .find(|line| !line.trim().is_empty())
             .unwrap_or_default()
             .trim();
-        let location = if listing.run.comment_id.is_some() {
-            format!("{}:{}", listing.file_path, listing.start_line)
-        } else {
-            listing.file_path.clone()
-        };
+        let location = listing_location(listing);
         Some(if snippet.is_empty() {
             location
         } else {
@@ -817,11 +813,7 @@ impl RunPanel {
         let style = card_style(status, finished.then_some(listing.comment_status), colors);
 
         let snippet = markdown::first_line_plain(&listing.body_md);
-        let location = if comment_id.is_some() {
-            format!("{}:{}", listing.file_path, listing.start_line)
-        } else {
-            listing.file_path.clone()
-        };
+        let location = listing_location(listing);
         // A live clock while Claude works; how long a finished run took is
         // in its log.
         let elapsed = matches!(status, RunStatus::Running | RunStatus::Queued)
@@ -1063,11 +1055,7 @@ impl RunPanel {
         // turns, cost and duration in its summary.
         let meta = listing.map(|listing| {
             let run = &listing.run;
-            let mut meta = if run.comment_id.is_some() {
-                format!("{}:{}", listing.file_path, listing.start_line)
-            } else {
-                listing.file_path.clone()
-            };
+            let mut meta = listing_location(listing);
             meta.push_str(" · ");
             meta.push_str(&run.model);
             if !run.effort.is_empty() {
@@ -1754,5 +1742,15 @@ async fn open_terminal(path: &std::path::Path) -> Result<(), String> {
             Ok(())
         }
         Err(error) => Err(format!("Could not open a terminal: {error}")),
+    }
+}
+
+/// Where a listed run works: `path:line` for a line comment, the path alone
+/// for a file comment or a run without a comment.
+fn listing_location(listing: &RunListing) -> String {
+    if listing.run.comment_id.is_some() && listing.start_line > 0 {
+        format!("{}:{}", listing.file_path, listing.start_line)
+    } else {
+        listing.file_path.clone()
     }
 }

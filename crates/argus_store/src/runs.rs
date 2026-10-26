@@ -129,9 +129,10 @@ pub struct RunListing {
     pub run: Run,
     /// File path of the comment, in head.
     pub file_path: String,
-    /// First line of the comment's range.
+    /// First line of the comment's range; `0` for a comment on the whole
+    /// file, or a run without a comment.
     pub start_line: u32,
-    /// Last line of the comment's range.
+    /// Last line of the comment's range; `0` like `start_line`.
     pub end_line: u32,
     /// The comment's Markdown body.
     pub body_md: String,

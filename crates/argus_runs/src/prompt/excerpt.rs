@@ -1,6 +1,7 @@
 //! The diff excerpt shown to Claude around a comment: the hunk(s) that
-//! contain the commented lines plus some extra context, as unified diff text
-//! with line numbers (spec §6.1).
+//! contain the commented lines plus some extra context, or for a file
+//! comment every change of the file, as unified diff text with line numbers
+//! (spec §6.1).
 
 use std::fmt::Write as _;
 use std::ops::RangeInclusive;
@@ -41,6 +42,9 @@ pub enum ExcerptTrim {
     /// The file has no line diff to show (binary, too large, or the code is
     /// gone); the excerpt is the snippet saved with the comment.
     SnippetOnly,
+    /// A file comment on a file with no line diff to show (binary, too
+    /// large, or its content did not change); the excerpt is empty.
+    NoDiff,
 }
 
 /// One row of the merged old/new view of a file.
@@ -114,6 +118,55 @@ impl DiffExcerpt {
             text: render(diff, &rows, window, &lines, side),
             trimmed: Some(ExcerptTrim::Oversized { original_chars }),
         })
+    }
+
+    /// The excerpt of a file comment: every change of `diff`, from the
+    /// first changed row to the last, plus up to [`EXTRA_CONTEXT_LINES`]
+    /// rows above and below. Nothing is marked as commented. An excerpt over
+    /// [`MAX_EXCERPT_CHARS`] is cut after the rows that fit.
+    ///
+    /// Returns `None` when the file has no changed lines.
+    pub fn from_file(diff: &TextDiff) -> Option<Self> {
+        let rows = merged_rows(diff);
+        let changed = |row: &Row| row.kind != LineKind::Context;
+        let first = rows.iter().position(changed)?;
+        let last = rows.iter().rposition(changed)?;
+        let window = pad(first, last, EXTRA_CONTEXT_LINES, rows.len());
+        // Lines are 1-based: line 0 marks no row as commented.
+        let none = 0..=0;
+        let text = render(diff, &rows, window.clone(), &none, Side::New);
+        let original_chars = text.chars().count();
+        if original_chars <= MAX_EXCERPT_CHARS {
+            return Some(Self {
+                text,
+                trimmed: None,
+            });
+        }
+        // Keep the rows that fit, leaving room for the header.
+        let mut used = 0;
+        let fit = text
+            .lines()
+            .skip(1)
+            .take_while(|line| {
+                used += line.chars().count() + 1;
+                used <= MAX_EXCERPT_CHARS - 100
+            })
+            .count()
+            .max(1);
+        let start = *window.start();
+        let end = (start + fit - 1).min(*window.end());
+        Some(Self {
+            text: render(diff, &rows, start..=end, &none, Side::New),
+            trimmed: Some(ExcerptTrim::Oversized { original_chars }),
+        })
+    }
+
+    /// The empty excerpt of a file comment on a file without a line diff.
+    pub fn no_diff() -> Self {
+        Self {
+            text: String::new(),
+            trimmed: Some(ExcerptTrim::NoDiff),
+        }
     }
 
     /// An excerpt made of the snippet saved with the comment, for files

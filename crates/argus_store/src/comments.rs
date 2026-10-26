@@ -34,11 +34,13 @@ pub struct Anchor {
     pub old_file_path: Option<String>,
     /// Side of the diff the line numbers refer to.
     pub side: Side,
-    /// First commented line, 1-based.
+    /// First commented line, 1-based; `0` for a comment on the whole file.
     pub start_line: u32,
-    /// Last commented line, 1-based, inclusive.
+    /// Last commented line, 1-based, inclusive; `0` for a comment on the
+    /// whole file.
     pub end_line: u32,
-    /// Hash of the commented lines plus surrounding context.
+    /// Hash of the commented lines plus surrounding context; empty for a
+    /// comment on the whole file.
     pub context_hash: String,
 }
 
