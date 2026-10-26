@@ -117,8 +117,12 @@ impl ClaudeCommand {
     ///
     /// ```text
     /// git diff --cached | claude -p --model haiku --tools "" --max-turns 1 \
-    ///   "Write a git commit message for this change: <format rules>. Review comment: <text>"
+    ///   --strict-mcp-config "Write a git commit message for this change: <format rules>. Review comment: <text>"
     /// ```
+    ///
+    /// `--tools ""` only removes the built-in tools; `--strict-mcp-config`
+    /// also drops the user's MCP servers, whose tools Haiku would otherwise
+    /// call and so use up its one turn.
     ///
     /// `diff_stdin` is the staged diff. Very long comments are truncated in
     /// the prompt. The working directory is inherited unless set with
@@ -244,6 +248,7 @@ impl ClaudeCommand {
                     "",
                     "--max-turns",
                     "1",
+                    "--strict-mcp-config",
                 ]
                 .map(OsString::from)
                 .into();
