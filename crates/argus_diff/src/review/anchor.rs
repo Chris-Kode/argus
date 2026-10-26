@@ -15,6 +15,10 @@ pub const CONTEXT_LINES: u32 = 3;
 
 /// Where a comment points in the diff, plus what is needed to re-anchor it
 /// and to show it once its code is gone.
+///
+/// A comment on a whole file rather than on lines ([`CommentAnchor::file`])
+/// has `start_line == end_line == 0`, an empty context hash and an empty
+/// snippet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommentAnchor {
     /// Path on the new side (the merge-base path for deleted files).
@@ -23,9 +27,9 @@ pub struct CommentAnchor {
     pub old_file_path: Option<String>,
     /// Side of the diff the line numbers refer to.
     pub side: Side,
-    /// First commented line, 1-based.
+    /// First commented line, 1-based; `0` for a file comment.
     pub start_line: u32,
-    /// Last commented line, 1-based, inclusive.
+    /// Last commented line, 1-based, inclusive; `0` for a file comment.
     pub end_line: u32,
     /// Head SHA (hex) when the comment was created.
     pub anchor_sha: String,
@@ -75,6 +79,32 @@ impl CommentAnchor {
             context_hash: context_hash(lines()),
             snippet: lines().collect::<Vec<_>>().join("\n"),
         })
+    }
+
+    /// An anchor on the whole file at `file_path` rather than on lines.
+    /// `side` is the side the file is read from: `Old` for a deleted file,
+    /// `New` otherwise.
+    pub fn file(
+        file_path: String,
+        old_file_path: Option<String>,
+        side: Side,
+        anchor_sha: impl Into<String>,
+    ) -> Self {
+        Self {
+            file_path,
+            old_file_path,
+            side,
+            start_line: 0,
+            end_line: 0,
+            anchor_sha: anchor_sha.into(),
+            context_hash: String::new(),
+            snippet: String::new(),
+        }
+    }
+
+    /// Whether the comment is on the whole file rather than on lines.
+    pub fn is_file(&self) -> bool {
+        self.start_line == 0
     }
 
     /// The path of the file on the anchored side.

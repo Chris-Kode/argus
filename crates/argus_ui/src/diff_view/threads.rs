@@ -7,7 +7,9 @@
 //!   take whole rows of the virtual list; their height in rows is estimated
 //!   first and then measured as they paint ([`DiffView::block_measured`]).
 //!   Every re-placement keeps the reading position: the line or block row
-//!   at the top of the viewport stays there.
+//!   at the top of the viewport stays there. File comments (and their
+//!   composers, opened from the file header) have no line: they go at the
+//!   top of the file, across its full width.
 //! - **Editing.** Composers (new comments), body edits and replies each own
 //!   a [`TextEditor`]. Their text is mirrored into the [`CommentDrafts`]
 //!   global as it is typed, so a draft survives closing the box or the diff
@@ -98,7 +100,8 @@ const MENU_REOPEN_GUARD: Duration = Duration::from_millis(250);
 /// What a draft belongs to.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DraftKey {
-    /// A new comment on a line range of a review.
+    /// A new comment on a line range of a review; `start == end == 0` for
+    /// a comment on the whole file.
     New {
         /// The review (repo, base, head); `None` before it is known.
         review: Option<ReviewKey>,
@@ -173,7 +176,8 @@ pub(super) struct EditorSlot {
     _subscription: Subscription,
 }
 
-/// A new-comment composer under a line range.
+/// A new-comment composer under a line range, or at the top of the file
+/// for a file comment (`selection.start == 0`).
 pub(super) struct Composer {
     file: usize,
     selection: LineSelection,
@@ -380,15 +384,19 @@ impl DiffView {
     /// Line ranges that must be visible in `file`: the current comments
     /// and open composers.
     pub(super) fn commented_ranges(&self, file: usize) -> Vec<(DiffSide, u32, u32)> {
-        let comments = self.file_comments(file).into_iter().map(|comment| {
-            let anchor = &comment.anchor;
-            (anchor.side, anchor.start_line, anchor.end_line)
-        });
+        let comments = self
+            .file_comments(file)
+            .into_iter()
+            .filter(|comment| !comment.anchor.is_file())
+            .map(|comment| {
+                let anchor = &comment.anchor;
+                (anchor.side, anchor.start_line, anchor.end_line)
+            });
         let composers = self
             .threads
             .composers
             .iter()
-            .filter(|composer| composer.file == file)
+            .filter(|composer| composer.file == file && composer.selection.start > 0)
             .map(|composer| {
                 let selection = &composer.selection;
                 (selection.side, selection.start, selection.end)
@@ -421,7 +429,8 @@ impl DiffView {
         markers.get(&line?).copied()
     }
 
-    /// The first line of a comment of `file` that Claude is running.
+    /// The first line of a comment of `file` that Claude is running; `0`
+    /// for a file comment.
     pub(super) fn running_line(&self, file: usize) -> Option<u32> {
         self.file_comments(file)
             .into_iter()
@@ -659,7 +668,11 @@ impl DiffView {
         let mut markers: [HashMap<u32, CommentStatus>; 2] = Default::default();
         for comment in self.file_comments(file) {
             let anchor = &comment.anchor;
+            // A file comment's line 0 has no row: it goes at the top.
             blocks.push((BlockKey::Thread(comment.id), anchor.side, anchor.end_line));
+            if anchor.is_file() {
+                continue;
+            }
             ranges[side_index(anchor.side)].push((anchor.start_line, anchor.end_line));
             markers[side_index(anchor.side)]
                 .entry(anchor.end_line)
@@ -964,6 +977,43 @@ impl DiffView {
         self.replace_threads(file, cx);
     }
 
+    /// The file header's comment button: opens (or focuses) a composer for
+    /// a comment on the whole `file`, at its top. In re-attach mode, it
+    /// re-attaches the comment to the file instead.
+    pub(super) fn comment_on_file(&mut self, file: usize, cx: &mut Context<Self>) {
+        if self.proposal {
+            self.hint = Some(PROPOSAL_COMMENT_HINT.into());
+            cx.notify();
+            return;
+        }
+        let ListStatus::Ready(list) = &self.status else {
+            return;
+        };
+        let Some(entry) = list.entries().get(file) else {
+            return;
+        };
+        let selection = LineSelection {
+            file: entry.path.clone(),
+            old_file: entry.old_path.clone(),
+            side: if entry.new.is_some() {
+                DiffSide::New
+            } else {
+                DiffSide::Old
+            },
+            start: 0,
+            end: 0,
+        };
+        if self.files[file].collapsed {
+            self.relayout(|this| this.files[file].collapsed = false);
+        }
+        self.open_composer(file, selection, cx);
+        // From the sticky header, the top of the file may be far above.
+        if self.threads.reattach.is_none() && self.starts[file] < self.top_row() {
+            self.scroll_to_row(self.starts[file], cx);
+        }
+        cx.notify();
+    }
+
     /// `c`: comments on the gutter selection, or on the first line in view.
     pub fn comment_on_current_line(&mut self, cx: &mut Context<Self>) {
         if self.proposal {
@@ -1114,6 +1164,14 @@ impl DiffView {
     /// The anchor of `selection` in `file`, captured from the loaded text at
     /// the head this view diffs.
     fn capture_anchor(&self, file: usize, selection: &LineSelection) -> Option<CommentAnchor> {
+        if selection.start == 0 {
+            return Some(CommentAnchor::file(
+                selection.file.clone(),
+                selection.old_file.clone(),
+                selection.side,
+                self.target.head_tip.to_hex(),
+            ));
+        }
         let text = self.files.get(file)?.loaded()?.diff.text()?;
         let location = AnchorLocation {
             file_path: selection.file.clone(),
@@ -1819,25 +1877,31 @@ impl DiffView {
         else {
             return div().into_any_element();
         };
+        // `None` for a file comment, which belongs to neither side.
         let side = match &key {
-            BlockKey::Thread(id) => self.comment(*id).map(|comment| comment.anchor.side),
+            BlockKey::Thread(id) => self
+                .comment(*id)
+                .map(|comment| (!comment.anchor.is_file()).then_some(comment.anchor.side)),
             BlockKey::Composer(draft) => self
                 .threads
                 .composers
                 .iter()
                 .find(|composer| composer.slot.draft == *draft)
-                .map(|composer| composer.selection.side),
+                .map(|composer| (composer.selection.start > 0).then_some(composer.selection.side)),
         }
-        .unwrap_or(DiffSide::New);
+        .unwrap_or(Some(DiffSide::New));
         let total = self.card_width();
         let (left, width) = if loaded.rows.split {
             let columns = self.split_columns();
             let indent = columns.number + COMMENT_COLUMN_WIDTH;
-            let left = match side {
-                DiffSide::Old => indent,
-                DiffSide::New => columns.half + SPLIT_DIVIDER_WIDTH + indent,
-            };
-            (left, columns.half - indent - CARD_MARGIN)
+            match side {
+                Some(DiffSide::Old) => (indent, columns.half - indent - CARD_MARGIN),
+                Some(DiffSide::New) => (
+                    columns.half + SPLIT_DIVIDER_WIDTH + indent,
+                    columns.half - indent - CARD_MARGIN,
+                ),
+                None => (indent, total - indent - CARD_MARGIN),
+            }
         } else {
             let left = self.columns().gutter + COMMENT_COLUMN_WIDTH;
             (left, total - left - CARD_MARGIN)
@@ -1902,7 +1966,9 @@ impl DiffView {
         let now = now_seconds();
         let menu_open = self.threads.menu == Some(id);
         let anchor = &comment.anchor;
-        let lines = if anchor.is_range() {
+        let lines = if anchor.is_file() {
+            "File".to_owned()
+        } else if anchor.is_range() {
             format!("Lines {}–{}", anchor.start_line, anchor.end_line)
         } else {
             format!("Line {}", anchor.start_line)
@@ -1910,6 +1976,11 @@ impl DiffView {
         let side = match anchor.side {
             DiffSide::Old => "old side",
             DiffSide::New => "new side",
+        };
+        let place = if anchor.is_file() {
+            anchor.file_path.clone()
+        } else {
+            format!("{} ({side})", anchor.file_path)
         };
 
         let chevron = div()
@@ -1961,7 +2032,7 @@ impl DiffView {
             .text_xs()
             .text_color(colors.text_muted)
             .child(lines)
-            .tooltip(text_tooltip(format!("{} ({side})", anchor.file_path)));
+            .tooltip(text_tooltip(place));
         let menu_button = div()
             .relative()
             .flex_none()

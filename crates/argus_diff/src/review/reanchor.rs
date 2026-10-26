@@ -26,6 +26,11 @@
 //! 6. No match → `outdated = true`. A match on an outdated comment (e.g.
 //!    after a revert) clears the flag.
 //!
+//! A file comment has no lines to look for: it follows its file through
+//! step 1 alone, and has no match once the file is no longer in the diff.
+//! Its side follows the file too: `Old` when it is deleted, `New`
+//! otherwise.
+//!
 //! `Resolved` comments are moved too, but never flagged outdated: their code
 //! is expected to change. Nor are `Running` and `Proposed` ones while their
 //! file is still in the diff: an outdated thread leaves the diff, and with
@@ -179,6 +184,19 @@ pub fn reanchor_in(
         let entry = find_entry(list, anchor);
         let located = match entry {
             None => Located::NoMatch,
+            Some(entry) if anchor.is_file() => {
+                let side = if entry.new.is_some() {
+                    Side::New
+                } else {
+                    Side::Old
+                };
+                Located::Moved(CommentAnchor::file(
+                    entry.path.clone(),
+                    entry.old_path.clone(),
+                    side,
+                    anchor.anchor_sha.clone(),
+                ))
+            }
             Some(entry) => {
                 let text = texts
                     .entry((entry.index, anchor.side))

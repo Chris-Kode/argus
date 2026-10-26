@@ -880,10 +880,12 @@ impl Workspace {
             // Closed threads need nothing more; they do not nag.
             if comment.outdated && !comment.is_closed() {
                 let first = markdown::first_line_plain(&comment.body_md);
-                labels.push(SharedString::from(format!(
-                    "{}:{} · {first}",
-                    comment.anchor.file_path, comment.anchor.start_line
-                )));
+                let anchor = &comment.anchor;
+                labels.push(SharedString::from(if anchor.is_file() {
+                    format!("{} · {first}", anchor.file_path)
+                } else {
+                    format!("{}:{} · {first}", anchor.file_path, anchor.start_line)
+                }));
                 outdated.push(comment.id);
             }
         }

@@ -150,6 +150,44 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE comment_replies
         ADD COLUMN run_id TEXT REFERENCES runs(id) ON DELETE SET NULL;
     "#,
+    // 4: a comment can be on a whole file instead of lines, stored as
+    // `start_line = end_line = 0`. The CHECK is relaxed by rebuilding the
+    // table, as in migration 2; `comment_replies` and `runs` keep pointing
+    // at `comments` by name.
+    r#"
+    CREATE TABLE comments_new (
+        id             TEXT PRIMARY KEY NOT NULL,
+        repo_id        TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        base_ref       TEXT NOT NULL,
+        head_ref       TEXT NOT NULL,
+        file_path      TEXT NOT NULL,
+        old_file_path  TEXT,
+        side           TEXT NOT NULL CHECK (side IN ('old', 'new')),
+        start_line     INTEGER NOT NULL,
+        end_line       INTEGER NOT NULL,
+        anchor_sha     TEXT NOT NULL,
+        context_hash   TEXT NOT NULL,
+        snippet        TEXT NOT NULL,
+        body_md        TEXT NOT NULL,
+        status         TEXT NOT NULL CHECK (status IN
+                           ('open', 'running', 'proposed', 'resolved', 'dismissed')),
+        outdated       INTEGER NOT NULL DEFAULT 0 CHECK (outdated IN (0, 1)),
+        created_at     INTEGER NOT NULL,
+        updated_at     INTEGER NOT NULL,
+        CHECK ((start_line = 0 AND end_line = 0)
+               OR (start_line >= 1 AND end_line >= start_line))
+    );
+    INSERT INTO comments_new (id, repo_id, base_ref, head_ref, file_path, old_file_path, side,
+                              start_line, end_line, anchor_sha, context_hash, snippet, body_md,
+                              status, outdated, created_at, updated_at)
+        SELECT id, repo_id, base_ref, head_ref, file_path, old_file_path, side, start_line,
+               end_line, anchor_sha, context_hash, snippet, body_md, status, outdated,
+               created_at, updated_at
+        FROM comments;
+    DROP TABLE comments;
+    ALTER TABLE comments_new RENAME TO comments;
+    CREATE INDEX comments_repo_refs ON comments(repo_id, base_ref, head_ref);
+    "#,
 ];
 
 /// Newest schema version this build understands.

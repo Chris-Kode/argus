@@ -228,10 +228,15 @@ impl CommentList {
         let colors = &theme.colors;
         let id = comment.id;
         let anchor = &comment.anchor;
-        let lines = if anchor.is_range() {
-            format!("lines {}–{}", anchor.start_line, anchor.end_line)
+        let location = if anchor.is_file() {
+            anchor.file_path.clone()
+        } else if anchor.is_range() {
+            format!(
+                "{} · lines {}–{}",
+                anchor.file_path, anchor.start_line, anchor.end_line
+            )
         } else {
-            format!("line {}", anchor.start_line)
+            format!("{} · line {}", anchor.file_path, anchor.start_line)
         };
         let first_line = anchor.snippet_start_line();
         let digits = (first_line as usize + anchor.snippet.lines().count())
@@ -316,25 +321,27 @@ impl CommentList {
                                 .text_xs()
                                 .text_color(colors.text_muted)
                                 .font_family(theme.fonts.code_family.clone())
-                                .child(format!("{} · {lines}", anchor.file_path)),
+                                .child(location),
                         ),
                 )
-                .child(
-                    div()
-                        .id("outdated-snippet")
-                        .flex()
-                        .flex_col()
-                        .min_h_0()
-                        .overflow_scroll()
-                        .py_1()
-                        .rounded(radius::sm(cx))
-                        .border_1()
-                        .border_color(colors.border_variant)
-                        .bg(colors.background)
-                        .text_xs()
-                        .font_family(theme.fonts.code_family.clone())
-                        .children(snippet),
-                )
+                .when(!anchor.is_file(), |card| {
+                    card.child(
+                        div()
+                            .id("outdated-snippet")
+                            .flex()
+                            .flex_col()
+                            .min_h_0()
+                            .overflow_scroll()
+                            .py_1()
+                            .rounded(radius::sm(cx))
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .bg(colors.background)
+                            .text_xs()
+                            .font_family(theme.fonts.code_family.clone())
+                            .children(snippet),
+                    )
+                })
                 .child(
                     div()
                         .text_sm()
@@ -352,7 +359,10 @@ impl CommentList {
                         .child(
                             primary_button("outdated-reattach", "Re-attach…", cx)
                                 .text_xs()
-                                .tooltip(text_tooltip("Pick the new lines in the diff, then Save."))
+                                .tooltip(text_tooltip(
+                                    "Pick the new lines in the diff and Save, or click a \
+                                     file's comment button.",
+                                ))
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     cx.emit(CommentListEvent::Reattach(id))
                                 })),
@@ -409,12 +419,16 @@ impl CommentList {
                         let (_, color) = status_style(comment.status, colors);
                         let selected = self.selected == Some(comment.id);
                         let anchor = &comment.anchor;
-                        let line = if anchor.is_range() {
+                        let line = if anchor.is_file() {
+                            "File".to_owned()
+                        } else if anchor.is_range() {
                             format!("L{}–{}", anchor.start_line, anchor.end_line)
                         } else {
                             format!("L{}", anchor.start_line)
                         };
-                        let title = if comment.outdated {
+                        let title = if comment.outdated && anchor.is_file() {
+                            anchor.file_path.clone()
+                        } else if comment.outdated {
                             format!("{} {line}", anchor.file_path)
                         } else {
                             line

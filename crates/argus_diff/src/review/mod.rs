@@ -3,14 +3,15 @@
 //!
 //! - [`CommentAnchor`] ties a comment to a file, side and line range, with a
 //!   whitespace-normalized [`context_hash`] and the original snippet for when
-//!   the code is gone.
+//!   the code is gone; or, for a file comment, to the whole file.
 //! - [`transition`] is the pure status state machine of spec §7.2; nothing
 //!   is persisted unless it accepts the event.
 //! - [`CommentService`] holds the comments of one (repo, base, head) review,
 //!   persists every change through [`argus_store::CommentStore`] and
 //!   broadcasts [`CommentChange`]s for the UI.
 //! - [`reanchor`] moves comments after a diff refresh, or flags them
-//!   outdated when their code is gone (spec §7.3).
+//!   outdated when their code (or, for a file comment, their file) is gone
+//!   (spec §7.3).
 
 mod anchor;
 mod comment;

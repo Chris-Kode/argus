@@ -259,7 +259,11 @@ impl ProposalView {
                             .rsplit('/')
                             .next()
                             .unwrap_or(&anchor.file_path);
-                        format!("{kind} · {name}:{}", anchor.start_line).into()
+                        if anchor.is_file() {
+                            format!("{kind} · {name}").into()
+                        } else {
+                            format!("{kind} · {name}:{}", anchor.start_line).into()
+                        }
                     }
                     None => format!("{kind} · pull before push · {}", proposal.head).into(),
                 }
@@ -998,6 +1002,11 @@ impl ProposalView {
                 DiffSide::Old => "old side",
                 DiffSide::New => "new side",
             };
+            let place = if anchor.is_file() {
+                anchor.file_path.clone()
+            } else {
+                format!("{}  {lines} · {side}", anchor.file_path)
+            };
             let location = div()
                 .id("proposal-location")
                 .flex_none()
@@ -1013,7 +1022,7 @@ impl ProposalView {
                 .on_click(cx.listener(move |_, _, _, cx| {
                     cx.emit(ProposalEvent::RevealComment(comment_id));
                 }))
-                .child(format!("{}  {lines} · {side}  ↗", anchor.file_path));
+                .child(format!("{place}  ↗"));
             let body = match &self.body_doc {
                 Some(doc) => markdown::render(doc, "proposal-comment".into(), cx),
                 None => div().child(comment.body_md.clone()).into_any_element(),

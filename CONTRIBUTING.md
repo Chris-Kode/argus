@@ -70,6 +70,16 @@ The rev corresponds to Zed tag **v1.24.2**.
 `cargo xtask bundle --universal` on a macOS runner and publishes the `.dmg` and
 `.zip` as a GitHub Release.
 
+The quick way is **Actions → New release → Run workflow** on `main`, picking
+`patch`, `minor` or `major`
+([`.github/workflows/new-release.yml`](.github/workflows/new-release.yml)). It
+increases that part of the version (`0.1.1` → `0.1.2`, `0.2.0` or `1.0.0`),
+commits the bump to `main`, tags it and starts the Release workflow on the
+tag. It pushes with the workflow token, so `main` must accept pushes from
+GitHub Actions.
+
+By hand:
+
 1. Bump `version` under `[workspace.package]` in the root `Cargo.toml`, run
    `cargo build` so `Cargo.lock` follows, and merge it to `main`.
 2. Tag that commit and push the tag; it must be the version with a `v`:
