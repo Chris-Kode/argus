@@ -1,8 +1,8 @@
-# Contributing to Argus
+# Development
 
 ## Toolchain
 
-[`rust-toolchain.toml`](rust-toolchain.toml) pins Rust **1.98.1** with `rustfmt`
+[`rust-toolchain.toml`](../rust-toolchain.toml) pins Rust **1.98.1** with `rustfmt`
 and `clippy`; rustup installs it on first use. The pin matches the toolchain Zed
 builds the pinned GPUI rev with — bump the two together, never separately.
 
@@ -19,6 +19,71 @@ cargo run -p argus
 ARGUS_HOME=/tmp/argus-dev cargo run -p argus
 ```
 
+## Bundling the app
+
+A release build of the app bundle takes a few minutes:
+
+```sh
+git clone https://github.com/Chris-Kode/argus.git
+cd argus
+cargo xtask bundle
+```
+
+This writes to `target/bundle/`:
+
+- `Argus.app`;
+- `Argus-<version>-macos-<arch>.dmg`: open it and drag Argus to Applications;
+- `Argus-<version>-macos-<arch>.zip`: the same app, zipped.
+
+`cargo xtask bundle --universal` builds one app for both Apple silicon and Intel
+(first `rustup target add aarch64-apple-darwin x86_64-apple-darwin`).
+
+### Signing and Gatekeeper
+
+By default the app is signed ad hoc, not with a Developer ID, and it is not
+notarized. On the Mac that built it, it opens normally. On another Mac, the
+first launch is blocked by Gatekeeper ("Apple could not verify…"): open
+**System Settings → Privacy & Security** and click **Open Anyway** next to the
+Argus message, or clear the download quarantine once:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Argus.app
+```
+
+To hand the app to other people, sign it with a Developer ID and notarize it
+(this needs an Apple Developer Program membership):
+
+1. Install a **Developer ID Application** certificate in your login keychain
+   and find its name with `security find-identity -v -p codesigning`.
+2. Store notary credentials in the keychain once, under a profile name of your
+   choice (an [app-specific password](https://support.apple.com/102654) works):
+
+   ```sh
+   xcrun notarytool store-credentials argus-notary --apple-id you@example.com --team-id TEAMID
+   ```
+
+3. Bundle with both:
+
+   ```sh
+   cargo xtask bundle --sign "Developer ID Application: Your Name (TEAMID)" --notarize argus-notary
+   ```
+
+`--sign` signs the app (hardened runtime, secure timestamp) and the `.dmg`.
+`--notarize` sends the `.dmg` to Apple, waits for the verdict (usually a few
+minutes) and staples the ticket to the `.dmg` and the app, so the `.zip` made
+afterwards carries it too. Gatekeeper then opens Argus without any prompt,
+even offline. `--sign` alone gives a Developer-ID-signed app that Gatekeeper
+still blocks until it is notarized. `ARGUS_SIGN_IDENTITY` and
+`ARGUS_NOTARY_PROFILE` can stand in for the two flags, e.g. in CI.
+
+### Linux (best effort)
+
+`cargo xtask bundle` on Linux writes `target/bundle/argus-<version>-linux-<arch>.tar.gz`
+with the `argus` binary, an `argus.desktop` entry and an `argus.png` icon. Put
+the binary on your `PATH`, and the desktop entry and the icon in
+`~/.local/share/applications` and `~/.local/share/icons`. GPUI needs the usual
+Vulkan, Wayland or X11 and font libraries.
+
 ## Checks
 
 ```sh
@@ -28,19 +93,19 @@ cargo test --workspace
 ```
 
 Clippy warnings are errors. `cargo test --workspace` currently runs zero tests
-by project policy — see [AGENTS.md](AGENTS.md).
+by project policy — see [AGENTS.md](../AGENTS.md).
 
 ## Performance
 
 `cargo xtask fixtures` builds the deterministic fixture repositories under
 `target/fixtures/`; `ARGUS_PERF=1` (with `--auto-scroll`) prints the timing
-report. See [docs/perf.md](docs/perf.md).
+report. See [perf.md](perf.md).
 
 ## GPUI pin
 
 GPUI is not reliably published on crates.io, so Argus depends on the Zed
 repository at one exact commit. Both GPUI crates must always point at the same
-rev, declared in the root [`Cargo.toml`](Cargo.toml) under
+rev, declared in the root [`Cargo.toml`](../Cargo.toml) under
 `[workspace.dependencies]`:
 
 | Crate | Git source | Pinned rev |
@@ -66,13 +131,13 @@ The rev corresponds to Zed tag **v1.24.2**.
 
 ## Releasing
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) builds
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) builds
 `cargo xtask bundle --universal` on a macOS runner and publishes the `.dmg` and
 `.zip` as a GitHub Release.
 
 The quick way is **Actions → New release → Run workflow** on `main`, picking
 `patch`, `minor` or `major`
-([`.github/workflows/new-release.yml`](.github/workflows/new-release.yml)). It
+([`.github/workflows/new-release.yml`](../.github/workflows/new-release.yml)). It
 increases that part of the version (`0.1.1` → `0.1.2`, `0.2.0` or `1.0.0`),
 commits the bump to `main`, tags it and starts the Release workflow on the
 tag. It pushes with the workflow token, so `main` must accept pushes from
@@ -120,8 +185,8 @@ membership:
    profile in it with `xcrun notarytool store-credentials argus-notary --key …
    --key-id … --issuer … --keychain …`.
 4. Give **Bundle** `ARGUS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}` and
-   `ARGUS_NOTARY_PROFILE: argus-notary`, and drop the Gatekeeper paragraph from
-   the release notes and the README.
+   `ARGUS_NOTARY_PROFILE: argus-notary`, and drop the Gatekeeper paragraphs from
+   the release notes, the README and "Signing and Gatekeeper" above.
 
 Once an installed copy is Developer-ID signed, it accepts only updates signed
 by the same team.

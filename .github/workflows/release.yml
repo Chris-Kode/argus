@@ -6,7 +6,7 @@
 #   builds, and keeps the files as a workflow artifact; on a tag it publishes,
 #   like a pushed tag. The New release workflow starts it that way.
 #
-# The app is signed ad hoc for now; see "Releasing" in CONTRIBUTING.md.
+# The app is signed ad hoc for now; see "Releasing" in docs/development.md.
 name: Release
 
 on:

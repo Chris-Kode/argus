@@ -12,4 +12,4 @@ that are easiest to get wrong:
   descriptions in the UI — see "UI copy" in AGENTS.md.
 - **Do not bump the pins.** `gpui`/`gpui_platform` (root `Cargo.toml`) and the
   Rust toolchain (`rust-toolchain.toml`) move only when a task explicitly asks,
-  both together, per [CONTRIBUTING.md](CONTRIBUTING.md).
+  both together, per [docs/development.md](docs/development.md).

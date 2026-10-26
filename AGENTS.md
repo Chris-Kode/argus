@@ -31,7 +31,7 @@ having nothing to run.
 - `rust-toolchain.toml` pins the Rust toolchain.
 
 Bump them only when a task explicitly asks for it, both together, following the
-procedure in [CONTRIBUTING.md](CONTRIBUTING.md).
+procedure in [docs/development.md](docs/development.md).
 
 ### 3. Keep the UI thread free
 
