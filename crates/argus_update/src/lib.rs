@@ -27,6 +27,10 @@ const FEED_ENV: &str = "ARGUS_UPDATE_FEED";
 const BUNDLE_ID: &str = "io.github.chris-kode.argus";
 /// This build's version.
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Name prefix of the new bundle while it is copied next to the old one.
+const INCOMING: &str = ".Argus.app.incoming";
+/// Name prefix of the old bundle between the swap and its deletion.
+const OUTGOING: &str = ".Argus.app.outgoing";
 
 /// Result alias used across `argus_update`.
 pub type Result<T, E = UpdateError> = std::result::Result<T, E>;
@@ -310,25 +314,35 @@ pub async fn install(release: &Release, app: &Path, updates_dir: &Path) -> Resul
         path: app.to_owned(),
         source: io::Error::from(io::ErrorKind::InvalidInput),
     })?;
-    let incoming = parent.join(".Argus.app.incoming");
-    remove_path(&incoming).await?;
+    sweep_leftovers(parent).await;
+    // Fresh names per attempt, so a leftover that cannot be deleted never
+    // blocks the next update.
+    let suffix = unique_suffix();
+    let incoming = Leftover::new(parent.join(format!("{INCOMING}{suffix}")));
     run(
         "ditto",
-        Command::new("ditto").arg(&downloaded).arg(&incoming),
+        Command::new("ditto").arg(&downloaded).arg(incoming.path()),
     )
     .await?;
 
-    let outgoing = parent.join(".Argus.app.outgoing");
+    let outgoing = parent.join(format!("{OUTGOING}{suffix}"));
     let current = app.to_owned();
     // `spawn_blocking` work is never aborted: the bundle is never left half
-    // swapped, even if the caller goes away.
-    tokio::task::spawn_blocking(move || swap(&current, &incoming, &outgoing))
-        .await
-        .map_err(|error| UpdateError::Io {
-            action: "cannot replace",
-            path: app.to_owned(),
-            source: io::Error::other(error),
-        })??;
+    // swapped, even if the caller goes away. `incoming` moves in with it so
+    // its cleanup cannot race the swap.
+    tokio::task::spawn_blocking(move || {
+        let result = swap(&current, incoming.path(), &outgoing);
+        if result.is_ok() {
+            incoming.keep();
+        }
+        result
+    })
+    .await
+    .map_err(|error| UpdateError::Io {
+        action: "cannot replace",
+        path: app.to_owned(),
+        source: io::Error::other(error),
+    })??;
     if let Err(error) = remove_path(&staging).await {
         tracing::warn!(%error, "cannot clean up the update download");
     }
@@ -407,7 +421,6 @@ async fn team_id(app: &Path) -> Option<String> {
 /// Moves `current` aside to `outgoing`, `incoming` into its place, then
 /// deletes the old bundle. Puts `current` back when the second move fails.
 fn swap(current: &Path, incoming: &Path, outgoing: &Path) -> Result<()> {
-    remove_path_blocking(outgoing)?;
     std::fs::rename(current, outgoing).map_err(io_error("cannot move aside", current))?;
     if let Err(source) = std::fs::rename(incoming, current) {
         if let Err(error) = std::fs::rename(outgoing, current) {
@@ -471,11 +484,120 @@ async fn remove_path(path: &Path) -> Result<()> {
 }
 
 fn remove_path_blocking(path: &Path) -> Result<()> {
-    let result = match std::fs::symlink_metadata(path) {
+    let mut result = remove_tree(path);
+    // A copied bundle can hold read-only directories, whose entries can only
+    // be deleted once the directories are writable again.
+    if matches!(&result, Err(error) if error.kind() == io::ErrorKind::PermissionDenied) {
+        make_writable(path);
+        result = remove_tree(path);
+    }
+    result.map_err(io_error("cannot delete", path))
+}
+
+fn remove_tree(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
         Ok(_) => std::fs::remove_file(path),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+/// Gives the owner full access to every directory under `path`, as far as
+/// it is allowed to; files are left alone, deleting them needs only a
+/// writable parent.
+#[cfg(unix)]
+fn make_writable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
     };
-    result.map_err(io_error("cannot delete", path))
+    if !meta.is_dir() {
+        return;
+    }
+    let mut permissions = meta.permissions();
+    permissions.set_mode(permissions.mode() | 0o700);
+    let _ = std::fs::set_permissions(path, permissions);
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            make_writable(&entry.path());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn make_writable(_path: &Path) {}
+
+/// Deletes the copies earlier, interrupted attempts left next to the app,
+/// as far as it can; what stays only costs disk space.
+async fn sweep_leftovers(parent: &Path) {
+    let parent = parent.to_owned();
+    let _ = tokio::task::spawn_blocking(move || {
+        let Ok(entries) = std::fs::read_dir(&parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !(name.starts_with(INCOMING) || name.starts_with(OUTGOING)) {
+                continue;
+            }
+            if let Err(error) = remove_path_blocking(&entry.path()) {
+                tracing::warn!(%error, "cannot delete a leftover from an earlier update");
+            }
+        }
+    })
+    .await;
+}
+
+/// A suffix no earlier attempt has used.
+fn unique_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!("-{}-{nanos}", std::process::id())
+}
+
+/// A path that is deleted in the background when dropped, unless kept: the
+/// new bundle's copy is cleaned up when the copy or the swap fails, or the
+/// install is cancelled.
+struct Leftover {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Leftover {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The path is in use now; leave it be.
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Leftover {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let path = std::mem::take(&mut self.path);
+        let remove = move || {
+            if let Err(error) = remove_path_blocking(&path) {
+                tracing::warn!(%error, "cannot clean up the update copy");
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(remove);
+            }
+            Err(_) => remove(),
+        }
+    }
 }
