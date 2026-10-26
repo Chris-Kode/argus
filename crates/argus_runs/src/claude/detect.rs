@@ -37,10 +37,10 @@ pub const EFFORT_FLAG: &str = "--effort";
 pub const AUTO_MODE: &str = "auto";
 
 /// Flags Argus cannot run without: every flag of the review-run argv
-/// (spec §6.2) plus `--tools` and `--max-turns` of the commit-message call
-/// (spec §6.4). `--permission-prompt-tool` is not listed by `--help`; the
-/// probe finds it.
-pub const REQUIRED_FLAGS: [&str; 13] = [
+/// (spec §6.2) plus `--tools`, `--max-turns` and `--strict-mcp-config` of
+/// the commit-message call (spec §6.4). `--permission-prompt-tool` is not
+/// listed by `--help`; the probe finds it.
+pub const REQUIRED_FLAGS: [&str; 14] = [
     "-p",
     "--model",
     "--session-id",
@@ -54,6 +54,7 @@ pub const REQUIRED_FLAGS: [&str; 13] = [
     "--append-system-prompt-file",
     "--tools",
     "--max-turns",
+    "--strict-mcp-config",
 ];
 
 /// Why `claude` could not be detected.
