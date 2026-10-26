@@ -2,8 +2,9 @@
 #
 # - Pushing a `vX.Y.Z` tag creates a GitHub Release with the `.dmg` and `.zip`
 #   (a tag with a `-`, e.g. `v0.2.0-beta.1`, makes a pre-release).
-# - Running it by hand (Actions → Release → Run workflow) only builds, and
-#   keeps the files as a workflow artifact.
+# - Running it by hand (Actions → Release → Run workflow) on a branch only
+#   builds, and keeps the files as a workflow artifact; on a tag it publishes,
+#   like a pushed tag. The New release workflow starts it that way.
 #
 # The app is signed ad hoc for now; see "Releasing" in CONTRIBUTING.md.
 name: Release
