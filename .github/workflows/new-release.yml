@@ -1,0 +1,116 @@
+# Cuts a new release by hand: Actions → New release → Run workflow, then pick
+# patch, minor or major.
+#
+# It bumps `version` under `[workspace.package]` in the root `Cargo.toml` (and
+# the workspace crates in `Cargo.lock`), commits that to `main`, tags it
+# `vX.Y.Z` and starts the Release workflow on the tag, which builds the app and
+# publishes the GitHub Release.
+#
+# A tag pushed with the workflow's own token does not start other workflows, so
+# the Release workflow is started explicitly; it treats a run on a tag like a
+# pushed tag.
+name: New release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version part to increase
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: new-release
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Only from the default branch
+        if: github.ref_name != github.event.repository.default_branch
+        run: |
+          echo "::error::Run this from ${{ github.event.repository.default_branch }}, not ${{ github.ref_name }}"
+          exit 1
+
+      - uses: actions/checkout@v5
+
+      - name: Bump the version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          python3 - <<'EOF'
+          import os, re
+
+          with open("Cargo.toml") as f:
+              manifest = f.read()
+          section = re.search(r"(?ms)^\[workspace\.package\]\n(.*?)(?=^\[|\Z)", manifest)
+          found = re.search(r'(?m)^version = "(\d+)\.(\d+)\.(\d+)"$', section.group(1))
+          if not found:
+              raise SystemExit("::error::No plain X.Y.Z version under [workspace.package]")
+          old = found.group(0)
+          major, minor, patch = map(int, found.groups())
+          bump = os.environ["BUMP"]
+          if bump == "major":
+              major, minor, patch = major + 1, 0, 0
+          elif bump == "minor":
+              minor, patch = minor + 1, 0
+          else:
+              patch += 1
+          current = ".".join(found.groups())
+          version = f"{major}.{minor}.{patch}"
+
+          start = section.start(1) + found.start()
+          manifest = manifest[:start] + f'version = "{version}"' + manifest[start + len(old):]
+          with open("Cargo.toml", "w") as f:
+              f.write(manifest)
+
+          # Workspace crates are the lockfile packages without a `source`.
+          with open("Cargo.lock") as f:
+              blocks = f.read().split("\n[[package]]\n")
+          changed = 0
+          for index, block in enumerate(blocks[1:], 1):
+              if "\nsource = " not in block and f'\nversion = "{current}"\n' in block:
+                  blocks[index] = block.replace(
+                      f'\nversion = "{current}"\n', f'\nversion = "{version}"\n', 1
+                  )
+                  changed += 1
+          if changed == 0:
+              raise SystemExit(f"::error::No workspace crate at {current} in Cargo.lock")
+          with open("Cargo.lock", "w") as f:
+              f.write("\n[[package]]\n".join(blocks))
+
+          print(f"{current} -> {version} ({changed} crates in Cargo.lock)")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={version}\n")
+          EOF
+
+      - name: Commit, tag and push
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "::error::Tag $tag already exists"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Bump version to $VERSION"
+          git tag "$tag"
+          git push origin "HEAD:${{ github.ref_name }}" "refs/tags/$tag"
+
+      - name: Start the Release workflow on the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "v$VERSION"
+          echo "Release v$VERSION started: https://github.com/$GITHUB_REPOSITORY/actions/workflows/release.yml" >> "$GITHUB_STEP_SUMMARY"
