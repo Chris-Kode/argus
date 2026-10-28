@@ -5,7 +5,7 @@
 //! commits of the diff, the diff itself and, for a line selection, the
 //! lines in question) with `git` reads of commits only, and hands it over
 //! on stdin. Claude answers in Markdown: what changed, before and after,
-//! small steps, plain-text diagrams and what is worth checking.
+//! small steps, Mermaid diagrams and what is worth checking.
 //!
 //! Answers are stored in the `explanations` table, keyed by the merge-base,
 //! the head tip and the scope ([`ExplainRequest::key`]): the same diff opens
@@ -243,14 +243,16 @@ fn prompt(request: &ExplainRequest) -> String {
          ## Step by step\nA numbered list of baby steps that walk through the change in the \
          order a reader should follow it. One small idea per step; name the files and \
          functions involved.\n\n\
-         ## Diagram\nOne or two plain-text diagrams, each in a ```text block, made of boxes \
-         and arrows and at most 72 characters wide, showing the flow or the structure before \
-         and after.\n\n\
+         ## Diagram\nOne or two small Mermaid diagrams, each in a ```mermaid block: a \
+         `flowchart` (TD or LR) of the flow or the structure, with a `Before` and an `After` \
+         subgraph when that helps, or a `sequenceDiagram` when the change is about who calls \
+         whom. At most about a dozen nodes; short labels, in double quotes when they hold \
+         punctuation or code. No styles, classDef, click or links.\n\n\
          ## Worth checking\nA short bulleted list of risks, edge cases or open questions for \
          the review. Write \"Nothing stands out.\" when there are none.\n\n\
          Rules: use plain, friendly words and short paragraphs; explain any jargon the first \
          time it appears; put identifiers in `inline code`; quote at most a few lines of \
-         code. Do not use tables, HTML or Mermaid: they are not rendered. Do not repeat the \
+         code. Do not use tables or HTML: they are not rendered. Do not repeat the \
          diff back. Answer only with the explanation."
     )
 }

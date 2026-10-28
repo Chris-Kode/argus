@@ -63,6 +63,8 @@ notify = "8.2.0"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 # Hidden-file patterns written as `/regex/` (MIT OR Apache-2.0).
 regex = "1.13.1"
+# Mermaid diagrams in Markdown, rendered to SVG in pure Rust (MIT).
+mermaid-svg = "0.7.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -105,6 +107,9 @@ tree-sitter-yaml = "0.7.2"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # Grapheme boundaries for the comment editor's caret.
 unicode-segmentation = "1.13.3"
+# Measures rendered Mermaid SVGs; the version GPUI draws SVGs with
+# (MIT OR Apache-2.0).
+usvg = { version = "0.46.0", default-features = false, features = ["text"] }
 uuid = { version = "1.28.0", features = ["serde", "v7"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 

@@ -24,6 +24,7 @@ pub mod icons;
 pub mod jobs;
 pub mod keymap;
 pub mod markdown;
+pub mod mermaid;
 pub mod perf;
 pub mod permission;
 pub mod proposal;

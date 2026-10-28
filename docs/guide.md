@@ -116,7 +116,7 @@ checkout.
 
 **Explain** in the title bar has Claude explain the whole diff in plain
 words: in short, how it worked before, how it works now, the change step by
-step, plain-text diagrams, and what is worth checking. Select lines in the
+step, diagrams, and what is worth checking. Select lines in the
 gutter and **Explain selection** (floating over the bottom of the diff) or
 `e` explains just those lines, in the context of their file's change; `e`
 with nothing selected explains the whole diff. `esc` clears the selection.
@@ -127,6 +127,10 @@ or head branch moves. **Regenerate** writes a new one; **Stop** (or closing
 the dialog) stops Claude. The right part of the Explain button, and the
 buttons at the bottom of the dialog, pick the model and effort; they are
 separate from the Run menu's and the last choice is kept.
+
+Diagrams are Mermaid, drawn in Argus without a browser; one Argus cannot draw
+shows as its source. A ```` ```mermaid ```` block in a comment is drawn the
+same way.
 
 Claude gets no tools for this: Argus hands it the commits, the diff (without
 your hidden files, and cut down when very large) and the selected lines, read

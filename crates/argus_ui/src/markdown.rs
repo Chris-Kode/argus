@@ -1,12 +1,15 @@
 //! Markdown for comment bodies: paragraphs, headings, emphasis, inline
 //! code, fenced code blocks (highlighted by the background highlighter),
-//! lists, block quotes and links that open in the browser.
+//! Mermaid diagrams, lists, block quotes and links that open in the
+//! browser.
 //!
 //! [`Markdown::parse`] turns a body into a small block model once; views
 //! keep the results in a [`MarkdownCache`] keyed by the body text, which
 //! also requests the highlights of fenced code blocks on the highlighter's
-//! worker threads ([`HighlightService`]), so neither parsing nor
-//! highlighting is redone per frame. [`render`] builds the elements.
+//! worker threads ([`HighlightService`]) and the rendering of ```` ```mermaid ````
+//! blocks ([`mermaid::Diagrams`]), so neither parsing, highlighting nor
+//! drawing diagrams is redone per frame. [`render`] builds the elements; a
+//! diagram shows as its source until it is drawn, or when it cannot be.
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -17,13 +20,14 @@ use argus_highlight::{
     HighlightKey, HighlightRequest, HighlightService, Highlights, Language, Outcome, Priority,
 };
 use gpui::{
-    AnyElement, App, Context, FontStyle, FontWeight, HighlightStyle, InteractiveText, SharedString,
-    StrikethroughStyle, StyledText, Task, UnderlineStyle, div, prelude::*, px,
+    AnyElement, App, Context, FontStyle, FontWeight, HighlightStyle, InteractiveText, ObjectFit,
+    SharedString, StrikethroughStyle, StyledText, Task, UnderlineStyle, div, img, prelude::*, px,
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::AppContext;
 use crate::components::radius;
+use crate::mermaid::{self, Diagram};
 use crate::theme::{ActiveTheme, Theme};
 
 /// Parsed bodies a cache keeps beyond the ones in use.
@@ -78,6 +82,8 @@ pub enum Block {
     Paragraph(RichText),
     /// A heading, level 1–6.
     Heading(u8, RichText),
+    /// A ```` ```mermaid ```` block: its source.
+    Diagram(String),
     /// A fenced or indented code block.
     Code {
         /// From the fence's info string, when it names a known language.
@@ -102,6 +108,8 @@ pub enum Block {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Markdown {
     blocks: Vec<Block>,
+    /// Whether any block, however nested, is a [`Block::Diagram`].
+    has_diagrams: bool,
 }
 
 /// Containers open while parsing.
@@ -120,7 +128,9 @@ impl Markdown {
         let mut stack: Vec<(Container, Vec<Block>)> = vec![(Container::Root, Vec::new())];
         let mut inline: Option<RichText> = None;
         let mut heading: Option<u8> = None;
-        let mut code: Option<(Option<Language>, String)> = None;
+        // Language, whether it is a Mermaid diagram, text.
+        let mut code: Option<(Option<Language>, bool, String)> = None;
+        let mut has_diagrams = false;
         let mut format = Format::default();
         let mut links: Vec<(usize, String)> = Vec::new();
 
@@ -154,14 +164,15 @@ impl Markdown {
                     }
                     Tag::CodeBlock(kind) => {
                         flush(&mut inline, &mut heading, &mut stack);
-                        let language = match kind {
+                        let info = match &kind {
                             CodeBlockKind::Fenced(info) => info
                                 .split(|ch: char| ch.is_whitespace() || ch == ',')
-                                .next()
-                                .and_then(Language::from_injection_name),
+                                .next(),
                             CodeBlockKind::Indented => None,
                         };
-                        code = Some((language, String::new()));
+                        let diagram = info.is_some_and(|info| info.eq_ignore_ascii_case("mermaid"));
+                        let language = info.and_then(Language::from_injection_name);
+                        code = Some((language, diagram, String::new()));
                     }
                     Tag::BlockQuote(_) => {
                         flush(&mut inline, &mut heading, &mut stack);
@@ -190,14 +201,19 @@ impl Markdown {
                         flush(&mut inline, &mut heading, &mut stack);
                     }
                     TagEnd::CodeBlock => {
-                        if let Some((language, mut text)) = code.take() {
+                        if let Some((language, diagram, mut text)) = code.take() {
                             if text.ends_with('\n') {
                                 text.pop();
                             }
+                            has_diagrams |= diagram;
                             if let Some((_, blocks)) = stack.last_mut() {
-                                blocks.push(Block::Code {
-                                    language,
-                                    code: text,
+                                blocks.push(if diagram {
+                                    Block::Diagram(text)
+                                } else {
+                                    Block::Code {
+                                        language,
+                                        code: text,
+                                    }
                                 });
                             }
                         }
@@ -245,7 +261,7 @@ impl Markdown {
                     _ => {}
                 },
                 Event::Text(text) => match &mut code {
-                    Some((_, code)) => code.push_str(&text),
+                    Some((_, _, code)) => code.push_str(&text),
                     None => inline
                         .get_or_insert_with(RichText::default)
                         .push(&text, format),
@@ -258,7 +274,7 @@ impl Markdown {
                     },
                 ),
                 Event::Html(text) | Event::InlineHtml(text) => match &mut code {
-                    Some((_, code)) => code.push_str(&text),
+                    Some((_, _, code)) => code.push_str(&text),
                     None => inline
                         .get_or_insert_with(RichText::default)
                         .push(&text, format),
@@ -297,30 +313,56 @@ impl Markdown {
             }
         }
         let blocks = stack.pop().map(|(_, blocks)| blocks).unwrap_or_default();
-        Self { blocks }
+        Self {
+            blocks,
+            has_diagrams,
+        }
     }
 
-    /// The code blocks with a known language, for highlighting.
-    fn code_blocks(&self) -> Vec<(Language, &str)> {
-        fn walk<'a>(blocks: &'a [Block], out: &mut Vec<(Language, &'a str)>) {
+    /// Every block, nested ones included, in document order.
+    fn walk<'a>(&'a self, visit: &mut impl FnMut(&'a Block)) {
+        fn walk<'a>(blocks: &'a [Block], visit: &mut impl FnMut(&'a Block)) {
             for block in blocks {
+                visit(block);
                 match block {
-                    Block::Code {
-                        language: Some(language),
-                        code,
-                    } => out.push((*language, code)),
                     Block::List { items, .. } => {
                         for item in items {
-                            walk(item, out);
+                            walk(item, visit);
                         }
                     }
-                    Block::Quote(blocks) => walk(blocks, out),
+                    Block::Quote(blocks) => walk(blocks, visit),
                     _ => {}
                 }
             }
         }
+        walk(&self.blocks, visit);
+    }
+
+    /// The code blocks with a known language, for highlighting.
+    fn code_blocks(&self) -> Vec<(Language, &str)> {
         let mut out = Vec::new();
-        walk(&self.blocks, &mut out);
+        self.walk(&mut |block| {
+            if let Block::Code {
+                language: Some(language),
+                code,
+            } = block
+            {
+                out.push((*language, code.as_str()));
+            }
+        });
+        out
+    }
+
+    /// The sources of the Mermaid diagrams.
+    fn diagrams(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        if self.has_diagrams {
+            self.walk(&mut |block| {
+                if let Block::Diagram(source) = block {
+                    out.push(source.as_str());
+                }
+            });
+        }
         out
     }
 }
@@ -345,8 +387,9 @@ impl MarkdownCache {
     }
 
     /// Parses `body` (once) and requests the highlights of its code blocks
-    /// on the highlighter's threads; the view repaints when they arrive.
-    /// `cache` finds this cache inside the view.
+    /// on the highlighter's threads and the drawing of its diagrams in the
+    /// current appearance; the view repaints when they arrive. `cache`
+    /// finds this cache inside the view.
     pub fn prepare<V: 'static>(
         &mut self,
         body: &str,
@@ -355,13 +398,17 @@ impl MarkdownCache {
     ) -> Arc<Markdown> {
         let hash = body_hash(body);
         if let Some(doc) = self.docs.get(&hash) {
-            return doc.clone();
+            // A theme switch needs the diagrams in the other colors.
+            let doc = doc.clone();
+            request_diagrams(&doc, cx);
+            return doc;
         }
         if self.docs.len() >= MAX_CACHED_DOCS {
             self.docs.clear();
         }
         let doc = Arc::new(Markdown::parse(body));
         self.docs.insert(hash, doc.clone());
+        request_diagrams(&doc, cx);
         let service: HighlightService = cx.global::<AppContext>().highlighter.clone();
         for (language, code) in doc.code_blocks() {
             let Some(key) = HighlightKey::for_text(code, language) else {
@@ -395,8 +442,18 @@ impl MarkdownCache {
     }
 }
 
-/// Renders a parsed body. `id` must be unique among the documents shown
-/// together (element ids of the clickable texts derive from it).
+/// Requests the drawing of `doc`'s diagrams in the current appearance.
+fn request_diagrams(doc: &Markdown, cx: &mut App) {
+    let diagrams = doc.diagrams();
+    if diagrams.is_empty() {
+        return;
+    }
+    let appearance = cx.theme().appearance;
+    for source in diagrams {
+        mermaid::Diagrams::request(source, appearance, cx);
+    }
+}
+
 /// The first non-blank line of `body` as plain text, for one-line
 /// previews: inline code, emphasis and link syntax are dropped, their text
 /// kept (`` `get` takes **two** `` → `get takes two`).
@@ -416,6 +473,8 @@ pub fn first_line_plain(body: &str) -> String {
     text
 }
 
+/// Renders a parsed body. `id` must be unique among the documents shown
+/// together (element ids of the clickable texts derive from it).
 pub fn render(doc: &Markdown, id: SharedString, cx: &App) -> AnyElement {
     let mut counter = 0;
     div()
@@ -468,6 +527,10 @@ fn render_blocks(
                 .child(render_text(text, id, counter, cx))
                 .into_any_element(),
             Block::Code { language, code } => render_code(*language, code, cx),
+            Block::Diagram(source) => match mermaid::Diagrams::get(source, theme.appearance, cx) {
+                Some(diagram) => render_diagram(&diagram, cx),
+                None => render_code(None, source, cx),
+            },
             Block::List { start, items } => div()
                 .flex()
                 .flex_col()
@@ -592,6 +655,27 @@ fn open_link(url: &str, cx: &mut App) {
     } else {
         tracing::debug!(url, "not opening a non-web link");
     }
+}
+
+/// A drawn diagram at its natural size, scaled down to the width available.
+fn render_diagram(diagram: &Diagram, cx: &App) -> AnyElement {
+    let colors = &cx.theme().colors;
+    div()
+        .flex()
+        .justify_center()
+        .w_full()
+        .p_2()
+        .rounded(radius::sm(cx))
+        .border_1()
+        .border_color(colors.border_variant)
+        .child(
+            img(diagram.image.clone())
+                .w_full()
+                .max_w(px(diagram.width))
+                .aspect_ratio(diagram.width / diagram.height)
+                .object_fit(ObjectFit::Contain),
+        )
+        .into_any_element()
 }
 
 fn render_code(language: Option<Language>, code: &str, cx: &App) -> AnyElement {
