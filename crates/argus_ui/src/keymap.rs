@@ -25,6 +25,16 @@ actions!(
         Comment,
         /// Run the selected comment with Claude.
         Run,
+        /// Have Claude explain the selected lines, or the whole diff.
+        Explain,
+        /// Diagram viewer: zoom in.
+        ZoomIn,
+        /// Diagram viewer: zoom out.
+        ZoomOut,
+        /// Diagram viewer: fit the diagram in the window.
+        ZoomToFit,
+        /// Diagram viewer: show the diagram at its natural size.
+        ZoomToActualSize,
         /// Accept the open proposal.
         Accept,
         /// Reject the open proposal (asks first; press again to confirm).
@@ -178,6 +188,12 @@ pub const COMMENT_EDITOR_CONTEXT: &str = "CommentEditor";
 
 /// Predicate for the comment editor's keys.
 const COMMENT_EDITOR: Option<&str> = Some("CommentEditor");
+
+/// Key context of the diagram viewer.
+pub const DIAGRAM_VIEWER_CONTEXT: &str = "DiagramViewer";
+
+/// Predicate for the diagram viewer's keys.
+const DIAGRAM_VIEWER: Option<&str> = Some("DiagramViewer");
 
 /// Predicate for single-key navigation shortcuts.
 const NAVIGATION: Option<&str> = Some("Workspace && !TextInput");
@@ -375,6 +391,13 @@ pub const SHORTCUTS: &[Shortcut] = &[
         "Review",
         "Run the comment with Claude"
     ),
+    shortcut!(
+        "e",
+        Explain,
+        NAVIGATION,
+        "Review",
+        "Explain the selected lines (or the diff) with Claude"
+    ),
     shortcut!("a", Accept, NAVIGATION, "Review", "Accept the proposal"),
     shortcut!(
         "x",
@@ -491,6 +514,22 @@ pub const SHORTCUTS: &[Shortcut] = &[
         "Appearance",
         "Reset font size"
     ),
+    shortcut!("=", ZoomIn, DIAGRAM_VIEWER, "Diagram", "Zoom in"),
+    shortcut!("-", ZoomOut, DIAGRAM_VIEWER, "Diagram", "Zoom out"),
+    shortcut!(
+        "0",
+        ZoomToFit,
+        DIAGRAM_VIEWER,
+        "Diagram",
+        "Fit in the window"
+    ),
+    shortcut!(
+        "1",
+        ZoomToActualSize,
+        DIAGRAM_VIEWER,
+        "Diagram",
+        "Actual size"
+    ),
     shortcut!("escape", Dismiss, None, "Application", "Close the sheet"),
     shortcut!(
         "1",
@@ -516,6 +555,7 @@ pub const SHORTCUT_GROUPS: &[&str] = &[
     "File tree",
     "Layout",
     "Review",
+    "Diagram",
     "Appearance",
     "Application",
     "Welcome",

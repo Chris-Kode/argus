@@ -1,6 +1,6 @@
 //! Run defaults the user sets once (spec §10, Claude section): the `claude`
-//! binary, the default model and effort, the review rules file and the
-//! commit-message timeout. The models and efforts on offer are fixed:
+//! binary, the default model and effort (of runs and of explanations), the
+//! review rules file and the commit-message timeout. The models and efforts on offer are fixed:
 //! [`MODELS`] and [`EFFORTS`].
 //!
 //! [`ClaudeSettings`] is stored as JSON in the `settings` table under
@@ -26,6 +26,10 @@ pub const CLAUDE_BINARY: &str = "claude";
 pub const DEFAULT_MODEL: &str = "sonnet";
 /// Initial default thinking effort.
 pub const DEFAULT_EFFORT: &str = "medium";
+/// Initial model of explanations.
+pub const DEFAULT_EXPLAIN_MODEL: &str = "opus";
+/// Initial thinking effort of explanations.
+pub const DEFAULT_EXPLAIN_EFFORT: &str = "medium";
 /// Models offered in the Run menu, as `claude --model` aliases.
 pub const MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 /// Thinking efforts offered in the Run menu.
@@ -92,6 +96,10 @@ pub struct ClaudeSettings {
     pub default_model: String,
     /// Thinking effort preselected in the Run menu.
     pub default_effort: String,
+    /// Model of explanations; Argus updates it to the last choice.
+    pub explain_model: String,
+    /// Thinking effort of explanations.
+    pub explain_effort: String,
     /// Review rules passed with `--append-system-prompt-file`; `None` uses
     /// `<argus_home>/review-rules.md`. A leading `~` is expanded.
     pub review_rules_path: Option<PathBuf>,
@@ -110,6 +118,8 @@ impl Default for ClaudeSettings {
             claude_path: None,
             default_model: DEFAULT_MODEL.to_owned(),
             default_effort: DEFAULT_EFFORT.to_owned(),
+            explain_model: DEFAULT_EXPLAIN_MODEL.to_owned(),
+            explain_effort: DEFAULT_EXPLAIN_EFFORT.to_owned(),
             review_rules_path: None,
             commit_message_timeout_s: DEFAULT_COMMIT_MESSAGE_TIMEOUT_S,
             auto_approve_safe: true,
@@ -138,14 +148,21 @@ impl ClaudeSettings {
 
     /// Repairs values a hand-edited, corrupted or older record could make
     /// invalid: a default model or effort that is no longer offered falls
-    /// back to [`DEFAULT_MODEL`] / [`DEFAULT_EFFORT`], and the timeout is
-    /// clamped.
+    /// back to [`DEFAULT_MODEL`] / [`DEFAULT_EFFORT`] (the explanation ones
+    /// to [`DEFAULT_EXPLAIN_MODEL`] / [`DEFAULT_EXPLAIN_EFFORT`]), and the
+    /// timeout is clamped.
     pub fn sanitized(mut self) -> Self {
         if !MODELS.contains(&self.default_model.as_str()) {
             self.default_model = DEFAULT_MODEL.to_owned();
         }
         if !EFFORTS.contains(&self.default_effort.as_str()) {
             self.default_effort = DEFAULT_EFFORT.to_owned();
+        }
+        if !MODELS.contains(&self.explain_model.as_str()) {
+            self.explain_model = DEFAULT_EXPLAIN_MODEL.to_owned();
+        }
+        if !EFFORTS.contains(&self.explain_effort.as_str()) {
+            self.explain_effort = DEFAULT_EXPLAIN_EFFORT.to_owned();
         }
         self.claude_path = self.claude_path.filter(|path| !path.as_os_str().is_empty());
         self.review_rules_path = self

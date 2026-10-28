@@ -8,6 +8,7 @@ use std::borrow::Cow;
 
 use gpui::{AssetSource, SharedString};
 
+use crate::fonts::PLEX_SANS_REGULAR;
 use crate::icons::IconName;
 
 /// The eye mark's layers, drawn separately so each can take its own color.
@@ -34,6 +35,12 @@ const EXTRA_ASSETS: &[(&str, &[u8])] = &[
     (
         "icons/argus-eye.svg",
         include_bytes!("../assets/icons/argus-eye.svg"),
+    ),
+    // GPUI's SVG renderer loads this path for the text of SVG images, so
+    // Mermaid diagram labels are drawn in the bundled UI font.
+    (
+        "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
+        PLEX_SANS_REGULAR,
     ),
 ];
 

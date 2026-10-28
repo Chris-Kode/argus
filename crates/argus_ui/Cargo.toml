@@ -17,12 +17,14 @@ argus_update.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 pulldown-cmark.workspace = true
+mermaid-svg.workspace = true
 regex.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 unicode-segmentation.workspace = true
+usvg.workspace = true
 
 # Peak RSS for the `ARGUS_PERF` report.
 [target.'cfg(unix)'.dependencies]

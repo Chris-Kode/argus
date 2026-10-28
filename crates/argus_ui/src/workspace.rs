@@ -21,7 +21,12 @@
 //! a pull-before-push resolution continues the Push. A run that waits for
 //! the reviewer (a tool permission its `auto` mode does not settle, or an
 //! `AskUserQuestion`) opens the [`PermissionDialog`]; Later hides it and the
-//! status bar's "waiting for you" counter brings it back. Settings, the
+//! status bar's "waiting for you" counter brings it back. The title bar's
+//! Explain button (or `e`) opens the [`ExplainDialog`] for the main diff,
+//! or for the lines selected in it; its caret picks the model and effort.
+//! A click on a drawn Mermaid diagram opens the [`DiagramViewer`] over
+//! everything but the permission dialog.
+//! Settings, the
 //! repository list and git are read and written on the tokio runtime; this
 //! view only receives the results.
 
@@ -32,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use argus_diff::layout::ViewMode;
 use argus_diff::review::{CommentChange, CommentStatus};
-use argus_runs::{ClaudeStatus, PermissionRequest};
+use argus_runs::{ClaudeStatus, ExplainRequest, ExplainScope, PermissionRequest};
 use argus_store::{Repo, StorageService};
 use gpui::{
     Action, AnyElement, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable,
@@ -53,22 +58,26 @@ use crate::components::{
     toggle_button, toggle_icon_button,
 };
 use crate::conflict::{ConflictDialog, ConflictDialogEvent, ConflictSource};
-use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
+use crate::diagram_viewer::{DiagramViewer, DiagramViewerEvent};
+use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions, LineSelection};
+use crate::explain::{self, ExplainDialog, ExplainDialogEvent};
 use crate::file_tree::{FileMarker, FileTree, FileTreeEvent};
+use crate::followup;
 use crate::fonts::InstalledFonts;
 use crate::hidden_files::{self, HiddenFiles};
 use crate::icons::{IconName, eye_mark, icon};
 use crate::jobs::BackgroundJobs;
 use crate::keymap::{
     Accept, AdvanceCommentStatus, CheckForUpdates, Comment, CycleTheme, DecreaseFontSize, Dismiss,
-    FocusFileFilter, IncreaseFontSize, NextComment, NextFile, NextHunk, OpenRecent1, OpenRecent2,
-    OpenRecent3, OpenRecent4, OpenRecent5, OpenRecent6, OpenRecent7, OpenRecent8, OpenRecent9,
-    OpenRepository, OpenSettings, PreviousComment, PreviousFile, PreviousHunk, ResetFontSize, Run,
-    SHORTCUT_GROUPS, SHORTCUTS, ToggleAllComments, ToggleCommentList, ToggleDiffMode,
-    ToggleFileListMode, ToggleFileTree, ToggleFocusMode, ToggleKeyboardShortcuts, ToggleRunPanel,
-    ToggleRunPanelPosition, ToggleSoftWrap, WELCOME_CONTEXT, WORKSPACE_CONTEXT,
+    Explain, FocusFileFilter, IncreaseFontSize, NextComment, NextFile, NextHunk, OpenRecent1,
+    OpenRecent2, OpenRecent3, OpenRecent4, OpenRecent5, OpenRecent6, OpenRecent7, OpenRecent8,
+    OpenRecent9, OpenRepository, OpenSettings, PreviousComment, PreviousFile, PreviousHunk,
+    ResetFontSize, Run, SHORTCUT_GROUPS, SHORTCUTS, ToggleAllComments, ToggleCommentList,
+    ToggleDiffMode, ToggleFileListMode, ToggleFileTree, ToggleFocusMode, ToggleKeyboardShortcuts,
+    ToggleRunPanel, ToggleRunPanelPosition, ToggleSoftWrap, WELCOME_CONTEXT, WORKSPACE_CONTEXT,
 };
 use crate::markdown;
+use crate::mermaid::OpenDiagram;
 use crate::perf;
 use crate::permission::{PermissionDialog, PermissionDialogEvent};
 use crate::proposal::{ProposalEvent, ProposalSource, ProposalView};
@@ -250,6 +259,12 @@ pub struct Workspace {
     push_flow: Entity<PushFlow>,
     /// The conflict dialog, while one is open.
     conflict: Option<(Entity<ConflictDialog>, Subscription)>,
+    /// The explanation dialog, while one is open.
+    explanation: Option<(Entity<ExplainDialog>, Subscription)>,
+    /// The Explain button's model and effort menu is open.
+    explain_menu: bool,
+    /// The diagram viewer, while a diagram is open in it.
+    diagram_viewer: Option<(Entity<DiagramViewer>, Subscription)>,
     /// Permission requests of live runs waiting for the reviewer, oldest
     /// first.
     permissions: Vec<PermissionRequest>,
@@ -408,6 +423,9 @@ impl Workspace {
             push_flow,
             updater,
             conflict: None,
+            explanation: None,
+            explain_menu: false,
+            diagram_viewer: None,
             permissions: Vec::new(),
             permission_dialog: None,
             permissions_hidden: false,
@@ -952,6 +970,10 @@ impl Workspace {
                 }
                 DiffViewEvent::CommentRequested(selection) => {
                     tracing::debug!(?selection, "comment requested");
+                }
+                DiffViewEvent::ExplainRequested(selection) => {
+                    let selection = selection.clone();
+                    this.explain_lines(selection, cx);
                 }
                 DiffViewEvent::SelectionRejected(hint) => {
                     tracing::debug!(%hint, "selection rejected");
@@ -1511,6 +1533,249 @@ impl Workspace {
         cx.notify();
     }
 
+    // ---- explanations -------------------------------------------------------
+
+    /// An explanation request for the main diff, or `None` without one.
+    fn explain_request(&self, scope: ExplainScope, cx: &gpui::App) -> Option<ExplainRequest> {
+        let session = self.session.as_ref()?.read(cx);
+        let target = self.diff_view.as_ref()?.read(cx).target();
+        Some(ExplainRequest {
+            repo_id: session.record().id,
+            repo_path: session.record().path.clone(),
+            base: target.base.clone(),
+            head: target.head.clone(),
+            merge_base: target.merge_base.to_hex(),
+            head_tip: target.head_tip.to_hex(),
+            scope,
+        })
+    }
+
+    /// Opens the explanation of the whole main diff.
+    fn explain_diff(&mut self, cx: &mut Context<Self>) {
+        let hidden = self
+            .diff_view
+            .as_ref()
+            .map(|view| view.read(cx).hidden_paths())
+            .unwrap_or_default();
+        let Some(request) = self.explain_request(ExplainScope::Diff { hidden }, cx) else {
+            return;
+        };
+        let title = format!("{}...{}", request.base, request.head);
+        self.open_explanation(request, title.into(), cx);
+    }
+
+    /// Opens the explanation of lines selected in the main diff.
+    fn explain_lines(&mut self, selection: LineSelection, cx: &mut Context<Self>) {
+        let lines = if selection.end > selection.start {
+            format!("lines {}–{}", selection.start, selection.end)
+        } else {
+            format!("line {}", selection.start)
+        };
+        let title = format!("{} · {lines}", selection.file);
+        let scope = ExplainScope::Lines {
+            file: selection.file,
+            old_file: selection.old_file,
+            side: selection.side,
+            start: selection.start,
+            end: selection.end,
+        };
+        let Some(request) = self.explain_request(scope, cx) else {
+            return;
+        };
+        self.open_explanation(request, title.into(), cx);
+    }
+
+    fn open_explanation(
+        &mut self,
+        request: ExplainRequest,
+        title: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(blocker) = self.claude.run_blocker() {
+            self.notice = Some(Notice {
+                message: blocker.into(),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        self.explain_menu = false;
+        if self
+            .explanation
+            .as_ref()
+            .is_some_and(|(dialog, _)| dialog.read(cx).explains(&request))
+        {
+            return;
+        }
+        let dialog = cx.new(|cx| ExplainDialog::new(request, title, cx));
+        let subscription =
+            cx.subscribe(
+                &dialog,
+                |this, _, event: &ExplainDialogEvent, cx| match event {
+                    ExplainDialogEvent::Closed => this.close_explanation(cx),
+                },
+            );
+        self.explanation = Some((dialog, subscription));
+        cx.notify();
+    }
+
+    /// Clears the gutter selection of the main diff while it is shown.
+    /// Returns whether there was one.
+    fn clear_main_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        self.active_proposal.is_none()
+            && self
+                .diff_view
+                .clone()
+                .is_some_and(|view| view.update(cx, |view, cx| view.clear_selection(cx)))
+    }
+
+    fn close_explanation(&mut self, cx: &mut Context<Self>) {
+        if self.explanation.take().is_some() {
+            self.focus_requested = true;
+            cx.notify();
+        }
+    }
+
+    fn open_diagram(&mut self, action: &OpenDiagram, window: &mut Window, cx: &mut Context<Self>) {
+        let viewer = cx.new(|cx| DiagramViewer::new(action.diagram.clone(), cx));
+        window.focus(&viewer.focus_handle(cx), cx);
+        let subscription = cx.subscribe_in(
+            &viewer,
+            window,
+            |this, _, event: &DiagramViewerEvent, window, cx| match event {
+                DiagramViewerEvent::Closed => this.close_diagram(window, cx),
+            },
+        );
+        if let Some((old, _)) = self.diagram_viewer.replace((viewer, subscription)) {
+            old.update(cx, |old, cx| old.release(window, cx));
+        }
+        cx.notify();
+    }
+
+    fn close_diagram(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((viewer, _)) = self.diagram_viewer.take() {
+            viewer.update(cx, |viewer, cx| viewer.release(window, cx));
+            self.focus_requested = true;
+            cx.notify();
+        }
+    }
+
+    /// `e`: explains the lines selected in the main diff, or the whole diff.
+    fn explain(&mut self, _: &Explain, _: &mut Window, cx: &mut Context<Self>) {
+        if self.diff_view.is_none() {
+            self.notice = Some(Notice {
+                message: "Open a diff to explain it.".into(),
+                is_error: false,
+            });
+            cx.notify();
+            return;
+        }
+        let selected = self.active_proposal.is_none()
+            && self
+                .diff_view
+                .clone()
+                .is_some_and(|view| view.update(cx, |view, cx| view.explain_selection(cx)));
+        if !selected {
+            self.explain_diff(cx);
+        }
+    }
+
+    /// The Explain split button: "Explain" opens the explanation of the
+    /// main diff, the right part (its model and effort) their menu.
+    fn render_explain_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.diff_view.as_ref()?;
+        let theme = cx.theme();
+        let colors = theme.colors.clone();
+        let blocker = self.claude.run_blocker();
+        let enabled = blocker.is_none();
+        let (label_color, detail_color) = if enabled {
+            (colors.text, colors.text_muted)
+        } else {
+            (colors.text_placeholder, colors.text_placeholder)
+        };
+        let (model, effort) = explain::choice(cx);
+        let main = div()
+            .id("title-explain")
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .h_full()
+            .px(px(9.0))
+            .text_color(label_color)
+            .child(icon(IconName::Sparkle, px(14.0), label_color))
+            .child("Explain")
+            .tooltip(text_tooltip(blocker.clone().unwrap_or_else(|| {
+                format!(
+                    "Claude explains this diff: before and after, step by step ({})",
+                    shortcut_text::<Explain>()
+                )
+            })))
+            .when(enabled, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(colors.element_hover))
+                    .active(|style| style.bg(colors.element_selected))
+                    .on_click(cx.listener(|this, _, _, cx| this.explain_diff(cx)))
+            });
+        let open = self.explain_menu;
+        let detail = div()
+            .id("title-explain-choice")
+            .flex()
+            .items_center()
+            .gap_1()
+            .h_full()
+            .px_2()
+            .border_l_1()
+            .border_color(colors.border)
+            .text_xs()
+            .text_color(detail_color)
+            .cursor_pointer()
+            .when(open, |this| this.bg(colors.element_selected))
+            .hover(|style| style.bg(colors.element_hover))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.explain_menu = !this.explain_menu;
+                cx.notify();
+            }))
+            .child(followup::label(&model, &effort))
+            .child(icon(IconName::CaretDown, px(10.0), detail_color));
+        let menu = open.then(|| {
+            deferred(
+                div()
+                    .absolute()
+                    .top(px(32.0))
+                    .right_0()
+                    .child(explain::choice_menu(
+                        "title-explain-menu",
+                        |this: &mut Self, cx| {
+                            this.explain_menu = false;
+                            cx.notify();
+                        },
+                        cx,
+                    )),
+            )
+            .with_priority(2)
+        });
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .h(px(28.0))
+                        .rounded(radius::md(cx))
+                        .border_1()
+                        .border_color(colors.border)
+                        .overflow_hidden()
+                        .text_sm()
+                        .child(main)
+                        .child(detail),
+                )
+                .children(menu)
+                .into_any_element(),
+        )
+    }
+
     /// The title bar's Push button was clicked: push to the upstream, or
     /// offer `git push -u` when the head has none.
     fn start_push(&mut self, cx: &mut Context<Self>) {
@@ -1813,6 +2078,19 @@ impl Workspace {
             self.hide_permissions(cx);
             return;
         }
+        if self.diagram_viewer.is_some() {
+            self.close_diagram(window, cx);
+            return;
+        }
+        if self.explain_menu {
+            self.explain_menu = false;
+            cx.notify();
+            return;
+        }
+        if self.explanation.is_some() {
+            self.close_explanation(cx);
+            return;
+        }
         if let Some(dialog) = self.conflict.as_ref().map(|(dialog, _)| dialog.clone()) {
             dialog.update(cx, |dialog, cx| dialog.cancel(cx));
             return;
@@ -1839,7 +2117,7 @@ impl Workspace {
             .is_some_and(|view| view.read(cx).is_reattaching())
         {
             self.update_main_diff(cx, |view, cx| view.cancel_reattach(cx));
-        } else {
+        } else if !self.clear_main_selection(cx) {
             cx.propagate();
         }
     }
@@ -2227,12 +2505,14 @@ impl Workspace {
         };
         let push = self.render_push_button(session, cx);
         let update = self.render_update_button(cx);
+        let explain = self.render_explain_button(cx);
         let actions = div()
             .flex()
             .flex_none()
             .items_center()
             .gap_1p5()
             .children(update)
+            .children(explain)
             .children(fetch)
             .children(push);
 
@@ -4414,6 +4694,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_comment_list))
             .on_action(cx.listener(Self::advance_comment_status))
             .on_action(cx.listener(Self::run))
+            .on_action(cx.listener(Self::explain))
+            .on_action(cx.listener(Self::open_diagram))
             .on_action(cx.listener(Self::accept))
             .child(self.render_title_bar(cx))
             .children(self.render_claude_banner(cx))
@@ -4436,6 +4718,16 @@ impl Render for Workspace {
             .when_some(
                 self.conflict.as_ref().map(|(dialog, _)| dialog.clone()),
                 |root, dialog| root.child(dialog),
+            )
+            .when_some(
+                self.explanation.as_ref().map(|(dialog, _)| dialog.clone()),
+                |root, dialog| root.child(dialog),
+            )
+            .when_some(
+                self.diagram_viewer
+                    .as_ref()
+                    .map(|(viewer, _)| viewer.clone()),
+                |root, viewer| root.child(viewer),
             )
             // Over every other dialog: a run is blocked until it is answered.
             .when_some(

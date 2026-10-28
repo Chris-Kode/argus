@@ -73,7 +73,9 @@ fn remember(model: String, effort: String, cx: &mut App) {
     }
 }
 
-fn next_in(list: &[&str], current: &str) -> Option<String> {
+/// The entry after `current` in `list` (the first when `current` is not
+/// in it), wrapping around.
+pub(crate) fn next_in(list: &[&str], current: &str) -> Option<String> {
     let index = list.iter().position(|&entry| entry == current);
     let next = index.map_or(0, |index| (index + 1) % list.len().max(1));
     list.get(next).map(|&entry| entry.to_owned())

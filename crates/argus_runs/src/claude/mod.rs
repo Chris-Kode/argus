@@ -5,9 +5,10 @@
 //!   locations), runs `claude --version` and `claude --help`, and reports the
 //!   result as [`ClaudeCapabilities`] (or a [`DetectError`]).
 //! - [`command`] is the single place where `claude` argument vectors are
-//!   built: [`ClaudeCommand::review_run`] and [`ClaudeCommand::commit_message`].
+//!   built: [`ClaudeCommand::review_run`], [`ClaudeCommand::commit_message`]
+//!   and [`ClaudeCommand::explain`].
 //! - [`env`] builds a child's environment: the user's own for review runs,
-//!   an allow list for probes and commit messages. Argus never forwards
+//!   an allow list for probes, commit messages and explanations. Argus never forwards
 //!   `ANTHROPIC_API_KEY` (or any `ANTHROPIC_*` variable); Claude Code
 //!   authenticates with the user's existing sign-in.
 //! - [`auth`] recognizes a failed sign-in in a run's output.

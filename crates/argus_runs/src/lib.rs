@@ -30,6 +30,9 @@
 //!   into a resolve run whose result is reviewed like any proposal
 //!   ([`RunManager::resolve_accept`], [`RunManager::resolve_push`],
 //!   [`RunManager::continue_push`], [`RunManager::cancel_resolve`]).
+//! - [`explain`] has Claude explain the diff, or lines of it, to the
+//!   reviewer ([`RunManager::explain`]); answers are cached by the commits
+//!   they explain ([`RunManager::cached_explanation`]).
 //! - The run defaults of the settings screen live in [`settings`]; the
 //!   review rules file in [`review_rules`].
 //!
@@ -40,6 +43,7 @@
 pub mod accept;
 pub mod auto_approve;
 pub mod claude;
+pub mod explain;
 pub mod log;
 pub mod permission;
 pub mod prompt;
@@ -63,6 +67,7 @@ pub use accept::{
     CommitDraft, CommitInput,
 };
 pub use claude::{ClaudeCapabilities, ClaudeCommand, ClaudeStatus, SessionMode};
+pub use explain::{ExplainEvent, ExplainRequest, ExplainScope, ExplainTicket};
 pub use log::{LogChange, LogEntry, RunLog, ToolCall};
 pub use permission::{PermissionDecision, PermissionRequest, Question, QuestionOption};
 pub use proposal::{Proposal, ProposalError, WorktreeWatch};
@@ -274,6 +279,65 @@ impl RunManager {
         .await?;
         self.remember_in_background(&model, &effort);
         Ok(run_id)
+    }
+
+    /// The stored explanation of `request`, written for the same merge-base
+    /// and head tip. Must run on the tokio runtime.
+    pub async fn cached_explanation(
+        &self,
+        request: &ExplainRequest,
+    ) -> argus_store::Result<Option<argus_store::Explanation>> {
+        explain::cached(&self.services.store, request).await
+    }
+
+    /// Starts an explanation of `request` with `model` and `effort` (an
+    /// empty effort, or a CLI without `--effort`, uses Claude's default).
+    /// The answer replaces any stored one of the same key. `model` and
+    /// `effort` become the explanation defaults. Dropping the ticket kills
+    /// `claude`. Must run on the tokio runtime.
+    pub fn explain(
+        &self,
+        request: ExplainRequest,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+    ) -> Result<ExplainTicket, RunError> {
+        let capabilities = self.capabilities()?;
+        let (model, effort) = (model.into(), effort.into());
+        if self.remember_explain_choice(&model, &effort) {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = manager.save_settings().await {
+                    tracing::warn!(%error, "cannot save the explanation defaults");
+                }
+            });
+        }
+        Ok(explain::start(explain::ExplainJob {
+            store: self.services.store.clone(),
+            scratch: resolve::scratch_dir(&self.argus_home),
+            capabilities,
+            request,
+            model,
+            effort,
+        }))
+    }
+
+    /// Makes `model` and `effort` the explanation defaults when they are
+    /// offered ([`settings::MODELS`], [`settings::EFFORTS`]). Returns
+    /// whether the live settings changed; save them with
+    /// [`RunManager::save_settings`].
+    pub fn remember_explain_choice(&self, model: &str, effort: &str) -> bool {
+        self.settings.send_if_modified(|settings| {
+            let mut changed = false;
+            if settings.explain_model != model && settings::MODELS.contains(&model) {
+                settings.explain_model = model.to_owned();
+                changed = true;
+            }
+            if settings.explain_effort != effort && settings::EFFORTS.contains(&effort) {
+                settings.explain_effort = effort.to_owned();
+                changed = true;
+            }
+            changed
+        })
     }
 
     /// The detected CLI, or why runs are blocked.

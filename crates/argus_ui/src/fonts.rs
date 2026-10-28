@@ -20,9 +20,13 @@ pub const BUNDLED_UI_FAMILY: &str = "IBM Plex Sans";
 /// The bundled code family.
 pub const BUNDLED_CODE_FAMILY: &str = "IBM Plex Mono";
 
+/// IBM Plex Sans Regular, also the font of Mermaid diagram labels.
+pub(crate) const PLEX_SANS_REGULAR: &[u8] =
+    include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf");
+
 /// The bundled font files, exactly as released by IBM.
 const BUNDLED_FONTS: &[&[u8]] = &[
-    include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf"),
+    PLEX_SANS_REGULAR,
     include_bytes!("../assets/fonts/IBMPlexSans-Medium.ttf"),
     include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf"),
     include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf"),

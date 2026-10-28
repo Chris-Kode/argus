@@ -4,7 +4,8 @@
 //! session: every tool, the user's settings, MCP servers, skills and
 //! plugins, in `auto` permission mode. What the mode does not settle comes
 //! back to Argus as a permission request (see [`crate::permission`]).
-//! Commit messages follow spec §6.4. Arguments go straight to `execve`
+//! Commit messages follow spec §6.4; explanations of a diff are built the
+//! same way, without tools. Arguments go straight to `execve`
 //! through [`tokio::process::Command`]; no shell is involved, so prompts and
 //! paths are never interpolated.
 
@@ -29,9 +30,16 @@ pub const REVIEW_DISALLOWED_TOOLS: [&str; 2] = ["Bash(git commit *)", "Bash(git 
 /// Model of the commit-message call (spec §6.4).
 pub const COMMIT_MESSAGE_MODEL: &str = "haiku";
 
-/// Settings of the commit-message call: none of the user's hooks run. A
-/// `Stop` hook that blocks would start a second turn, past `--max-turns 1`.
+/// Settings of the commit-message and explanation calls: none of the
+/// user's hooks run. A `Stop` hook that blocks would start a second turn,
+/// past `--max-turns 1`.
 const COMMIT_MESSAGE_SETTINGS: &str = r#"{"disableAllHooks":true}"#;
+
+/// Streams the answer of an explanation as it is written; optional.
+pub const PARTIAL_MESSAGES_FLAG: &str = "--include-partial-messages";
+
+/// Keeps an explanation out of the user's resumable sessions; optional.
+pub const NO_SESSION_PERSISTENCE_FLAG: &str = "--no-session-persistence";
 
 /// Longest review comment quoted in the commit-message prompt, in bytes. The
 /// prompt must stay an argument because the diff takes stdin.
@@ -61,6 +69,14 @@ enum Kind {
     CommitMessage {
         diff: Vec<u8>,
         prompt: String,
+    },
+    Explain {
+        context: Vec<u8>,
+        prompt: String,
+        model: String,
+        effort: Option<String>,
+        partial: bool,
+        persist: bool,
     },
 }
 
@@ -151,6 +167,39 @@ impl ClaudeCommand {
         }
     }
 
+    /// An explanation of a change for the reviewer (the Explain button):
+    ///
+    /// ```text
+    /// <context> | claude -p --model <model> --effort <effort> --tools "" \
+    ///   --max-turns 1 --strict-mcp-config --settings '{"disableAllHooks":true}' \
+    ///   --output-format stream-json --verbose \
+    ///   [--include-partial-messages] [--no-session-persistence] "<prompt>"
+    /// ```
+    ///
+    /// Like the commit message, Claude gets no tools, MCP servers or hooks:
+    /// everything it explains is in `context` (commits, diff, the lines in
+    /// question), which goes to stdin. The optional flags are added by
+    /// [`ClaudeCommand::adapt_to`] when the CLI has them. `effort: None`
+    /// omits `--effort`.
+    pub fn explain(
+        context: impl Into<Vec<u8>>,
+        prompt: impl Into<String>,
+        model: impl Into<String>,
+        effort: Option<&str>,
+    ) -> Self {
+        Self {
+            cwd: None,
+            kind: Kind::Explain {
+                context: context.into(),
+                prompt: prompt.into(),
+                model: model.into(),
+                effort: effort.map(str::to_owned),
+                partial: false,
+                persist: true,
+            },
+        }
+    }
+
     /// Denies the file-editing tools inside `checkout`, the user's working
     /// checkout of the reviewed repository (spec §11.1): a review run edits
     /// its own worktree only, whatever its permission mode allows.
@@ -169,20 +218,35 @@ impl ClaudeCommand {
 
     /// Fits the command to the installed CLI: drops `--effort` when it is
     /// unsupported, and falls back to [`FALLBACK_PERMISSION_MODE`] when the
-    /// CLI has no `auto` mode.
+    /// CLI has no `auto` mode. An explanation streams its answer and stays
+    /// out of the session list when the CLI can.
     pub fn adapt_to(mut self, capabilities: &ClaudeCapabilities) -> Self {
-        if let Kind::Review {
-            effort,
-            permission_mode,
-            ..
-        } = &mut self.kind
-        {
-            if !capabilities.supports(EFFORT_FLAG) {
-                *effort = None;
+        match &mut self.kind {
+            Kind::Review {
+                effort,
+                permission_mode,
+                ..
+            } => {
+                if !capabilities.supports(EFFORT_FLAG) {
+                    *effort = None;
+                }
+                if !capabilities.supports_auto_mode() {
+                    *permission_mode = FALLBACK_PERMISSION_MODE;
+                }
             }
-            if !capabilities.supports_auto_mode() {
-                *permission_mode = FALLBACK_PERMISSION_MODE;
+            Kind::Explain {
+                effort,
+                partial,
+                persist,
+                ..
+            } => {
+                if !capabilities.supports(EFFORT_FLAG) {
+                    *effort = None;
+                }
+                *partial = capabilities.supports(PARTIAL_MESSAGES_FLAG);
+                *persist = !capabilities.supports(NO_SESSION_PERSISTENCE_FLAG);
             }
+            Kind::CommitMessage { .. } => {}
         }
         self
     }
@@ -268,12 +332,50 @@ impl ClaudeCommand {
                 args.push(prompt.into());
                 args
             }
+            Kind::Explain {
+                prompt,
+                model,
+                effort,
+                partial,
+                persist,
+                ..
+            } => {
+                let mut args: Vec<OsString> = vec!["-p".into()];
+                args.extend(["--model".into(), model.into()]);
+                if let Some(effort) = effort {
+                    args.extend(["--effort".into(), effort.into()]);
+                }
+                args.extend(
+                    [
+                        "--tools",
+                        "",
+                        "--max-turns",
+                        "1",
+                        "--strict-mcp-config",
+                        "--settings",
+                        COMMIT_MESSAGE_SETTINGS,
+                        "--output-format",
+                        "stream-json",
+                        "--verbose",
+                    ]
+                    .map(OsString::from),
+                );
+                if *partial {
+                    args.push(PARTIAL_MESSAGES_FLAG.into());
+                }
+                if !*persist {
+                    args.push(NO_SESSION_PERSISTENCE_FLAG.into());
+                }
+                args.push(prompt.into());
+                args
+            }
         }
     }
 
     /// The first bytes to write to the child's stdin: the staged diff of a
-    /// commit message (then stdin is closed), or the prompt of a review run
-    /// as a `stream-json` user message line.
+    /// commit message or the context of an explanation (then stdin is
+    /// closed), or the prompt of a review run as a `stream-json` user
+    /// message line.
     pub fn stdin(&self) -> Vec<u8> {
         match &self.kind {
             Kind::Review { prompt, .. } => {
@@ -282,6 +384,7 @@ impl ClaudeCommand {
                 line
             }
             Kind::CommitMessage { diff, .. } => diff.clone(),
+            Kind::Explain { context, .. } => context.clone(),
         }
     }
 
@@ -289,7 +392,7 @@ impl ClaudeCommand {
     ///
     /// It has the working directory, the argv, its environment (see
     /// [`super::env`]: the user's own for a review run, a clean one for a
-    /// commit message), piped stdin/stdout/stderr, and its own process group
+    /// commit message or an explanation), piped stdin/stdout/stderr, and its own process group
     /// so Stop can signal the whole tree. The child is killed when its handle
     /// is dropped.
     pub fn to_command(&self, program: &Path) -> tokio::process::Command {
