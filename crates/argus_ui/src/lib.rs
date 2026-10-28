@@ -13,6 +13,7 @@ pub mod comment_list;
 pub mod comments;
 pub mod components;
 pub mod conflict;
+pub mod diagram_viewer;
 pub mod diff_view;
 pub mod explain;
 pub mod file_tree;

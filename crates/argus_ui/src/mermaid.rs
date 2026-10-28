@@ -11,14 +11,16 @@
 //! [`Diagrams`] is the global cache of rendered diagrams by source and
 //! appearance. [`Diagrams::request`] renders a diagram on the background
 //! executor and repaints the windows when it is done; a diagram that is not
-//! ready, or that `mermaid-svg` cannot render, shows as its source.
+//! ready, or that `mermaid-svg` cannot render, shows as its source. A click
+//! on a drawn diagram dispatches [`OpenDiagram`], which opens it in the
+//! [`crate::diagram_viewer::DiagramViewer`].
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, LazyLock};
 
-use gpui::{App, Global, Image, ImageFormat};
+use gpui::{Action, App, Global, Image, ImageFormat};
 
 use crate::fonts::{BUNDLED_UI_FAMILY, PLEX_SANS_REGULAR};
 use crate::theme::Appearance;
@@ -30,6 +32,10 @@ const PADDING: f32 = 8.0;
 /// Rendered diagrams kept; the cache starts over past it.
 const MAX_CACHED: usize = 512;
 
+/// Longest side of a sharper copy of a diagram ([`Diagram::scaled`]), in
+/// pixels; GPUI rasterizes SVG images at twice their size.
+const MAX_SCALED_SIDE: f32 = 2048.0;
+
 /// A rendered diagram.
 #[derive(Debug)]
 pub struct Diagram {
@@ -39,6 +45,50 @@ pub struct Diagram {
     pub width: f32,
     /// Natural height, in pixels.
     pub height: f32,
+    /// The fitted SVG, for [`Diagram::scaled`].
+    svg: String,
+}
+
+impl Diagram {
+    /// The largest power-of-two scale, up to the one `zoom` needs, at
+    /// which the diagram stays within [`MAX_SCALED_SIDE`]; 1 when the
+    /// natural size is sharp enough.
+    pub fn sharp_scale(&self, zoom: f32) -> u32 {
+        let side = self.width.max(self.height);
+        let mut scale = 1;
+        while (scale as f32) < zoom && side * (scale * 2) as f32 <= MAX_SCALED_SIDE {
+            scale *= 2;
+        }
+        scale
+    }
+
+    /// The diagram as an SVG image `scale` times its natural size, which
+    /// GPUI rasterizes sharp enough to be shown at that zoom.
+    pub fn scaled(&self, scale: u32) -> Arc<Image> {
+        if scale <= 1 {
+            return self.image.clone();
+        }
+        let svg = set_root_size(
+            &self.svg,
+            self.width * scale as f32,
+            self.height * scale as f32,
+        );
+        Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()))
+    }
+}
+
+/// Opens a drawn diagram in the diagram viewer.
+#[derive(Clone, Debug, Action)]
+#[action(namespace = argus, no_json, no_register)]
+pub struct OpenDiagram {
+    /// The diagram.
+    pub diagram: Arc<Diagram>,
+}
+
+impl PartialEq for OpenDiagram {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.diagram, &other.diagram)
+    }
 }
 
 #[derive(Debug)]
@@ -132,9 +182,13 @@ pub fn render(source: &str, appearance: Appearance) -> Result<Diagram, String> {
     .map_err(|error| error.to_string())?;
     let (svg, width, height) = fit(&svg)?;
     Ok(Diagram {
-        image: Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes())),
+        image: Arc::new(Image::from_bytes(
+            ImageFormat::Svg,
+            svg.clone().into_bytes(),
+        )),
         width,
         height,
+        svg,
     })
 }
 
@@ -194,6 +248,20 @@ fn fit(svg: &str) -> Result<(String, f32, f32), String> {
         width,
         height,
     ))
+}
+
+/// `svg` with the root element's `width` and `height` replaced; its
+/// `viewBox` stays, so the drawing scales.
+fn set_root_size(svg: &str, width: f32, height: f32) -> String {
+    let Some(start) = svg.find("<svg") else {
+        return svg.to_owned();
+    };
+    let Some(end) = svg[start..].find('>').map(|end| start + end) else {
+        return svg.to_owned();
+    };
+    let root = set_attribute(&svg[start..end], "width", &width.to_string());
+    let root = set_attribute(&root, "height", &height.to_string());
+    format!("{}{root}{}", &svg[..start], &svg[end..])
 }
 
 /// The value of attribute `name` of the start tag `tag`.

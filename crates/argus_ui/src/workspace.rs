@@ -24,6 +24,8 @@
 //! status bar's "waiting for you" counter brings it back. The title bar's
 //! Explain button (or `e`) opens the [`ExplainDialog`] for the main diff,
 //! or for the lines selected in it; its caret picks the model and effort.
+//! A click on a drawn Mermaid diagram opens the [`DiagramViewer`] over
+//! everything but the permission dialog.
 //! Settings, the
 //! repository list and git are read and written on the tokio runtime; this
 //! view only receives the results.
@@ -56,6 +58,7 @@ use crate::components::{
     toggle_button, toggle_icon_button,
 };
 use crate::conflict::{ConflictDialog, ConflictDialogEvent, ConflictSource};
+use crate::diagram_viewer::{DiagramViewer, DiagramViewerEvent};
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions, LineSelection};
 use crate::explain::{self, ExplainDialog, ExplainDialogEvent};
 use crate::file_tree::{FileMarker, FileTree, FileTreeEvent};
@@ -74,6 +77,7 @@ use crate::keymap::{
     ToggleRunPanel, ToggleRunPanelPosition, ToggleSoftWrap, WELCOME_CONTEXT, WORKSPACE_CONTEXT,
 };
 use crate::markdown;
+use crate::mermaid::OpenDiagram;
 use crate::perf;
 use crate::permission::{PermissionDialog, PermissionDialogEvent};
 use crate::proposal::{ProposalEvent, ProposalSource, ProposalView};
@@ -259,6 +263,8 @@ pub struct Workspace {
     explanation: Option<(Entity<ExplainDialog>, Subscription)>,
     /// The Explain button's model and effort menu is open.
     explain_menu: bool,
+    /// The diagram viewer, while a diagram is open in it.
+    diagram_viewer: Option<(Entity<DiagramViewer>, Subscription)>,
     /// Permission requests of live runs waiting for the reviewer, oldest
     /// first.
     permissions: Vec<PermissionRequest>,
@@ -419,6 +425,7 @@ impl Workspace {
             conflict: None,
             explanation: None,
             explain_menu: false,
+            diagram_viewer: None,
             permissions: Vec::new(),
             permission_dialog: None,
             permissions_hidden: false,
@@ -1629,6 +1636,30 @@ impl Workspace {
         }
     }
 
+    fn open_diagram(&mut self, action: &OpenDiagram, window: &mut Window, cx: &mut Context<Self>) {
+        let viewer = cx.new(|cx| DiagramViewer::new(action.diagram.clone(), cx));
+        window.focus(&viewer.focus_handle(cx), cx);
+        let subscription = cx.subscribe_in(
+            &viewer,
+            window,
+            |this, _, event: &DiagramViewerEvent, window, cx| match event {
+                DiagramViewerEvent::Closed => this.close_diagram(window, cx),
+            },
+        );
+        if let Some((old, _)) = self.diagram_viewer.replace((viewer, subscription)) {
+            old.update(cx, |old, cx| old.release(window, cx));
+        }
+        cx.notify();
+    }
+
+    fn close_diagram(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((viewer, _)) = self.diagram_viewer.take() {
+            viewer.update(cx, |viewer, cx| viewer.release(window, cx));
+            self.focus_requested = true;
+            cx.notify();
+        }
+    }
+
     /// `e`: explains the lines selected in the main diff, or the whole diff.
     fn explain(&mut self, _: &Explain, _: &mut Window, cx: &mut Context<Self>) {
         if self.diff_view.is_none() {
@@ -2045,6 +2076,10 @@ impl Workspace {
             .is_some_and(|session| session.read(cx).tracking_prompt().is_some());
         if self.permission_dialog.is_some() {
             self.hide_permissions(cx);
+            return;
+        }
+        if self.diagram_viewer.is_some() {
+            self.close_diagram(window, cx);
             return;
         }
         if self.explain_menu {
@@ -4660,6 +4695,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::advance_comment_status))
             .on_action(cx.listener(Self::run))
             .on_action(cx.listener(Self::explain))
+            .on_action(cx.listener(Self::open_diagram))
             .on_action(cx.listener(Self::accept))
             .child(self.render_title_bar(cx))
             .children(self.render_claude_banner(cx))
@@ -4686,6 +4722,12 @@ impl Render for Workspace {
             .when_some(
                 self.explanation.as_ref().map(|(dialog, _)| dialog.clone()),
                 |root, dialog| root.child(dialog),
+            )
+            .when_some(
+                self.diagram_viewer
+                    .as_ref()
+                    .map(|(viewer, _)| viewer.clone()),
+                |root, viewer| root.child(viewer),
             )
             // Over every other dialog: a run is blocked until it is answered.
             .when_some(

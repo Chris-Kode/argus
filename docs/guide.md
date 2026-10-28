@@ -130,7 +130,10 @@ separate from the Run menu's and the last choice is kept.
 
 Diagrams are Mermaid, drawn in Argus without a browser; one Argus cannot draw
 shows as its source. A ```` ```mermaid ```` block in a comment is drawn the
-same way.
+same way. Click a diagram to open it on the whole window: drag or scroll to
+move around, pinch or `⌘`-scroll to zoom around the pointer, `=` / `-` to zoom
+in and out, `0` to fit it in the window, `1` for its actual size, `esc` to
+close it.
 
 Claude gets no tools for this: Argus hands it the commits, the diff (without
 your hidden files, and cut down when very large) and the selected lines, read
@@ -267,6 +270,7 @@ shortcuts work whenever the focus is not in a text field.
 | `/` | Filter the files |
 | `c` | Comment on the selected line(s) |
 | `e` | Explain the selected lines (or the whole diff) |
+| `=` / `-` / `0` / `1` | Diagram viewer: zoom in / out / fit / actual size |
 | `⌘↩` / `esc` | Save / cancel the comment |
 | `]c` / `[c` | Next / previous comment |
 | `⇧C` | Collapse / expand all comments |

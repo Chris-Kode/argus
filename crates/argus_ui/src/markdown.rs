@@ -26,8 +26,9 @@ use gpui::{
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::AppContext;
-use crate::components::radius;
-use crate::mermaid::{self, Diagram};
+use crate::components::{radius, text_tooltip};
+use crate::icons::{IconName, icon};
+use crate::mermaid::{self, Diagram, OpenDiagram};
 use crate::theme::{ActiveTheme, Theme};
 
 /// Parsed bodies a cache keeps beyond the ones in use.
@@ -528,7 +529,10 @@ fn render_blocks(
                 .into_any_element(),
             Block::Code { language, code } => render_code(*language, code, cx),
             Block::Diagram(source) => match mermaid::Diagrams::get(source, theme.appearance, cx) {
-                Some(diagram) => render_diagram(&diagram, cx),
+                Some(diagram) => {
+                    *counter += 1;
+                    render_diagram(diagram, format!("{id}-diagram-{counter}").into(), cx)
+                }
                 None => render_code(None, source, cx),
             },
             Block::List { start, items } => div()
@@ -657,10 +661,20 @@ fn open_link(url: &str, cx: &mut App) {
     }
 }
 
-/// A drawn diagram at its natural size, scaled down to the width available.
-fn render_diagram(diagram: &Diagram, cx: &App) -> AnyElement {
+/// A drawn diagram at its natural size, scaled down to the width
+/// available; a click opens it in the diagram viewer.
+fn render_diagram(diagram: Arc<Diagram>, id: SharedString, cx: &App) -> AnyElement {
     let colors = &cx.theme().colors;
+    let group = SharedString::from(format!("{id}-group"));
+    let image = img(diagram.image.clone())
+        .w_full()
+        .max_w(px(diagram.width))
+        .aspect_ratio(diagram.width / diagram.height)
+        .object_fit(ObjectFit::Contain);
     div()
+        .id(id)
+        .group(group.clone())
+        .relative()
         .flex()
         .justify_center()
         .w_full()
@@ -668,12 +682,29 @@ fn render_diagram(diagram: &Diagram, cx: &App) -> AnyElement {
         .rounded(radius::sm(cx))
         .border_1()
         .border_color(colors.border_variant)
+        .cursor_pointer()
+        .hover(|style| style.border_color(colors.border))
+        .tooltip(text_tooltip("Open to zoom and pan"))
+        .on_click(move |_, window, cx| {
+            window.dispatch_action(
+                Box::new(OpenDiagram {
+                    diagram: diagram.clone(),
+                }),
+                cx,
+            );
+        })
+        .child(image)
         .child(
-            img(diagram.image.clone())
-                .w_full()
-                .max_w(px(diagram.width))
-                .aspect_ratio(diagram.width / diagram.height)
-                .object_fit(ObjectFit::Contain),
+            div()
+                .invisible()
+                .group_hover(group, |style| style.visible())
+                .absolute()
+                .top_1()
+                .right_1()
+                .p_1()
+                .rounded(radius::sm(cx))
+                .bg(colors.elevated_surface)
+                .child(icon(IconName::ArrowsOut, px(14.0), colors.text_muted)),
         )
         .into_any_element()
 }
