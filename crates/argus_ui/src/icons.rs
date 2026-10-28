@@ -65,6 +65,7 @@ icon_names! {
     Sidebar => "sidebar.svg",
     SidebarSimple => "sidebar-simple.svg",
     SlidersHorizontal => "sliders-horizontal.svg",
+    Sparkle => "sparkle.svg",
     Warning => "warning.svg",
     X => "x.svg",
 }

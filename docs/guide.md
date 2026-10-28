@@ -112,6 +112,26 @@ status bar's "waiting for you" counter brings the dialog back. Whatever the
 mode, a run can never `git commit`, `git push`, or edit files in your own
 checkout.
 
+## Explanations
+
+**Explain** in the title bar has Claude explain the whole diff in plain
+words: in short, how it worked before, how it works now, the change step by
+step, plain-text diagrams, and what is worth checking. Select lines in the
+gutter and **Explain selection** (floating over the bottom of the diff) or
+`e` explains just those lines, in the context of their file's change; `e`
+with nothing selected explains the whole diff. `esc` clears the selection.
+
+The explanation opens in a dialog as Claude writes it. It is kept for the
+exact commits it explains: opening it again shows it at once, until the base
+or head branch moves. **Regenerate** writes a new one; **Stop** (or closing
+the dialog) stops Claude. The right part of the Explain button, and the
+buttons at the bottom of the dialog, pick the model and effort; they are
+separate from the Run menu's and the last choice is kept.
+
+Claude gets no tools for this: Argus hands it the commits, the diff (without
+your hidden files, and cut down when very large) and the selected lines, read
+from commits only, never from your working checkout.
+
 ## The run panel
 
 The run panel (`cmd-j`, docked right or bottom with `cmd-shift-j`) is hidden
@@ -215,7 +235,7 @@ Everything Argus writes lives in `~/.argus/`, never inside a reviewed repository
 
 | Path | What |
 | --- | --- |
-| `~/.argus/argus.db` | SQLite database: repositories, comments, runs, accepts, settings |
+| `~/.argus/argus.db` | SQLite database: repositories, comments, runs, accepts, explanations, settings |
 | `~/.argus/review-rules.md` | Rules appended to every run's system prompt; edit freely, never overwritten |
 | `~/.argus/worktrees/` | One git worktree per run, plus each repository's `_integration` worktree for Accept and Push |
 | `~/.argus/logs/argus.log` | Log file |
@@ -242,6 +262,7 @@ shortcuts work whenever the focus is not in a text field.
 | `n` / `p` | Next / previous hunk |
 | `/` | Filter the files |
 | `c` | Comment on the selected line(s) |
+| `e` | Explain the selected lines (or the whole diff) |
 | `⌘↩` / `esc` | Save / cancel the comment |
 | `]c` / `[c` | Next / previous comment |
 | `⇧C` | Collapse / expand all comments |

@@ -15,6 +15,7 @@
 mod accepts;
 mod comments;
 mod error;
+mod explanations;
 mod migrations;
 mod model;
 mod repos;
@@ -33,6 +34,7 @@ use tokio::sync::oneshot;
 pub use accepts::{Accept, AcceptStore};
 pub use comments::{Anchor, AnchorUpdate, Comment, CommentStore, NewComment, Reply, ReplyRun};
 pub use error::{Result, StoreError};
+pub use explanations::{Explanation, ExplanationKey, ExplanationStore, MAX_EXPLANATIONS_PER_REPO};
 pub use migrations::SCHEMA_VERSION;
 pub use model::{
     AcceptId, CommentId, CommentStatus, ReplyAuthor, ReplyId, RepoId, RunId, RunKind, RunStatus,
@@ -125,6 +127,11 @@ impl StorageService {
     /// Accepted proposals (`accepts`).
     pub fn accepts(&self) -> AcceptStore {
         AcceptStore::new(self.clone())
+    }
+
+    /// Cached explanations of diffs (`explanations`).
+    pub fn explanations(&self) -> ExplanationStore {
+        ExplanationStore::new(self.clone())
     }
 
     /// JSON key/value settings (`settings`).

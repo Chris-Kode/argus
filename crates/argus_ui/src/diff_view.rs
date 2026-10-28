@@ -72,7 +72,9 @@
 //! crosses a hunk header). In side-by-side mode each column has its own
 //! gutter: the left one selects old lines, the right one new lines. The
 //! gutter "+" (or `c`) opens a comment composer under the selection and
-//! emits [`DiffViewEvent::CommentRequested`].
+//! emits [`DiffViewEvent::CommentRequested`]. While lines are selected in
+//! the main diff, "Explain selection" (or `e`) floats over the bottom of the
+//! diff and emits [`DiffViewEvent::ExplainRequested`].
 //!
 //! # Comment threads
 //!
@@ -121,8 +123,8 @@ use gpui::{
 use crate::AppContext;
 use crate::comments::{ReviewComments, ReviewCommentsEvent};
 use crate::components::{
-    BadgeSize, button, chip, claude_activity, icon_button, letter_badge, muted_button_with_icon,
-    placeholder, radius,
+    BadgeSize, button, button_with_icon, chip, claude_activity, icon_button, kbd, letter_badge,
+    muted_button_with_icon, placeholder, radius,
 };
 use crate::hidden_files::HiddenFiles;
 use crate::icons::{IconName, icon};
@@ -212,6 +214,8 @@ pub enum DiffViewEvent {
     SelectionRejected(SharedString),
     /// The user clicked the gutter "+" to comment on a line or range.
     CommentRequested(LineSelection),
+    /// "Explain selection": Claude should explain these lines.
+    ExplainRequested(LineSelection),
     /// The file under the top of the viewport changed (file-list index);
     /// the file tree highlights it.
     ActiveFileChanged(usize),
@@ -1958,6 +1962,44 @@ impl DiffView {
         cx.notify();
     }
 
+    /// Asks for an explanation of the gutter selection. Returns `false`
+    /// when nothing that can be explained is selected (a proposal, or no
+    /// selection).
+    pub fn explain_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.proposal || self.selection.is_none() {
+            return false;
+        }
+        let Some(selection) = self.resolve_selection(cx) else {
+            cx.notify();
+            return true;
+        };
+        cx.emit(DiffViewEvent::ExplainRequested(selection));
+        true
+    }
+
+    /// Clears the gutter selection. Returns whether there was one.
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.selection.take().is_none() {
+            return false;
+        }
+        self.drag = None;
+        cx.notify();
+        true
+    }
+
+    /// Paths of the files the hidden-file patterns leave out.
+    pub fn hidden_paths(&self) -> HashSet<String> {
+        let ListStatus::Ready(list) = &self.status else {
+            return HashSet::new();
+        };
+        list.entries()
+            .iter()
+            .zip(&self.files)
+            .filter(|(_, slot)| slot.hidden)
+            .map(|(entry, _)| entry.path.clone())
+            .collect()
+    }
+
     fn is_selected(&self, file: usize, row: usize, side: Option<DiffSide>) -> bool {
         self.selection.is_some_and(|selection| {
             selection.file == file && selection.side == side && selection.rows().contains(&row)
@@ -3138,6 +3180,63 @@ impl DiffView {
         )
     }
 
+    /// "Explain selection" floating over the bottom of the main diff while
+    /// lines are selected (not while dragging, or re-attaching a comment).
+    fn render_selection_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.proposal
+            || self.hint.is_some()
+            || self.drag.is_some()
+            || self.is_reattaching()
+            || !matches!(self.selection(), Some(Ok(_)))
+        {
+            return None;
+        }
+        let theme = cx.theme();
+        let colors = &theme.colors;
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_3()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .p_0p5()
+                        .font_family(theme.fonts.ui_family.clone())
+                        .text_size(theme.fonts.ui_size)
+                        .rounded(radius::md(cx))
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.elevated_surface)
+                        .shadow(vec![BoxShadow {
+                            color: colors.shadow,
+                            offset: point(px(0.0), px(2.0)),
+                            blur_radius: px(8.0),
+                            spread_radius: px(0.0),
+                            inset: false,
+                        }])
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            button_with_icon(
+                                "diff-explain-selection",
+                                IconName::Sparkle,
+                                "Explain selection",
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.explain_selection(cx);
+                            }))
+                            .child(kbd("e", cx)),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The row above a proposal's cards: its `start...worktree` range, file
     /// count and totals. The main diff has none: the title bar carries its
     /// summary.
@@ -3197,7 +3296,9 @@ impl Render for DiffView {
         let colors = &theme.colors;
         let toolbar = self.render_toolbar(cx);
         let reattach_bar = self.render_reattach_bar(cx);
-        let hint = self.render_hint(cx);
+        let hint = self
+            .render_hint(cx)
+            .or_else(|| self.render_selection_bar(cx));
         let root = div()
             .track_focus(&self.focus_handle)
             .flex()

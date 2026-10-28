@@ -188,6 +188,21 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE comments_new RENAME TO comments;
     CREATE INDEX comments_repo_refs ON comments(repo_id, base_ref, head_ref);
     "#,
+    // 5: Claude's explanations of a diff or of lines in it, cached by the
+    // commits they explain.
+    r#"
+    CREATE TABLE explanations (
+        repo_id     TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        merge_base  TEXT NOT NULL,
+        head_tip    TEXT NOT NULL,
+        scope       TEXT NOT NULL,
+        body_md     TEXT NOT NULL,
+        model       TEXT NOT NULL,
+        effort      TEXT NOT NULL,
+        created_at  INTEGER NOT NULL,
+        PRIMARY KEY (repo_id, merge_base, head_tip, scope)
+    );
+    "#,
 ];
 
 /// Newest schema version this build understands.

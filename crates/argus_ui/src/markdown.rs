@@ -427,6 +427,29 @@ pub fn render(doc: &Markdown, id: SharedString, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// [`render`] for a long document read on its own (e.g. an explanation):
+/// more room between blocks, and above each heading but the first.
+pub fn render_document(doc: &Markdown, id: SharedString, cx: &App) -> AnyElement {
+    let mut counter = 0;
+    let elements = render_blocks(&doc.blocks, &id, &mut counter, cx);
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .min_w_0()
+        .children(
+            doc.blocks.iter().zip(elements).enumerate().map(
+                |(index, (block, element))| match block {
+                    Block::Heading(..) if index > 0 => {
+                        div().pt_3().child(element).into_any_element()
+                    }
+                    _ => element,
+                },
+            ),
+        )
+        .into_any_element()
+}
+
 fn render_blocks(
     blocks: &[Block],
     id: &SharedString,

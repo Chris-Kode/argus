@@ -14,6 +14,7 @@ pub mod comments;
 pub mod components;
 pub mod conflict;
 pub mod diff_view;
+pub mod explain;
 pub mod file_tree;
 pub mod followup;
 mod fonts;

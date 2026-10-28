@@ -25,6 +25,8 @@ actions!(
         Comment,
         /// Run the selected comment with Claude.
         Run,
+        /// Have Claude explain the selected lines, or the whole diff.
+        Explain,
         /// Accept the open proposal.
         Accept,
         /// Reject the open proposal (asks first; press again to confirm).
@@ -374,6 +376,13 @@ pub const SHORTCUTS: &[Shortcut] = &[
         NAVIGATION,
         "Review",
         "Run the comment with Claude"
+    ),
+    shortcut!(
+        "e",
+        Explain,
+        NAVIGATION,
+        "Review",
+        "Explain the selected lines (or the diff) with Claude"
     ),
     shortcut!("a", Accept, NAVIGATION, "Review", "Accept the proposal"),
     shortcut!(
