@@ -69,6 +69,7 @@ use crate::claude::{ClaudeCommand, ClaudeStatus};
 use crate::proposal::{ProposalError, load_parts};
 use crate::run::{RunUpdate, Services};
 use crate::settings::ClaudeSettings;
+use crate::stream::{self, StreamEvent};
 
 /// Commit subject when Haiku wrote none.
 pub const FALLBACK_SUBJECT: &str = "Apply review comment";
@@ -981,8 +982,8 @@ async fn commit_text(
     }
 }
 
-/// Runs the commit-message command to completion and returns its stdout.
-/// Dropping the future kills `claude`.
+/// Runs the commit-message command to completion and returns Haiku's answer
+/// from its `stream-json` output. Dropping the future kills `claude`.
 async fn run_claude(command: &ClaudeCommand, program: &Path) -> Result<String, String> {
     let mut child = command
         .to_command(program)
@@ -1016,16 +1017,43 @@ async fn run_claude(command: &ClaudeCommand, program: &Path) -> Result<String, S
     };
     let ((), out, err) = tokio::join!(write, read_out, read_err);
     let status = child.wait().await.map_err(|error| error.to_string())?;
-    if !status.success() {
-        let err = String::from_utf8_lossy(&err);
-        let out = String::from_utf8_lossy(&out);
-        let detail = [err.trim(), out.trim()]
+    let out = String::from_utf8_lossy(&out);
+    let mut answer = None;
+    let mut result = None;
+    for line in out.lines().filter(|line| !line.trim().is_empty()) {
+        match stream::parse_line(line) {
+            Ok(StreamEvent::Assistant(message)) => answer = message.text().or(answer),
+            Ok(StreamEvent::Result(last)) => result = Some(last),
+            _ => {}
+        }
+    }
+    match (result, answer) {
+        (Some(result), _) if status.success() && !result.is_error => {
+            result.result.ok_or_else(|| "no answer".to_owned())
+        }
+        // The turn limit ends the call after Haiku answered; the answer
+        // stands. Other errors may come with a synthetic message (an API
+        // error, a sign-in prompt) that is no commit message.
+        (Some(result), Some(answer)) if result.subtype == "error_max_turns" => {
+            tracing::info!(%status, "commit message call hit the turn limit after answering");
+            Ok(answer)
+        }
+        (result, _) => {
+            let err = String::from_utf8_lossy(&err);
+            let detail = [
+                err.trim(),
+                result
+                    .as_ref()
+                    .and_then(|r| r.result.as_deref())
+                    .unwrap_or(""),
+                result.as_ref().map_or("", |r| r.subtype.as_str()),
+            ]
             .into_iter()
             .find(|text| !text.is_empty())
             .unwrap_or("no output");
-        return Err(format!("{status}: {}", prefix(detail, HAIKU_ERROR_BYTES)));
+            Err(format!("{status}: {}", prefix(detail, HAIKU_ERROR_BYTES)))
+        }
     }
-    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Haiku's answer as a commit subject and body: surrounding code fences

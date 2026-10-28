@@ -29,6 +29,10 @@ pub const REVIEW_DISALLOWED_TOOLS: [&str; 2] = ["Bash(git commit *)", "Bash(git 
 /// Model of the commit-message call (spec §6.4).
 pub const COMMIT_MESSAGE_MODEL: &str = "haiku";
 
+/// Settings of the commit-message call: none of the user's hooks run. A
+/// `Stop` hook that blocks would start a second turn, past `--max-turns 1`.
+const COMMIT_MESSAGE_SETTINGS: &str = r#"{"disableAllHooks":true}"#;
+
 /// Longest review comment quoted in the commit-message prompt, in bytes. The
 /// prompt must stay an argument because the diff takes stdin.
 const COMMIT_COMMENT_MAX_BYTES: usize = 8 * 1024;
@@ -117,12 +121,16 @@ impl ClaudeCommand {
     ///
     /// ```text
     /// git diff --cached | claude -p --model haiku --tools "" --max-turns 1 \
-    ///   --strict-mcp-config "Write a git commit message for this change: <format rules>. Review comment: <text>"
+    ///   --strict-mcp-config --settings '{"disableAllHooks":true}' \
+    ///   --output-format stream-json --verbose \
+    ///   "Write a git commit message for this change: <format rules>. Review comment: <text>"
     /// ```
     ///
-    /// `--tools ""` only removes the built-in tools; `--strict-mcp-config`
-    /// also drops the user's MCP servers, whose tools Haiku would otherwise
-    /// call and so use up its one turn.
+    /// Haiku has one turn, so nothing may start another: `--tools ""` only
+    /// removes the built-in tools, `--strict-mcp-config` also drops the
+    /// user's MCP servers, and `disableAllHooks` their hooks. `stream-json`
+    /// keeps Haiku's answer readable when the call still ends at the turn
+    /// limit (e.g. a managed hook the settings cannot disable).
     ///
     /// `diff_stdin` is the staged diff. Very long comments are truncated in
     /// the prompt. The working directory is inherited unless set with
@@ -249,6 +257,11 @@ impl ClaudeCommand {
                     "--max-turns",
                     "1",
                     "--strict-mcp-config",
+                    "--settings",
+                    COMMIT_MESSAGE_SETTINGS,
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
                 ]
                 .map(OsString::from)
                 .into();
