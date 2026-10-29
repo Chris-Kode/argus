@@ -41,6 +41,9 @@ actions!(
         RejectProposal,
         /// Reply to the open proposal, starting a follow-up.
         ReplyToProposal,
+        /// Hide the comment and summary above the proposal's diff, or show
+        /// them again.
+        ToggleProposalHeader,
         /// Open the settings sheet.
         OpenSettings,
         /// Pick a repository to open.
@@ -412,6 +415,13 @@ pub const SHORTCUTS: &[Shortcut] = &[
         PROPOSAL,
         "Review",
         "Reply to the proposal"
+    ),
+    shortcut!(
+        "h",
+        ToggleProposalHeader,
+        PROPOSAL,
+        "Review",
+        "Hide / show the proposal's comment and summary"
     ),
     shortcut!(
         "secondary-enter",

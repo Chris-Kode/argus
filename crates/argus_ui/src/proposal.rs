@@ -13,6 +13,8 @@
 //! since the run started. The run's model, effort, turns, cost and duration
 //! are in its log (run panel), not here.
 //!
+//! The header can be hidden (`h`) to give the diff the whole tab.
+//!
 //! Actions: Accept (`a`), Reject (`x`, asks first), Reply (`r`) and Open in
 //! editor. A reply is sent as a follow-up run by default (the same Claude
 //! session, in this worktree, with the picked model and effort) or added as
@@ -53,12 +55,14 @@ use crate::AppContext;
 use crate::comments::ReviewComments;
 use crate::components::{
     accept_button, button, disabled_button, disabled_button_with_icon, kbd, placeholder,
-    primary_button, radius, reject_button, reply_button, status_chip,
+    primary_button, radius, reject_button, reply_button, status_chip, toggle_icon_button,
 };
 use crate::diff_view::{DiffView, DiffViewEvent, DisplayOptions};
 use crate::followup::{self, FollowupKind};
 use crate::icons::IconName;
-use crate::keymap::{Accept, PROPOSAL_CONTEXT, RejectProposal, ReplyToProposal, SHORTCUTS};
+use crate::keymap::{
+    Accept, PROPOSAL_CONTEXT, RejectProposal, ReplyToProposal, SHORTCUTS, ToggleProposalHeader,
+};
 use crate::markdown::{self, Markdown, MarkdownCache};
 use crate::runtime::spawn_job;
 use crate::session::DiffTarget;
@@ -152,6 +156,8 @@ pub struct ProposalView {
     session_lost: bool,
     confirm_reject: bool,
     rejecting: bool,
+    /// The comment and summary above the diff are hidden.
+    header_hidden: bool,
     /// Where the Accept of this proposal is, while queued or in progress.
     accepting: Option<AcceptStage>,
     refreshing: bool,
@@ -209,6 +215,7 @@ impl ProposalView {
             session_lost: false,
             confirm_reject: false,
             rejecting: false,
+            header_hidden: false,
             accepting: None,
             refreshing: false,
             focus_requested: true,
@@ -717,6 +724,11 @@ impl ProposalView {
         self.open_reply(cx);
     }
 
+    fn toggle_header(&mut self, _: &ToggleProposalHeader, _: &mut Window, cx: &mut Context<Self>) {
+        self.header_hidden = !self.header_hidden;
+        cx.notify();
+    }
+
     fn open_reply(&mut self, cx: &mut Context<Self>) {
         if self.loaded().is_none() {
             return;
@@ -1216,6 +1228,22 @@ impl ProposalView {
             .child(kbd(shortcut_keys::<ReplyToProposal>(), cx));
         let editor = button("proposal-open-editor", "Open in editor", cx)
             .on_click(cx.listener(|this, _, _, cx| this.open_commented_file(cx)));
+        let header_toggle = toggle_icon_button(
+            "proposal-header-toggle",
+            if self.header_hidden {
+                IconName::CaretRight
+            } else {
+                IconName::CaretDown
+            },
+            format!(
+                "{} the comment and summary ({})",
+                if self.header_hidden { "Show" } else { "Hide" },
+                shortcut_keys::<ToggleProposalHeader>()
+            ),
+            !self.header_hidden,
+            cx,
+        )
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleProposalHeader), cx));
         let refresh = if self.refreshing {
             disabled_button("proposal-refresh", "Refreshing…", cx).into_any_element()
         } else {
@@ -1378,7 +1406,8 @@ impl ProposalView {
                     .child(reply)
                     .child(div().flex_1())
                     .child(editor)
-                    .child(refresh),
+                    .child(refresh)
+                    .child(header_toggle),
             )
             .children(followup_banner)
             .children(confirm)
@@ -1405,6 +1434,7 @@ impl Render for ProposalView {
             .on_action(cx.listener(Self::accept))
             .on_action(cx.listener(Self::reject_action))
             .on_action(cx.listener(Self::reply_action))
+            .on_action(cx.listener(Self::toggle_header))
             .on_action(cx.listener(|this, _: &crate::keymap::Dismiss, _, cx| {
                 if this.confirm_reject {
                     this.confirm_reject = false;
@@ -1435,14 +1465,14 @@ impl Render for ProposalView {
             }
             State::Ready(loaded) => {
                 let view = loaded.view.clone();
-                let header = self.render_header(loaded, cx);
+                let header = (!self.header_hidden).then(|| self.render_header(loaded, cx));
                 let actions = self.render_actions(cx);
                 div()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .child(header)
+                    .children(header)
                     .child(actions)
                     .child(view)
                     .into_any_element()
